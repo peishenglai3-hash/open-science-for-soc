@@ -10,6 +10,9 @@ import { analyzePythonNotebookSource } from './dependency-analysis-python'
 import { analyzeNotebookSourceFileAccess } from './source-file-access-analysis'
 import cells from './reported-venn-export-failure.fixture.json'
 
+// Owned keys can still dispatch xtfrm; unproven ordering keeps effects partial.
+// Known paths and producer/consumer evidence remain checked independently.
+
 const corrected = readFileSync(join(__dirname, 'reported-venn-export-recovery.R'), 'utf8')
 it.each([1, 2, 3, 5, 6, 13])(
   'captures data and file dependencies of reported cell %i',
@@ -18,15 +21,17 @@ it.each([1, 2, 3, 5, 6, 13])(
     const { facts } = await (language === 'r'
       ? analyzeRNotebookSource(script)
       : analyzePythonNotebookSource(script))
-    expect(facts.state === 'unknown' ? facts.reasons : [], JSON.stringify(facts)).toEqual([
-      'external-state'
-    ])
+    expect(facts.state === 'unknown' ? facts.reasons : [], JSON.stringify(facts)).toEqual(
+      [3, 5, 6, 13].includes(index)
+        ? ['external-state', 'function-scope', 'opaque-call']
+        : ['external-state']
+    )
     expect(
       await analyzeNotebookSourceFileAccess(language === 'r' ? 'r' : 'python', script)
     ).toMatchObject({
-      readState: 'complete',
-      writeState: 'complete',
-      externalState: 'complete',
+      readState: [3, 5, 6, 13].includes(index) ? 'partial' : 'complete',
+      writeState: [3, 5, 6, 13].includes(index) ? 'partial' : 'complete',
+      externalState: [3, 5, 6, 13].includes(index) ? 'partial' : 'complete',
       reads: ['inputs/set-membership-111111111111.xlsx'],
       writes:
         index === 13
@@ -46,16 +51,18 @@ it.each([7, 8, 9, 10, 11, 12])(
 )
 
 it.each(['df <- data.frame(A=c("a",NA), B=c("b","c"))', 'df <- readxl::read_excel("input.xlsx")'])(
-  'tracks ordinary captured data through immediate callbacks: %s',
+  'withholds method-result ownership in captured-data callbacks: %s',
   async (setup) => {
     const { facts } = await analyzeRNotebookSource(
       setup + '\nsets<-lapply(colnames(df),function(c) unique(stats::na.omit(df[[c]])))'
     )
     expect(facts.state === 'unknown' ? facts.reasons : []).toEqual(
-      setup.includes('read_excel') ? ['external-state'] : []
+      setup.includes('read_excel')
+        ? ['external-state', 'function-scope', 'opaque-call']
+        : ['function-scope', 'opaque-call']
     )
     expect(facts.usedNames).toContain('df')
-    expect(facts.copyOnModifyNames).toContain('sets')
+    expect(facts.copyOnModifyNames ?? []).not.toContain('sets')
   }
 )
 
@@ -108,8 +115,11 @@ it('recovers in a fresh kernel and preserves the failed producer status', async 
       })
       const result = await analyzer.project({ projectId: 'p', sessionId: 's', throughRunId: '14' })
       expect(result.stalenessByRunId['13']).toBeUndefined()
-      expect(result.stalenessByRunId['14']).toEqual({ state: 'clear' })
-      expect(result.dependenciesByRunId?.['14']).toEqual([])
+      expect(result.stalenessByRunId['14']).toMatchObject({
+        state: 'unknown',
+        reasons: expect.arrayContaining(['opaque-call'])
+      })
+      expect(result.dependenciesByRunId?.['14']).toBeUndefined()
       const context = await analyzer.sourceFileAccessContext({
         projectId: 'p',
         sessionId: 's',
@@ -119,15 +129,15 @@ it('recovers in a fresh kernel and preserves the failed producer status', async 
         kernelEpochId: 'r'
       })
       expect(await analyzeNotebookSourceFileAccess('r', cells[4]!.script, context)).toMatchObject({
-        readState: 'complete',
-        writeState: 'complete',
-        externalState: 'complete'
+        readState: 'partial',
+        writeState: 'partial',
+        externalState: 'partial'
       })
     }
     expect(await analyzeNotebookSourceFileAccess('r', corrected)).toMatchObject({
-      readState: 'complete',
-      writeState: 'complete',
-      externalState: 'complete',
+      readState: 'partial',
+      writeState: 'partial',
+      externalState: 'partial',
       reads: ['inputs/set-membership-111111111111.xlsx'],
       writes: ['proportional_venn_5sets.png', 'venn_region_counts.csv']
     })
@@ -146,10 +156,8 @@ it('recovers in a fresh kernel and preserves the failed producer status', async 
         sessionId: kernelEpochId,
         throughRunId: 'plot'
       })
-      expect(result.stalenessByRunId['plot']?.state).toBe(
-        kernelEpochId === 'fresh' ? 'clear' : 'unknown'
-      )
-      if (kernelEpochId === 'fresh') expect(result.dependenciesByRunId?.['plot']).toEqual(['setup'])
+      expect(result.stalenessByRunId['plot']?.state).toBe('unknown')
+      expect(result.dependenciesByRunId?.['plot']).toBeUndefined()
     }
   } finally {
     await rm(root, { recursive: true, force: true })

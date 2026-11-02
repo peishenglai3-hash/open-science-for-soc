@@ -51,6 +51,7 @@ type AcpSessionResumeDecision =
       }>)
 
 type AcpSessionResumeAdoptableFailureReason =
+  | 'codex-rollout-not-found'
   | 'resource-not-found-code'
   | 'session-not-found-message'
   | 'session-service-failure'
@@ -272,6 +273,19 @@ class AcpSessionResumePolicy {
     const message = readProperty(error, 'message')
     if (!message.readable) return authoritativeFailure('uninspectable-error')
 
+    if (
+      context?.currentFrameworkId === 'pi' &&
+      code.value === -32602 &&
+      typeof message.value === 'string' &&
+      /^Invalid params: unknown session: [A-Za-z0-9_-]+$/.test(message.value)
+    ) {
+      const data = readProperty(error, 'data')
+      if (!data.readable) return authoritativeFailure('uninspectable-error')
+      if (hasNoStructuredErrorData(data.value)) {
+        return adoptableFailure('session-not-found-message')
+      }
+    }
+
     if (code.value !== -32603) {
       return code.value !== undefined || message.value !== undefined
         ? authoritativeFailure('non-internal-error')
@@ -320,6 +334,18 @@ class AcpSessionResumePolicy {
 
     const details = readProperty(data.value, 'details')
     if (!details.readable) return authoritativeFailure('uninspectable-error')
+    // The installed Codex adapter wraps this native response in Internal error. Keep the exact
+    // shape distinct: Specialist switching may replace this missing history, but must not turn
+    // opaque provider failures or arbitrary "failed to resume" messages into automatic resets.
+    if (
+      context?.currentFrameworkId === 'codex' &&
+      typeof details.value === 'string' &&
+      /^no rollout found for thread id [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        details.value.trim()
+      )
+    ) {
+      return adoptableFailure('codex-rollout-not-found')
+    }
     if (describesUnresumableSession(details.value)) {
       return adoptableFailure('legacy-unresumable-details')
     }

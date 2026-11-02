@@ -51,7 +51,7 @@ describe('runtime update operation boundaries', () => {
       cancel = vi.fn(async () => {})
     useUpdateStore.setState({ apply, cancel })
     render()
-    act(() => buttons('Restart to update')[0].click())
+    act(() => buttons('Update')[0].click())
     expect(buttons('Cancel')[0].disabled).toBe(false)
     await act(async () => buttons('Cancel')[0].click())
     expect(cancel).toHaveBeenCalledOnce()
@@ -102,12 +102,11 @@ describe('runtime update operation boundaries', () => {
     expect(document.querySelectorAll('[role="dialog"], [role="alertdialog"]')).toHaveLength(1)
     expect(buttons('Cancel')).toHaveLength(1)
     expect(buttons('Update')).toHaveLength(1)
-    expect(buttons('Restart to update')).toHaveLength(0)
     expect(document.body.textContent).toContain('/isolated/service')
     expect(document.body.textContent).toContain('separate installation will not be updated')
     expect(apply).not.toHaveBeenCalled()
     await act(async () => buttons('Update')[0].click())
-    expect(apply).toHaveBeenCalledWith({ force: false, cliConsentToken: 'reviewed' })
+    expect(apply).toHaveBeenCalledWith({ force: true, cliConsentToken: 'reviewed' })
   })
   it('closes CLI cancellation without applying', async () => {
     const apply = vi.fn(async () => {}),
@@ -131,7 +130,7 @@ describe('runtime update operation boundaries', () => {
     })
     render()
     const dialog = document.querySelector('[role="dialog"]')!
-    expect(dialog.querySelectorAll('button')).toHaveLength(3)
+    expect(dialog.querySelectorAll('button')).toHaveLength(4)
     await act(async () =>
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     )
@@ -157,7 +156,7 @@ describe('runtime update operation boundaries', () => {
       }
     })
     render()
-    expect(buttons('Restart to update')).toHaveLength(0)
+    expect(buttons('Update')).toHaveLength(0)
     expect(buttons('Retry')).toHaveLength(1)
     await act(async () =>
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
@@ -343,7 +342,7 @@ it('presents a second completed cancellation after reopening and starting anothe
   )
   await act(async () => useUpdateStore.getState().openDialog())
   expect(document.querySelector('[role="dialog"]')).not.toBeNull()
-  await act(async () => buttons('Restart to update')[0].click())
+  await act(async () => buttons('Update')[0].click())
   await act(async () => buttons('Cancel')[0].click())
   expect(useUpdateStore.getState().status.outcome).toBe('cancelled')
   expect(document.querySelector('[data-runtime-update-state="S15"]')).not.toBeNull()
@@ -380,7 +379,7 @@ it('reopens after a completed recovery without retaining a failed-recovery warni
   await act(async () => useUpdateStore.getState().openDialog())
   expect(document.querySelector('[role="dialog"]')).not.toBeNull()
   expect(document.body.textContent).not.toContain('Recovery has not been confirmed')
-  await act(async () => buttons('Restart to update')[0].click())
+  await act(async () => buttons('Update')[0].click())
   expect(document.querySelector('[data-runtime-update-state="S11"]')).not.toBeNull()
   expect(document.body.textContent).not.toContain('Recovery has not been confirmed')
 })
@@ -398,9 +397,11 @@ it.each([
       status: { state: 'ready', current: '1', reason, recovery: r() }
     })
     render()
-    expect(buttons('Restart to update')).toHaveLength(0)
+    expect(buttons('Update')).toHaveLength(0)
     expect(buttons('Retry')).toHaveLength(1)
-    expect(buttons('Retry')[0].parentElement?.className).toContain('border-t')
+    expect(
+      buttons('Retry')[0].closest('[data-testid="manual-update-footer"]')?.className
+    ).toContain('border-t')
     await act(async () => buttons('Retry')[0].click())
     expect(recheck).toHaveBeenCalledOnce()
   }
@@ -460,4 +461,252 @@ it('describes preparation failure without claiming an unknown installation resul
   expect(document.body.textContent).toContain('Update preparation failed')
   expect(document.body.textContent).not.toContain('Installation result is unknown')
   expect(buttons('Cancel')).toHaveLength(1)
+})
+
+describe('continuous in-place update dialog', () => {
+  it('keeps one dialog and release notes from download through installation preparation', () => {
+    const base: UpdateStatus = {
+      state: 'available',
+      current: '1.0.11',
+      latest: '1.0.12',
+      applyKind: 'restart',
+      notes: 'Preserve the release notes throughout the update.',
+      totalBytes: 1024
+    }
+    useUpdateStore.setState({ status: base })
+    act(() => root.render(<UpdateDialog />))
+    const dialog = document.querySelector('[role="dialog"]')
+    expect(buttons('Download update (1.0 KB)')).toHaveLength(1)
+    for (const state of ['downloading', 'error', 'ready', 'applying'] as const) {
+      act(() =>
+        useUpdateStore.setState({
+          status: {
+            ...base,
+            state,
+            progress: 50,
+            error: state === 'error' ? 'Synthetic download failed' : undefined
+          }
+        })
+      )
+      expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(1)
+      expect(document.querySelector('[role="dialog"]')).toBe(dialog)
+      expect(dialog?.textContent).toContain(base.notes)
+      if (state === 'ready') {
+        expect(buttons('Update')).toHaveLength(1)
+        expect(dialog?.textContent).not.toContain('Diagnostics')
+      }
+    }
+    expect(dialog?.textContent).toContain('Preparing update')
+  })
+
+  it('cancels a pending download without starting installation', async () => {
+    let finish!: () => void
+    const download = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve
+        })
+    )
+    const cancel = vi.fn(async () => {})
+    const apply = vi.fn(async () => {})
+    useUpdateStore.setState({
+      download,
+      cancel,
+      apply,
+      status: { state: 'available', current: '1', latest: '2', applyKind: 'restart' }
+    })
+    act(() => root.render(<UpdateDialog />))
+    act(() => buttons('Download update')[0].click())
+    expect(buttons('Cancel')[0].disabled).toBe(false)
+    await act(async () => buttons('Cancel')[0].click())
+    expect(cancel).toHaveBeenCalledOnce()
+    expect(apply).not.toHaveBeenCalled()
+    await act(async () => finish())
+  })
+})
+
+describe('update check and download admission', () => {
+  it.each(['idle', 'up-to-date'] as const)(
+    'hides installation actions when an open offer changes to %s, even with a stale version',
+    (state) => {
+      useUpdateStore.setState({
+        status: { state: 'available', current: '1', latest: '2', applyKind: 'restart' }
+      })
+      act(() => root.render(<UpdateDialog />))
+      expect(buttons('Download update')).toHaveLength(1)
+      act(() => useUpdateStore.setState({ status: { ...useUpdateStore.getState().status, state } }))
+      expect(document.querySelector('[role="dialog"]')).toBeNull()
+      expect(buttons('Update')).toHaveLength(0)
+      expect(buttons('Download update')).toHaveLength(0)
+    }
+  )
+
+  it.each([undefined, '2'])(
+    'keeps an open dialog mounted during provider checks with target %s',
+    (latest) => {
+      useUpdateStore.setState({
+        status: { state: 'available', current: '1', latest: '2', applyKind: 'restart' }
+      })
+      act(() => root.render(<UpdateDialog />))
+      const dialog = document.querySelector('[role="dialog"]')
+      act(() =>
+        useUpdateStore.setState({
+          status: { state: 'checking', current: '1', latest, applyKind: 'restart' }
+        })
+      )
+      expect(document.querySelector('[role="dialog"]')).toBe(dialog)
+      expect(dialog?.textContent).toContain('Checking for updates…')
+      expect(dialog?.textContent).not.toContain('Ready to install')
+      expect(buttons('Download update')).toHaveLength(0)
+      expect(buttons('Update')).toHaveLength(0)
+      expect(buttons('Cancel')[0].disabled).toBe(false)
+      act(() =>
+        useUpdateStore.setState({
+          status: { state: 'error', current: '1', applyKind: 'restart', error: 'Check failed' }
+        })
+      )
+      expect(document.querySelector('[role="dialog"]')).toBe(dialog)
+      expect(buttons('Retry')).toHaveLength(1)
+    }
+  )
+
+  it('rechecks a versionless failure instead of downloading or installing', async () => {
+    let finish!: () => void
+    const check = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve
+        })
+    )
+    const download = vi.fn(async () => {})
+    const apply = vi.fn(async () => {})
+    useUpdateStore.setState({
+      check,
+      download,
+      apply,
+      status: {
+        state: 'error',
+        current: '1',
+        applyKind: 'restart',
+        error: 'Synthetic check failure'
+      }
+    })
+    act(() => root.render(<UpdateDialog />))
+    expect(document.body.textContent).toContain('Synthetic check failure')
+    expect(document.body.textContent).not.toContain('Ready to install')
+    expect(buttons('Download update')).toHaveLength(0)
+    expect(buttons('Update')).toHaveLength(0)
+    expect(buttons('Retry')).toHaveLength(1)
+    act(() => buttons('Retry')[0].click())
+    expect(buttons('Checking…')[0].disabled).toBe(true)
+    expect(check).toHaveBeenCalledOnce()
+    expect(download).not.toHaveBeenCalled()
+    expect(apply).not.toHaveBeenCalled()
+    await act(async () => finish())
+    expect(buttons('Retry')[0].disabled).toBe(false)
+  })
+
+  it('retries a failed transfer with a known release through download', async () => {
+    const check = vi.fn(async () => {})
+    const download = vi.fn(async () => {})
+    const apply = vi.fn(async () => {})
+    useUpdateStore.setState({
+      check,
+      download,
+      apply,
+      status: {
+        state: 'error',
+        current: '1',
+        latest: '2',
+        applyKind: 'restart',
+        error: 'Transfer failed'
+      }
+    })
+    act(() => root.render(<UpdateDialog />))
+    await act(async () => buttons('Download update')[0].click())
+    expect(download).toHaveBeenCalledOnce()
+    expect(check).not.toHaveBeenCalled()
+    expect(apply).not.toHaveBeenCalled()
+  })
+
+  it('keeps runtime recovery visible when the update provider reports checking', () => {
+    useUpdateStore.setState({
+      status: {
+        state: 'checking',
+        current: '1',
+        applyKind: 'restart',
+        recovery: r({ runtime: 'stopped-clean', canRecover: true })
+      }
+    })
+    act(() => root.render(<UpdateDialog />))
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull()
+    expect(buttons('Retry')).toHaveLength(1)
+  })
+})
+
+it.each([
+  [
+    'applying',
+    r({ phase: 'handoff', runtime: 'stopped-clean', installation: 'pending', canCancel: false })
+  ],
+  [
+    'error',
+    r({ runtime: 'stopped-clean', installation: 'unknown', canCancel: false, canRecover: true })
+  ]
+] as const)(
+  'reads and leaves manual instructions without unlocking %s recovery',
+  async (state, recovery) => {
+    const cancel = vi.fn(async () => {})
+    const apply = vi.fn(async () => {})
+    const recover = vi.fn(async () => {})
+    const download = vi.fn(async () => {})
+    useUpdateStore.setState({
+      cancel,
+      apply,
+      recover,
+      download,
+      status: { state, current: '1', latest: '2', recovery }
+    })
+    render()
+    const dialog = document.querySelector('[role="dialog"]')!
+    const instructions = dialog.querySelector<HTMLButtonElement>(
+      '[data-testid="manual-update-links"] button'
+    )!
+    act(() => instructions.click())
+    expect(document.querySelectorAll('[role="dialog"], [role="alertdialog"]')).toHaveLength(1)
+    expect(dialog.getAttribute('aria-label')).toBe('Installation instructions')
+    expect(document.activeElement?.getAttribute('aria-label')).toBe('Back to update')
+    expect(dialog.querySelector('[data-manual-update-guide]')?.textContent).toContain(
+      'An installer may still be running'
+    )
+    await act(async () =>
+      document.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+      )
+    )
+    expect(document.activeElement).toBe(instructions)
+    expect(useUpdateStore.getState().isDialogOpen).toBe(true)
+    expect(useUpdateStore.getState().status.recovery).toEqual(recovery)
+    expect(buttons('Cancel')).toHaveLength(0)
+    expect(cancel).not.toHaveBeenCalled()
+    expect(apply).not.toHaveBeenCalled()
+    expect(recover).not.toHaveBeenCalled()
+    expect(download).not.toHaveBeenCalled()
+  }
+)
+
+it('puts manual failure links inside existing error prose while keeping the persistent footer', () => {
+  useUpdateStore.setState({
+    status: { state: 'error', current: '1', error: 'Provider check failed' }
+  })
+  render()
+  const alert = document.querySelector('[role="alert"]')!
+  expect(alert.textContent).toContain('Provider check failed')
+  const notice = alert.closest('section')!
+  expect(notice.querySelector('a')?.textContent).toContain('download from the website')
+  expect(notice.querySelector('button')?.textContent).toBe('installation instructions')
+  const footer = document.querySelector('[data-testid="manual-update-footer"]')!
+  expect(footer.querySelector('[data-testid="manual-update-links"]')).not.toBeNull()
+  expect(alert.contains(footer)).toBe(false)
+  expect(buttons('Retry')).toHaveLength(1)
 })

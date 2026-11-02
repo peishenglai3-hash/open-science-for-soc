@@ -4,7 +4,7 @@ import {
   type SpawnOptionsWithoutStdio
 } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { SessionModeState } from '@agentclientprotocol/sdk'
 
 import {
@@ -13,11 +13,15 @@ import {
 } from '../acp/permission-profile-controller'
 import type { PermissionProfileId } from '../../shared/permission-profiles'
 import { preferredEndpoint } from '../../shared/settings'
-import type { ModelReasoningEffort } from '../../shared/reasoning-effort'
-import { anthropicMessagesBase, openAiCompletionsBase } from '../settings/base-url'
+import type { ModelReasoningEffort } from '@aipoch/providers'
+import {
+  resolveMessagesBaseUrl,
+  resolveChatCompletionsBaseUrl,
+  resolveChatReasoningTransport
+} from '@aipoch/providers/protocol'
 import { augmentedPathEnv } from '../settings/shell-path'
 import type { ResolvedProvider } from '../settings/provider-env'
-import { resolveChatReasoningTransport } from '../settings/reasoning-transport'
+
 import type {
   AgentFramework,
   AgentModelCatalogEntry,
@@ -28,7 +32,7 @@ import type {
   SessionSetupContext
 } from './types'
 import { isProductionDelegatedWorkFramework } from '../delegation/production-readiness'
-import { renderAppMcpToolReferences } from './app-mcp-names'
+import { appMcpServerNames, renderAppMcpToolReferences } from './app-mcp-names'
 
 type SpawnProcess = (
   command: string,
@@ -80,9 +84,12 @@ export const opencodeTransportProviderId = (providerId: string, model: string): 
 
 // Pin the SDK for both protocols: app-generated provider ids do not inherit OpenCode's
 // built-in Anthropic driver. The endpoint prefers OpenAI when the provider offers both.
-const OPENCODE_ENDPOINT_PROVIDER: Record<'anthropic' | 'openai', { id: string; npm?: string }> = {
-  anthropic: { id: 'anthropic', npm: '@ai-sdk/anthropic' },
-  openai: { id: 'openai-compatible', npm: '@ai-sdk/openai-compatible' }
+const OPENCODE_ENDPOINT_PROVIDER: Record<
+  'messages' | 'chat-completions',
+  { id: string; npm?: string }
+> = {
+  messages: { id: 'anthropic', npm: '@ai-sdk/anthropic' },
+  'chat-completions': { id: 'openai-compatible', npm: '@ai-sdk/openai-compatible' }
 }
 
 // The decrypted provider key is handed to opencode via this spawn-env var and referenced from the
@@ -185,8 +192,8 @@ const resolveOpencodeEndpoint = (
   const bareModel = provider.model
   // opencode drives both endpoints; pick the one for this provider (openai wins when it offers both).
   const endpoint =
-    preferredEndpoint(provider.apiEndpoints ?? ['anthropic'], ['anthropic', 'openai']) ??
-    'anthropic'
+    preferredEndpoint(provider.apiEndpoints ?? ['messages'], ['messages', 'chat-completions']) ??
+    'messages'
   const { id: defaultProviderId, npm } = OPENCODE_ENDPOINT_PROVIDER[endpoint]
   const providerId = provider.agentProviderId ?? defaultProviderId
   // The @ai-sdk/openai-compatible client appends `/chat/completions` to baseURL, so hand it the
@@ -195,10 +202,10 @@ const resolveOpencodeEndpoint = (
   // bridge. The Anthropic AI SDK appends `/messages` (not `/v1/messages`), so its base must carry the
   // `/v1` segment that Claude Code and the validator append themselves.
   const baseURL =
-    endpoint === 'openai'
-      ? (openAiCompletionsBase(provider) ?? provider.baseUrl)
+    endpoint === 'chat-completions'
+      ? (resolveChatCompletionsBaseUrl(provider) ?? provider.baseUrl)
       : provider.baseUrl
-        ? anthropicMessagesBase(provider.baseUrl)
+        ? resolveMessagesBaseUrl(provider.baseUrl)
         : undefined
 
   return { apiKeyEnv: opencodeApiKeyEnv(provider), bareModel, providerId, npm, baseURL }
@@ -287,6 +294,43 @@ const buildOpencodeGoSessionPlugin = (
     '  "chat.headers": async (input, output) => {',
     '    if (!providerIDs.has(input.model.providerID)) return',
     '    output.headers["x-opencode-session"] = input.sessionID',
+    '  }',
+    '})',
+    ''
+  ].join('\n')
+}
+
+const buildOpencodeV2Plugin = (provider: ResolvedProvider, ctx: ModelConfigContext): string => {
+  const providerIds = opencodeModelCatalog(provider, ctx.reasoningEffort, ctx.providerModelCatalog)
+    .filter((entry) => entry.provider.vendorId === 'opencode-go')
+    .map((entry) => resolveOpencodeEndpoint(entry.provider).providerId)
+  return [
+    'import { Plugin } from "@opencode/plugin"',
+    `const servers = new Set(${JSON.stringify(appMcpServerNames('opencode'))})`,
+    `const providerIDs = new Set(${JSON.stringify(providerIds)})`,
+    'export default Plugin.define({',
+    '  id: "open-science-compatibility",',
+    '  async setup(ctx) {',
+    '    await ctx.mcp.transform(editor => {',
+    '      for (const [name, server] of editor.list()) {',
+    '        if (servers.has(name)) server.codemode = false',
+    '      }',
+    '    })',
+    // 2.x returns session/new before async MCP discovery and its tool catalog debounce settle.
+    '    await ctx.session.hook("prompt", async () => {',
+    '      const expected = (await ctx.mcp.list()).data.filter(server => servers.has(server.name)).map(server => server.name)',
+    '      if (!expected.length) return',
+    '      const deadline = Date.now() + 10000',
+    '      do {',
+    '        const available = new Set((await ctx.tool.list()).filter(tool => tool.options?.codemode === false).map(tool => tool.options.namespace))',
+    '        if (expected.every(name => available.has(name))) return',
+    '        await new Promise(resolve => setTimeout(resolve, 20))',
+    '      } while (Date.now() < deadline)',
+    '      throw new Error("OpenCode app tools did not become ready. Reconnect the session and try again.")',
+    '    })',
+    '    await ctx.session.hook("model.request", event => {',
+    '      if (providerIDs.has(event.model.providerID)) event.headers["x-opencode-session"] = event.sessionID',
+    '    })',
     '  }',
     '})',
     ''
@@ -448,6 +492,50 @@ const buildOpencodeConfig = (
 
 export { buildOpencodeConfig }
 
+export const spawnOpenCodeProcess = (
+  input: AgentSpawnInput,
+  command: 'acp' | 'serve',
+  {
+    platform = process.platform,
+    sourceEnv = process.env,
+    spawnProcess = spawn as SpawnProcess
+  }: OpencodeFrameworkDeps = {}
+): ChildProcessWithoutNullStreams => {
+  // `opencode acp` starts the ACP subprocess over stdio, matching the app's existing transport. On
+  // Windows an npm-installed opencode is a `opencode.cmd`/`.bat` shim that Node cannot launch without
+  // a shell (spawn EINVAL, same as Claude's cli.js shim), so those go through the shell with the
+  // path quoted; a native `.exe`/Unix binary spawns directly.
+  const needsShell = platform === 'win32' && /\.(cmd|bat)$/i.test(input.executablePath)
+  const inheritedEnv = { ...augmentedPathEnv(sourceEnv) }
+  // Config overrides bypass HOME/XDG isolation; PURE also disables our required Go plugin.
+  // Drop shell-owned controls, then apply the explicit app backend configuration below.
+  for (const key of Object.keys(inheritedEnv)) {
+    if (
+      [
+        'OPENCODE_CONFIG',
+        'OPENCODE_CONFIG_DIR',
+        'OPENCODE_CONFIG_CONTENT',
+        'OPENCODE_TEST_MANAGED_CONFIG_DIR',
+        'OPENCODE_PLUGIN_META_FILE',
+        'OPENCODE_PURE'
+      ].includes(key.toUpperCase())
+    ) {
+      delete inheritedEnv[key]
+    }
+  }
+
+  return (input.spawnProcess ?? spawnProcess)(
+    needsShell ? `"${input.executablePath}"` : input.executablePath,
+    [command, ...input.args],
+    {
+      env: { ...inheritedEnv, ...input.env },
+      stdio: 'pipe',
+      windowsHide: true,
+      shell: needsShell
+    }
+  )
+}
+
 export const createOpencodeFramework = ({
   platform = process.platform,
   sourceEnv = process.env,
@@ -471,25 +559,10 @@ export const createOpencodeFramework = ({
   // generated config's per-model options, so a change must respawn to take effect.
   supportsLiveEffortChange: false,
   // opencode speaks both Anthropic /v1/messages and OpenAI /v1/chat/completions.
-  supportedApiTypes: ['anthropic', 'openai'],
+  supportedApiTypes: ['messages', 'chat-completions'],
 
   spawn(input: AgentSpawnInput): ChildProcessWithoutNullStreams {
-    // `opencode acp` starts the ACP subprocess over stdio, matching the app's existing transport. On
-    // Windows an npm-installed opencode is a `opencode.cmd`/`.bat` shim that Node cannot launch without
-    // a shell (spawn EINVAL, same as Claude's cli.js shim), so those go through the shell with the
-    // path quoted; a native `.exe`/Unix binary spawns directly.
-    const needsShell = platform === 'win32' && /\.(cmd|bat)$/i.test(input.executablePath)
-
-    return (input.spawnProcess ?? spawnProcess)(
-      needsShell ? `"${input.executablePath}"` : input.executablePath,
-      ['acp', ...input.args],
-      {
-        env: { ...augmentedPathEnv(sourceEnv), ...input.env },
-        stdio: 'pipe',
-        windowsHide: true,
-        shell: needsShell
-      }
-    )
+    return spawnOpenCodeProcess(input, 'acp', { platform, sourceEnv, spawnProcess })
   },
 
   prepareModelConfig(provider: ResolvedProvider, ctx: ModelConfigContext): AgentModelConfig {
@@ -500,17 +573,24 @@ export const createOpencodeFramework = ({
     const dataHome = opencodeDataHome(ctx.storageRoot)
     const opencodeDir = join(configHome, 'opencode')
     const configPath = join(opencodeDir, 'opencode.json')
-    const configFiles = [
+    const v2PluginDir = ctx.nativeVersion?.startsWith('2.')
+      ? join(opencodeDir, 'open-science-v2')
+      : undefined
+    const configFiles: NonNullable<AgentModelConfig['configFiles']> = [
       { path: configPath, content: '' },
       {
-        path: join(opencodeDir, 'plugins', OPENCODE_GO_SESSION_PLUGIN),
+        path: v2PluginDir
+          ? join(v2PluginDir, 'index.ts')
+          : join(opencodeDir, 'plugins', OPENCODE_GO_SESSION_PLUGIN),
         // Always rewrite the app-owned plugin, including with an empty provider set, so switching
         // away from Go cannot leave a previously generated provider match active on disk.
-        content: buildOpencodeGoSessionPlugin(
-          provider,
-          ctx.reasoningEffort,
-          ctx.providerModelCatalog ?? []
-        )
+        content: v2PluginDir
+          ? buildOpencodeV2Plugin(provider, ctx)
+          : buildOpencodeGoSessionPlugin(
+              provider,
+              ctx.reasoningEffort,
+              ctx.providerModelCatalog ?? []
+            )
       }
     ]
 
@@ -525,26 +605,37 @@ export const createOpencodeFramework = ({
         .filter(Boolean)
         .join('\n\n')
       if (instructions) {
-        const instructionsPath = join(opencodeDir, 'instructions', 'open-science.md')
+        const instructionsPath = join(
+          opencodeDir,
+          'instructions',
+          `open-science-${createHash('sha256').update(instructions).digest('hex')}.md`
+        )
         instructionPaths.push(instructionsPath)
         persistentInstructions.push(instructions)
-        configFiles.push({ path: instructionsPath, content: instructions })
+        configFiles.push({ path: instructionsPath, content: instructions, contentAddressed: true })
       }
     }
     if (ctx.instructions) {
-      const instructionsPath = join(opencodeDir, 'instructions', 'connectors.md')
+      const instructionsPath = join(
+        opencodeDir,
+        'instructions',
+        `connectors-${createHash('sha256').update(ctx.instructions).digest('hex')}.md`
+      )
       instructionPaths.push(instructionsPath)
       persistentInstructions.push(ctx.instructions)
-      configFiles.push({ path: instructionsPath, content: ctx.instructions })
+      configFiles.push({
+        path: instructionsPath,
+        content: ctx.instructions,
+        contentAddressed: true
+      })
     }
 
     configFiles[0].content = buildOpencodeConfig(
       provider,
       {},
-      instructionPaths,
+      [],
       ctx.reasoningEffort,
-      ctx.providerModelCatalog,
-      ctx.storageRoot
+      ctx.providerModelCatalog
     )
 
     return {
@@ -576,14 +667,38 @@ export const createOpencodeFramework = ({
         // against the only remaining non-repo surface, the user's own ~/.opencode: it cannot repoint the
         // active provider's baseURL or swap the model to an attacker provider while inheriting the app's
         // `{env:...}` key ref. The key itself never rides this layer, only its env reference.
-        OPENCODE_CONFIG_CONTENT: JSON.stringify(
-          buildAppConfigContent(
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          ...buildAppConfigContent(
             provider,
             ctx.reasoningEffort,
             ctx.providerModelCatalog,
             ctx.storageRoot
-          )
-        ),
+          ),
+          instructions: instructionPaths,
+          ...(v2PluginDir ? { plugins: [v2PluginDir] } : {}),
+          ...(ctx.skillDiscovery
+            ? {
+                permission: {
+                  ...opencodePermissionRules(),
+                  external_directory: {
+                    '*': 'deny',
+                    ...Object.fromEntries(
+                      ctx.skillDiscovery.allowedPaths.map((path) => [
+                        join(dirname(path), '*'),
+                        'allow'
+                      ])
+                    )
+                  },
+                  skill: {
+                    '*': 'deny',
+                    ...Object.fromEntries(
+                      ctx.skillDiscovery.allowedNames.map((name) => [name, 'ask'])
+                    )
+                  }
+                }
+              }
+            : {})
+        }),
         // Pass credentials only through referenced environment values. Generation-local transport
         // routes use distinct variables so late OpenCode background work cannot inherit a new route.
         ...Object.fromEntries(

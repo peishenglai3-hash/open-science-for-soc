@@ -16,12 +16,13 @@ import {
   parseConfiguredModelKey,
   type ConfiguredModelCatalogEntry
 } from '../../../../shared/configured-model-catalog'
-import type { ReasoningEffort } from '../../../../shared/model-preference-contract'
-import { resolveProviderReasoningEffortProfile } from '../../../../shared/provider-reasoning-effort'
+import { type ReasoningEffort } from '../../../../shared/model-preference-contract'
 import {
   projectReasoningEffortIntent,
   resolveReasoningEffortControl
 } from '../../../../shared/reasoning-effort'
+import { resolveProviderReasoningEffortProfile } from '../../../../shared/provider-reasoning-effort'
+
 import { isCodexSubscriptionProvider } from '../../../../shared/settings'
 import { providerKindKey } from './provider-form-value'
 import { ProviderKindIcon } from './provider-icons'
@@ -195,7 +196,7 @@ const ModelPolicySelect = (props: ModelPolicySelectProps): React.JSX.Element => 
                   <span className="truncate">
                     {selectedEntry.label}
                     <span className="ml-1.5 text-muted-foreground">
-                      · {selectedEntry.providerName}
+                      / {selectedEntry.providerName}
                     </span>
                   </span>
                 </>
@@ -203,7 +204,7 @@ const ModelPolicySelect = (props: ModelPolicySelectProps): React.JSX.Element => 
                 <span className="truncate">{disabledLabel}</span>
               ) : unavailable ? (
                 <span className="truncate">
-                  {configuration.model} · {configuration.providerId} · {t('Unavailable')}
+                  {configuration.model} / {configuration.providerId} / {t('Unavailable')}
                 </span>
               ) : (
                 <span className="truncate">{inheritLabel}</span>
@@ -214,7 +215,7 @@ const ModelPolicySelect = (props: ModelPolicySelectProps): React.JSX.Element => 
             <SelectItem value={INHERIT_KEY}>{inheritLabel}</SelectItem>
             {unavailable ? (
               <SelectItem value={selectedKey} disabled>
-                {configuration.model} · {configuration.providerId} · {t('Unavailable')}
+                {configuration.model} / {configuration.providerId} / {t('Unavailable')}
               </SelectItem>
             ) : null}
             {groups.map(({ provider, entries }) => (
@@ -231,7 +232,7 @@ const ModelPolicySelect = (props: ModelPolicySelectProps): React.JSX.Element => 
                       />
                     }
                   >
-                    {entry.label} · {entry.providerName}
+                    {entry.label} / {entry.providerName}
                   </SelectItem>
                 ))}
               </SelectGroup>

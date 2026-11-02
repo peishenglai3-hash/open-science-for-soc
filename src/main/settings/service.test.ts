@@ -1,3 +1,4 @@
+import { OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION } from '../skills/runtime-mcp-server'
 import { configureTestElectronHost } from '../../../test/runtime-host'
 import { existsSync } from 'node:fs'
 import {
@@ -16,7 +17,7 @@ import { tmpdir } from 'node:os'
 import { execPath } from 'node:process'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { defaultVendorModel } from '../../shared/provider-registry'
+import { defaultVendorModel } from '../../shared/provider-model-policy'
 import {
   CLAUDE_ISOLATED_PROVIDER_ID,
   CLAUDE_SHARED_PROVIDER_ID,
@@ -61,7 +62,8 @@ vi.mock('electron', () => ({
 
 const { initDataRoot } = await import('../storage-root')
 const { SettingsService } = await import('./service')
-const { ResponsesBridge: ResponsesBridgeClass } = await import('./responses-bridge')
+const { ResponsesToChatCompletionsBridge: ResponsesToChatCompletionsBridgeClass } =
+  await import('./responses-to-chat-completions-bridge')
 const { SettingsRepository } = await import('./repository')
 const { getAppClaudeConfigDir } = await import('./provider-env')
 const { getClaudeSkillRuntimeRoot } = await import('./claude-runtime-provisioner')
@@ -210,6 +212,7 @@ const createService = (
     userSkills?: UserSkillRepositoryType
     log?: Logger
     installCoordinator?: SettingsInstallCoordinator
+    withNotebookFolderPolicyChange?: SettingsServiceOptions['withNotebookFolderPolicyChange']
     wslSetup?: SettingsServiceOptions['wslSetup']
     getNotebookNetworkStatus?: SettingsServiceOptions['getNotebookNetworkStatus']
     wsl2PreviewStatus?: SettingsServiceOptions['wsl2PreviewStatus']
@@ -217,6 +220,7 @@ const createService = (
 ): InstanceType<typeof SettingsService> =>
   new SettingsService({
     repository,
+    withNotebookFolderPolicyChange: options.withNotebookFolderPolicyChange,
     log: options.log ?? silentLog,
     configRoot: storageRoot,
     // Point at a non-existent user Claude dir so tests never read the real ~/.claude. The same
@@ -903,7 +907,11 @@ describe('SettingsService: custom MCP OAuth', () => {
     const id = added.customServers[0].id
     const authenticator = vi.fn(async (serverId: string) => {
       await service.saveCustomServerOAuthState(serverId, {
-        tokens: { access_token: 'access', token_type: 'Bearer' }
+        tokens: {
+          access_token: 'access',
+          token_type: 'Bearer',
+          issuer: 'https://auth.example.test/'
+        }
       })
     })
     const cancel = vi.fn(async () => undefined)
@@ -938,7 +946,7 @@ describe('SettingsService: custom MCP OAuth', () => {
     })
     const id = added.customServers[0].id
     await service.saveCustomServerOAuthState(id, {
-      tokens: { access_token: 'access', token_type: 'Bearer' }
+      tokens: { access_token: 'access', token_type: 'Bearer', issuer: 'https://auth.example.test/' }
     })
     const disconnectRuntime = vi.fn(async () => undefined)
     service.setDeviceCredentialAuthenticator(vi.fn(), vi.fn(), disconnectRuntime)
@@ -1259,18 +1267,6 @@ describe('SettingsService: providers', () => {
         type: 'codex-isolated',
         name,
         apiEndpoints: ['responses'],
-        models: [
-          'gpt-5.6-sol',
-          'gpt-6-astra',
-          'gpt-6.1-sol',
-          'gpt-6-sol',
-          'gpt-6-luna',
-          'gpt-5.6-terra',
-          'gpt-5.6-luna',
-          'gpt-5.5',
-          'gpt-5.4',
-          'gpt-5.4-mini'
-        ],
         hasKey: false
       })
     ])
@@ -1909,7 +1905,9 @@ describe('SettingsService: providers', () => {
 
     expect(backend.persistentSystemPrompt).toContain('Stable Open-Science app guidance.')
     const appInstructions = await readFile(
-      join(storageRoot, 'opencode', 'config', 'opencode', 'instructions', 'open-science.md'),
+      JSON.parse(backend.env.OPENCODE_CONFIG_CONTENT).instructions.find((path: string) =>
+        /open-science-[a-f0-9]+\.md$/.test(path)
+      ),
       'utf8'
     )
     expect(appInstructions).toContain('Stable Open-Science app guidance.')
@@ -1917,14 +1915,17 @@ describe('SettingsService: providers', () => {
     expect(appInstructions).toContain(join(storageRoot, 'skills', 'imported'))
 
     const baseline = await readFile(
-      join(storageRoot, 'opencode', 'config', 'opencode', 'instructions', 'connectors.md'),
+      JSON.parse(backend.env.OPENCODE_CONFIG_CONTENT).instructions.find((path: string) =>
+        /connectors-[a-f0-9]+\.md$/.test(path)
+      ),
       'utf8'
     )
     expect(baseline).toContain('host.mcp')
     expect(baseline).toContain('mcp-*')
     expect(baseline).toContain('Load the matching `mcp-*` skill before the first `host.mcp` call')
     expect(baseline).toContain('Never guess a connector server or method name')
-    expect(baseline).toContain('`mcp-xt`')
+    expect(baseline).not.toContain('`mcp-xt`')
+    expect(JSON.parse(backend.env.OPENCODE_CONFIG_CONTENT).permission.skill['mcp-xt']).toBe('ask')
     expect(baseline).not.toContain('Use XT records.')
     expect(baseline).not.toContain('host.mcp("xt"')
     expect(baseline).not.toContain('pubchem_get_compounds')
@@ -2144,7 +2145,7 @@ describe('SettingsService: validation', () => {
         baseUrl: 'https://g',
         model: 'm',
         key: 'k',
-        apiEndpoints: ['openai']
+        apiEndpoints: ['chat-completions']
       })
     ).providers[0]
 
@@ -2171,7 +2172,7 @@ describe('SettingsService: validation', () => {
         baseUrl: 'https://g',
         model: 'm',
         key: 'k',
-        apiEndpoints: ['anthropic', 'openai']
+        apiEndpoints: ['messages', 'chat-completions']
       })
     ).providers[0]
 
@@ -2288,7 +2289,7 @@ describe('SettingsService: validation', () => {
         name: 'G',
         baseUrl: 'https://g/v1',
         model: 'm',
-        apiEndpoints: ['anthropic'],
+        apiEndpoints: ['messages'],
         key: 'k'
       })
     ).providers[0]
@@ -2413,7 +2414,7 @@ describe('SettingsService: validation', () => {
       await service.upsertProvider({
         type: 'custom',
         name: 'Chat Gateway',
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['chat-completions'],
         baseUrl: 'https://g/v1',
         model: 'm',
         key: 'k'
@@ -2470,6 +2471,7 @@ describe('SettingsService: preflight & spawn config', () => {
       opencodeReady: false,
       codexReady: false,
       codebuddyReady: false,
+      piReady: false,
       agentFrameworkId: 'claude-code',
       agentReady: true,
       activeProviderReady: true,
@@ -3588,7 +3590,7 @@ describe('SettingsService: preflight & spawn config', () => {
       await service.upsertProvider({
         type: 'custom',
         name: 'Chat Gateway',
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['chat-completions'],
         baseUrl: 'https://api.deepseek.com/v1',
         model: 'deepseek-v4-pro',
         contextWindow: 1_000_000,
@@ -3689,7 +3691,7 @@ describe('SettingsService: preflight & spawn config', () => {
     )
     expect(pubmedSkill).toContain('host.mcp')
 
-    await backend.responsesBridgeLease?.release()
+    await backend.responsesTransportLease?.release()
     await repository.setConversationSkillImportEnabled(false)
     upstreamRequest = undefined
     const disabledBackend = await resolveActiveBackend(service)
@@ -3712,7 +3714,7 @@ describe('SettingsService: preflight & spawn config', () => {
     ).map((tool) => tool.function?.name)
     expect(disabledToolNames).toContain('mcp__open_science_notebook__notebook_execute')
     expect(disabledToolNames).not.toContain('mcp__open_science_skills__request_skill_import')
-    await disabledBackend.responsesBridgeLease?.release()
+    await disabledBackend.responsesTransportLease?.release()
   })
 
   it('keeps bridged Codex backends pinned to the provider target they were created for', async () => {
@@ -3768,7 +3770,7 @@ describe('SettingsService: preflight & spawn config', () => {
       await service.upsertProvider({
         type: 'custom',
         name: 'Provider One',
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['chat-completions'],
         baseUrl: 'https://one.example/v1',
         model: 'model-one',
         key: 'key-one'
@@ -3778,7 +3780,7 @@ describe('SettingsService: preflight & spawn config', () => {
       await service.upsertProvider({
         type: 'custom',
         name: 'Provider Two',
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['chat-completions'],
         baseUrl: 'https://two.example/v1',
         model: 'model-two',
         key: 'key-two'
@@ -3798,8 +3800,8 @@ describe('SettingsService: preflight & spawn config', () => {
       secondBackend.providerConfiguration?.baseUrl
     )
 
-    firstBackend.responsesBridgeLease?.registerReviewerSession('reviewer-one')
-    secondBackend.responsesBridgeLease?.registerReviewerSession('reviewer-two')
+    firstBackend.responsesTransportLease?.registerReviewerSession('reviewer-one')
+    secondBackend.responsesTransportLease?.registerReviewerSession('reviewer-two')
 
     const send = async (backend: typeof firstBackend, promptCacheKey: string): Promise<void> => {
       const response = await localFetch(`${backend.providerConfiguration?.baseUrl}/responses`, {
@@ -3838,14 +3840,18 @@ describe('SettingsService: preflight & spawn config', () => {
       expect.arrayContaining(['mcp__open_science_reviewer__submit_findings'])
     ])
 
-    await firstBackend.responsesBridgeLease?.release()
-    await secondBackend.responsesBridgeLease?.release()
+    await firstBackend.responsesTransportLease?.release()
+    await secondBackend.responsesTransportLease?.release()
   })
 
   it('closes and evicts a responses bridge whose start fails', async () => {
     const startError = new Error('bridge start failed')
-    const startSpy = vi.spyOn(ResponsesBridgeClass.prototype, 'start').mockRejectedValue(startError)
-    const closeSpy = vi.spyOn(ResponsesBridgeClass.prototype, 'close').mockResolvedValue(undefined)
+    const startSpy = vi
+      .spyOn(ResponsesToChatCompletionsBridgeClass.prototype, 'start')
+      .mockRejectedValue(startError)
+    const closeSpy = vi
+      .spyOn(ResponsesToChatCompletionsBridgeClass.prototype, 'close')
+      .mockResolvedValue(undefined)
     const adapterPath = join(storageRoot, 'bin', 'codex-acp')
     await mkdir(dirname(adapterPath), { recursive: true })
     await writeFile(adapterPath, MANAGED_CODEX_ADAPTER_FIXTURE, 'utf8')
@@ -3865,7 +3871,7 @@ describe('SettingsService: preflight & spawn config', () => {
       await service.upsertProvider({
         type: 'custom',
         name: 'Broken bridge provider',
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['chat-completions'],
         baseUrl: 'https://broken.example/v1',
         model: 'model-one',
         key: 'key-one'
@@ -3957,7 +3963,7 @@ describe('SettingsService: preflight & spawn config', () => {
     expect(backend.authentication).toBeUndefined()
     expect(backend.env.CODEX_CONFIG).not.toContain('mm-secret')
 
-    await backend.responsesBridgeLease?.release()
+    await backend.responsesTransportLease?.release()
   })
 
   it('builds spawn env from the active provider with the decrypted key', async () => {
@@ -4740,11 +4746,13 @@ describe('SettingsService: skills', () => {
     expect(resolved?.body).not.toContain('name: mcp-molecule')
   })
 
-  it('does not resolve a disabled bundled connector skill', async () => {
+  it('previews a bundled definition independently of Main runtime permission', async () => {
     const service = await createSkillService()
     await service.setConnectorEnabled({ id: 'molecule', enabled: false })
 
-    await expect(service.resolveSkillDocument({ name: 'mcp-molecule' })).resolves.toBeNull()
+    await expect(service.resolveSkillDocument({ name: 'mcp-molecule' })).resolves.toMatchObject({
+      name: 'mcp-molecule'
+    })
   })
 
   it('resolves a materialized custom connector skill from the provisioned source dir', async () => {
@@ -4939,7 +4947,7 @@ describe('SettingsService: skills', () => {
     ])
   })
 
-  it('force-loads a disabled picked skill for the turn without mutating stored settings', async () => {
+  it('prepares disabled source documents without granting Main or mutating stored settings', async () => {
     const service = await createSkillService()
 
     await repository.setClaudeInfo({ resolvedPath: execPath, version: '2.1.118' })
@@ -4961,14 +4969,28 @@ describe('SettingsService: skills', () => {
         () => false
       )
 
-    // Disabled: the skill is not materialized on a normal spawn.
+    // Source documents are prepared independently of per-session authorization.
     const disabledBackend = await resolveActiveBackend(service)
     expect(
+      (
+        disabledBackend.sessionOptions?.[OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION] as {
+          mainAllowedNames: string[]
+        }
+      ).mainAllowedNames
+    ).not.toContain('demo')
+    expect(
       await exists(join(claudeSkillProjectionRoot(disabledBackend), '.claude', 'skills', 'demo'))
-    ).toBe(false)
+    ).toBe(true)
 
-    // Turn-forced: the disabled skill is materialized for this spawn only.
+    // A Specialist force-load cannot transfer its authority into a shared Main session.
     const forcedBackend = await resolveActiveBackend(service, { forcedSkillIds: ['demo'] })
+    expect(
+      (
+        forcedBackend.sessionOptions?.[OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION] as {
+          mainAllowedNames: string[]
+        }
+      ).mainAllowedNames
+    ).not.toContain('demo')
     expect(
       await exists(join(claudeSkillProjectionRoot(forcedBackend), '.claude', 'skills', 'demo'))
     ).toBe(true)
@@ -4977,11 +4999,18 @@ describe('SettingsService: skills', () => {
     const skills = await service.listSkills()
     expect(skills.find((skill) => skill.id === 'demo')?.enabled).toBe(false)
 
-    // Clearing the force set removes it again on the next spawn.
+    // Main remains unable to discover it after the Specialist turn closes.
     const clearedBackend = await resolveActiveBackend(service)
     expect(
+      (
+        clearedBackend.sessionOptions?.[OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION] as {
+          mainAllowedNames: string[]
+        }
+      ).mainAllowedNames
+    ).not.toContain('demo')
+    expect(
       await exists(join(claudeSkillProjectionRoot(clearedBackend), '.claude', 'skills', 'demo'))
-    ).toBe(false)
+    ).toBe(true)
   })
 
   it('keeps the shared Claude profile private while exposing only canonical Skill identities', async () => {
@@ -5908,7 +5937,8 @@ describe('SettingsService: managed-runtime flags', () => {
       { id: 'claude-code', supportsDelegatedWork: true },
       { id: 'opencode', supportsDelegatedWork: true },
       { id: 'codex', supportsDelegatedWork: true },
-      { id: 'codebuddy', supportsDelegatedWork: true }
+      { id: 'codebuddy', supportsDelegatedWork: true },
+      { id: 'pi', supportsDelegatedWork: true }
     ])
   })
 
@@ -6359,7 +6389,7 @@ describe('SettingsService: reasoning effort', () => {
       await service.upsertProvider({
         type: 'custom',
         name: 'DeepSeek',
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['chat-completions'],
         baseUrl: 'https://api.deepseek.com',
         model: 'deepseek-v4-flash',
         key: 'test-key'
@@ -6388,18 +6418,18 @@ describe('SettingsService: reasoning effort', () => {
     expect(upstreamRequest).not.toHaveProperty('reasoning_effort')
 
     // The active runtime owns this lease, so it updates only the bridge for its own provider/model.
-    backend.responsesBridgeLease?.setReasoningEffort?.('high')
+    backend.responsesTransportLease?.setReasoningEffort?.('high')
     await post()
     expect(upstreamRequest).toMatchObject({ reasoning_effort: 'high' })
 
     // The bridge receives the concrete mapped value, not a forwarding boolean: it replaces Codex's
     // own request effort instead of letting an incompatible value leak to the selected model.
-    backend.responsesBridgeLease?.setReasoningEffort?.('max')
+    backend.responsesTransportLease?.setReasoningEffort?.('max')
     await post()
     expect(upstreamRequest).toMatchObject({ reasoning_effort: 'max' })
 
     // Back to 'default': stripping is restored so Codex's own effort can't leak upstream.
-    backend.responsesBridgeLease?.setReasoningEffort?.(undefined)
+    backend.responsesTransportLease?.setReasoningEffort?.(undefined)
     await post()
     expect(upstreamRequest).not.toHaveProperty('reasoning_effort')
   })
@@ -6411,7 +6441,7 @@ describe('SettingsService: Subagent model', () => {
     const created = await service.upsertProvider({
       type: 'custom',
       name: 'Session provider',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://session.example/v1',
       model: 'subagent-model',
       key: 'secret'
@@ -6441,7 +6471,7 @@ describe('SettingsService: Subagent model', () => {
     const created = await service.upsertProvider({
       type: 'custom',
       name: 'Subagent gateway',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://subagent.example/v1',
       model: 'subagent-model',
       key: 'secret'
@@ -6468,7 +6498,7 @@ describe('SettingsService: Subagent model', () => {
     const created = await service.upsertProvider({
       type: 'custom',
       name: 'Ephemeral admitted gateway',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://subagent.example/v1',
       model: 'subagent-model',
       key: 'secret'
@@ -6509,7 +6539,7 @@ describe('SettingsService: Subagent model', () => {
     const draft = {
       type: 'custom' as const,
       name: 'Restorable Subagent gateway',
-      apiEndpoints: ['anthropic' as const],
+      apiEndpoints: ['messages' as const],
       baseUrl: 'https://subagent.example/v1',
       model: 'subagent-model',
       key: 'secret'
@@ -6557,7 +6587,7 @@ describe('SettingsService: Subagent model', () => {
     const created = await service.upsertProvider({
       type: 'custom',
       name: 'Failing Subagent gateway',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://subagent.example/v1',
       model: 'subagent-model',
       key: 'secret'
@@ -6582,7 +6612,7 @@ describe('SettingsService: Subagent model', () => {
     const created = await service.upsertProvider({
       type: 'custom',
       name: 'No-effort gateway',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://subagent.example/v1',
       model: 'no-effort-model',
       key: 'secret',
@@ -6608,7 +6638,7 @@ describe('SettingsService: Reviewer model', () => {
     const created = await service.upsertProvider({
       type: 'custom',
       name: 'Routing gateway',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://routing.example/v1',
       model: 'routing-model',
       key: 'secret'
@@ -6648,7 +6678,7 @@ describe('SettingsService: Reviewer model', () => {
     const created = await service.upsertProvider({
       type: 'custom',
       name: 'Reviewer gateway',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://reviewer.example/v1',
       model: 'reviewer-model',
       key: 'secret'
@@ -6675,7 +6705,7 @@ describe('SettingsService: Reviewer model', () => {
     const created = await service.upsertProvider({
       type: 'custom',
       name: 'Admitted Reviewer gateway',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://reviewer.example/v1',
       model: 'reviewer-model',
       key: 'secret'
@@ -6710,7 +6740,7 @@ describe('SettingsService: Reviewer model', () => {
     const created = await service.upsertProvider({
       type: 'custom',
       name: 'Overridden Reviewer gateway',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://reviewer.example/v1',
       model: 'reviewer-model',
       key: 'secret'
@@ -6741,7 +6771,7 @@ describe('SettingsService: Reviewer model', () => {
     const created = await service.upsertProvider({
       type: 'custom',
       name: 'Failing Reviewer gateway',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://reviewer.example/v1',
       model: 'reviewer-model',
       key: 'secret'
@@ -6768,7 +6798,7 @@ describe('SettingsService: Reviewer model', () => {
     const created = await service.upsertProvider({
       type: 'custom',
       name: 'Restorable Reviewer gateway',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://reviewer.example/v1',
       model: 'reviewer-model',
       key: 'secret'
@@ -6798,7 +6828,7 @@ describe('SettingsService: Reviewer model', () => {
     const created = await service.upsertProvider({
       type: 'custom',
       name: 'Active Reviewer gateway',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://active.example/v1',
       model: 'active-model',
       key: 'secret'
@@ -6840,7 +6870,7 @@ describe('SettingsService: Vision model', () => {
     const created = await service.upsertProvider({
       type: 'custom',
       name: 'Vision gateway',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://vision.example/v1',
       model: 'vision-model',
       key: 'secret',
@@ -6869,7 +6899,7 @@ describe('SettingsService: Vision model', () => {
     const visual = await service.upsertProvider({
       type: 'custom',
       name: 'Visual gateway',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://vision.example/v1',
       model: 'vision-model',
       key: 'secret',
@@ -6884,7 +6914,7 @@ describe('SettingsService: Vision model', () => {
     const textOnly = await service.upsertProvider({
       type: 'custom',
       name: 'Text gateway',
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       baseUrl: 'https://text.example/v1',
       model: 'text-model',
       key: 'secret',
@@ -7805,11 +7835,13 @@ describe('SettingsService: claude-isolated login + status coordination', () => {
   })
 
   it('does not restore a token cleared while its login probe is still running', async () => {
+    const started = Promise.withResolvers<void>()
     let finishProbe: (() => void) | undefined
     const probe = vi.fn(
       () =>
         new Promise<void>((resolve) => {
           finishProbe = resolve
+          started.resolve()
         })
     )
     const service = createService(undefined, { executeClaudeProbe: probe })
@@ -7821,7 +7853,8 @@ describe('SettingsService: claude-isolated login + status coordination', () => {
     })
 
     const login = service.loginIsolatedClaude('sk-ant-valid')
-    await vi.waitFor(() => expect(probe).toHaveBeenCalledOnce())
+    await started.promise
+    expect(probe).toHaveBeenCalledOnce()
     await service.logoutIsolatedClaude()
     finishProbe?.()
 
@@ -8968,3 +9001,94 @@ describe('Notebook protection Shell capability switch', () => {
 })
 
 await configureTestElectronHost(await import('electron'))
+
+describe('Notebook folder restriction settings', () => {
+  it('defaults legacy settings to enabled and persists only after process shutdown succeeds', async () => {
+    const lifecycle = vi.fn(async (commit: () => Promise<void>) => {
+      expect((await repository.getSettings()).notebookFolderRestrictionEnabled).toBeUndefined()
+      await commit()
+    })
+    const service = createService(undefined, { withNotebookFolderPolicyChange: lifecycle })
+    expect(await service.getNotebookFolderRestrictionEnabled()).toBe(true)
+    await service.setNotebookFolderRestrictionEnabled(false)
+    expect(lifecycle).toHaveBeenCalledOnce()
+    expect(
+      (await new SettingsRepository(storageRoot).getSettings()).notebookFolderRestrictionEnabled
+    ).toBe(false)
+    expect(await service.getNotebookFolderRestrictionEnabled()).toBe(false)
+    await service.setNotebookFolderRestrictionEnabled(false)
+    expect(lifecycle).toHaveBeenCalledOnce()
+  })
+
+  it('preserves the prior policy when shutdown fails and rejects untyped values', async () => {
+    const service = createService(undefined, {
+      withNotebookFolderPolicyChange: async () => {
+        throw new Error('unreaped process')
+      }
+    })
+    await expect(service.setNotebookFolderRestrictionEnabled(false)).rejects.toThrow(
+      'unreaped process'
+    )
+    expect(await service.getNotebookFolderRestrictionEnabled()).toBe(true)
+    expect(() =>
+      service.setNotebookFolderRestrictionEnabled('false' as unknown as boolean)
+    ).toThrow('Invalid Notebook folder restriction flag')
+  })
+})
+
+describe('Global network grant publication', () => {
+  it('publishes only after the durable grant has finalized', async () => {
+    const calls: string[] = []
+    const publish = vi.fn(async () => {
+      expect((await repository.getSettings()).notebookNetwork?.allowedDomains).toContain(
+        'data.example.org'
+      )
+      calls.push('publish')
+    })
+    const service = new SettingsService({
+      repository,
+      configRoot: storageRoot,
+      applyNotebookNetwork: async () => {
+        calls.push('apply')
+      },
+      onNotebookNetworkDomainAllowed: publish,
+      log: silentLog
+    })
+    await service.allowNotebookNetworkDomain('data.example.org', undefined, async () => {
+      calls.push('finalize')
+    })
+    expect(calls).toEqual(['apply', 'finalize', 'publish'])
+  })
+
+  it('does not publish a grant whose finalization rolls back', async () => {
+    const publish = vi.fn()
+    const service = new SettingsService({
+      repository,
+      configRoot: storageRoot,
+      onNotebookNetworkDomainAllowed: publish,
+      log: silentLog
+    })
+    await expect(
+      service.allowNotebookNetworkDomain('data.example.org', undefined, async () => {
+        throw new Error('cancelled')
+      })
+    ).rejects.toThrow('cancelled')
+    expect(publish).not.toHaveBeenCalled()
+    expect((await service.getNotebookNetwork()).allowedDomains).not.toContain('data.example.org')
+  })
+
+  it('keeps committed consent when publication fails', async () => {
+    const service = new SettingsService({
+      repository,
+      configRoot: storageRoot,
+      onNotebookNetworkDomainAllowed: async () => {
+        throw new Error('offline')
+      },
+      log: silentLog
+    })
+    await expect(service.allowNotebookNetworkDomain('data.example.org')).resolves.toMatchObject({
+      allowedDomains: ['data.example.org']
+    })
+    expect((await service.getNotebookNetwork()).allowedDomains).toContain('data.example.org')
+  })
+})

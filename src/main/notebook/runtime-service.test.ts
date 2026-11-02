@@ -76,7 +76,7 @@ import {
   writeReadyMarker,
   writeRReadyMarker
 } from '@aipoch/environment'
-import type { NotebookShellProcess } from './shell-process'
+import { ShellPreparationError, type NotebookShellProcess } from './shell-process'
 import * as windowsNotebookRuntime from './windows-notebook-runtime'
 import { NOTEBOOK_CODE_LIMIT_BYTES } from './content-limits'
 import type { RuntimeDiagnosticLogger } from '@aipoch/diagnostics/node'
@@ -220,6 +220,40 @@ const lifecycleCallbackHarness = (
 }
 
 describe('notebook runtime service', () => {
+  it('holds session creation behind a folder policy commit and releases admission after failure', async () => {
+    const root = await createStorageRoot()
+    const service = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectId: 'default-project'
+    })
+    const started = createDeferred<void>()
+    const release = createDeferred<void>()
+    const change = service.shutdownAll({
+      afterShutdown: async () => {
+        started.resolve()
+        await release.promise
+        throw new Error('settings write failed')
+      }
+    })
+    const rejected = expect(change).rejects.toThrow('settings write failed')
+    await started.promise
+    let opened = false
+    const state = service
+      .state({ sessionId: 'folder-policy', workspaceCwd: root })
+      .then((value) => {
+        opened = true
+        return value
+      })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(opened).toBe(false)
+    release.resolve()
+    await rejected
+    await state
+    expect(opened).toBe(true)
+    await service.shutdownAll()
+  })
+
   it('rejects export-locked execution before creating a Notebook or kernel', async () => {
     const root = await createStorageRoot()
     const repository = new NotebookRunRepository(root)
@@ -4507,6 +4541,63 @@ describe('notebook runtime service', () => {
       expect(execute).toHaveBeenCalledOnce()
     })
 
+    it.each([false, true])(
+      'replays completed Shell work without checking current runtime readiness (background: %s)',
+      async (background) => {
+        const root = await createStorageRoot()
+        const result = { stdout: 'completed', stderr: '', exitCode: 0 }
+        const execute = vi.fn<NotebookShellProcess['execute']>().mockResolvedValue(result)
+        const prepareEnvironment = vi.fn().mockResolvedValue({ PATH: 'verified-runtime' })
+        const service = new NotebookRuntimeService({
+          configRoot: root,
+          dataRoot: root,
+          projectId: 'default-project',
+          platform: 'win32',
+          shellRuntimeBinding: { kind: 'powershell', version: '7.6' },
+          shellBackgroundExecutionEnabled: true,
+          shellProcess: { execute, prepareEnvironment }
+        })
+        const request = {
+          sessionId: 'completed-retry',
+          workspaceCwd: root,
+          command: '$PSVersionTable.PSVersion.ToString()',
+          executionInvocationId: 'same-invocation'
+        }
+        try {
+          let runId: string | undefined
+          if (background) {
+            const receipt = await service.executeShellBackground(request)
+            runId = receipt.runId
+            await service.waitForBackgroundRun(runId)
+          } else expect(await service.executeShell(request)).toEqual(result)
+          prepareEnvironment.mockRejectedValue(
+            new ShellPreparationError({
+              stdout: '',
+              stderr: 'Notebook protection changed.',
+              exitCode: null,
+              runtimeStatus: 'unavailable',
+              errorCode: 'shell-runtime-unavailable',
+              recovery: { execution: 'not-started', retryAfter: 'runtime-ready' }
+            })
+          )
+          if (background) {
+            expect((await service.executeShellBackground(request)).runId).toBe(runId)
+            expect((await service.getBackgroundRun({ ...request, runId })).run.status).toBe(
+              'completed'
+            )
+          } else await expect(service.executeShell(request)).resolves.toEqual(result)
+          expect(prepareEnvironment).toHaveBeenCalledOnce()
+          expect(execute).toHaveBeenCalledOnce()
+          const changed = { ...request, command: 'Write-Output different' }
+          await expect(
+            background ? service.executeShellBackground(changed) : service.executeShell(changed)
+          ).rejects.toThrow('NOTEBOOK_RUN_SUBMISSION_CONFLICT')
+        } finally {
+          await service.shutdownAll()
+        }
+      }
+    )
+
     it('blocks unmanaged WSL Bash detachment on a Windows host', async () => {
       const root = await createStorageRoot()
       const execute = vi.fn<NotebookShellProcess['execute']>()
@@ -5268,7 +5359,7 @@ describe('notebook runtime service', () => {
       await vi.waitFor(() => expect(settled).toBe(true), { timeout: 1000 })
     })
 
-    it('releases Shell admission after scope preflight rejects without persisting a Run', async () => {
+    it('releases Shell admission after preparation rejects without persisting a Run', async () => {
       const root = await createStorageRoot()
       const execute = vi.fn<NotebookShellProcess['execute']>()
       const preparedExecute = vi
@@ -5276,7 +5367,7 @@ describe('notebook runtime service', () => {
         .mockResolvedValue({ stdout: 'scoped', stderr: '', exitCode: 0 })
       const prepare = vi
         .fn<NonNullable<NotebookShellProcess['prepare']>>()
-        .mockRejectedValueOnce(new Error('Shell search scope denied: outside cwd'))
+        .mockRejectedValueOnce(new Error('Shell runtime preparation failed'))
         .mockResolvedValue({ execute: preparedExecute, dispose: vi.fn() })
       const service = new NotebookRuntimeService({
         configRoot: root,
@@ -5288,7 +5379,7 @@ describe('notebook runtime service', () => {
       })
       const scope = { sessionId: 'session-1', workspaceCwd: root }
       await expect(service.executeShell({ ...scope, command: 'unsafe-search' })).rejects.toThrow(
-        /search scope denied/i
+        /runtime preparation failed/i
       )
       expect((await service.state(scope)).runs).toEqual([])
       await expect(
@@ -5300,53 +5391,70 @@ describe('notebook runtime service', () => {
       expect((await service.state(scope)).runs).toHaveLength(1)
     })
 
-    it('dispatches a queued Shell Run with the environment frozen at admission', async () => {
-      const root = await createStorageRoot()
-      const originalPath = process.env.PATH ?? ''
-      let releaseFirst!: () => void
-      const firstGate = new Promise<void>((resolve) => {
-        releaseFirst = resolve
-      })
-      const firstStarted = createDeferred<void>()
-      const observedPaths: string[] = []
-      const execute = vi.fn<NotebookShellProcess['execute']>(async (request) => {
-        observedPaths.push(request.environment?.PATH ?? '')
-        if (request.command === 'first') firstStarted.resolve(undefined)
-        if (request.command === 'first') await firstGate
-        return { stdout: '', stderr: '', exitCode: 0 }
-      })
-      const service = new NotebookRuntimeService({
-        configRoot: root,
-        dataRoot: root,
-        projectId: 'default-project',
-        repository: new NotebookRunRepository(root),
-        shellProcess: { execute },
-        shellConcurrencyLimit: 1
-      })
-      const scope = { sessionId: 'session-1', workspaceCwd: root }
-      const first = service.executeShell({ ...scope, command: 'first' })
-      // Filesystem preparation can exceed waitFor's default 1s under CI coverage.
-      await firstStarted.promise
-      const admittedPath = observedPaths[0]
-      expect(admittedPath).toContain(originalPath)
-      const second = service.executeShell({ ...scope, command: 'second' })
-      await vi.waitFor(
-        async () => {
-          const state = await service.state(scope)
-          expect(state.runs.find((run) => run.script === 'second')?.status).toBe('queued')
-        },
-        { timeout: 10_000 }
-      )
-      process.env.PATH = '/mutated-after-admission'
-      try {
-        releaseFirst()
-        await Promise.all([first, second])
-      } finally {
-        process.env.PATH = originalPath
+    it.each(['unique', 'repeated'] as const)(
+      'dispatches a queued Shell Run with the environment frozen at admission (%s PATH entries)',
+      async (pathShape) => {
+        const root = await createStorageRoot()
+        const firstDirectory = join(root, 'admitted-first')
+        const secondDirectory = join(root, 'admitted-second')
+        const directories =
+          pathShape === 'repeated'
+            ? [firstDirectory, secondDirectory, firstDirectory]
+            : [firstDirectory, secondDirectory]
+        vi.stubEnv('PATH', directories.join(delimiter))
+        let releaseFirst!: () => void
+        const firstGate = new Promise<void>((resolve) => {
+          releaseFirst = resolve
+        })
+        const firstStarted = createDeferred<void>()
+        const observedPaths: string[] = []
+        const execute = vi.fn<NotebookShellProcess['execute']>(async (request) => {
+          observedPaths.push(request.environment?.PATH ?? '')
+          if (request.command === 'first') firstStarted.resolve(undefined)
+          if (request.command === 'first') await firstGate
+          return { stdout: '', stderr: '', exitCode: 0 }
+        })
+        const service = new NotebookRuntimeService({
+          configRoot: root,
+          dataRoot: root,
+          projectId: 'default-project',
+          repository: new NotebookRunRepository(root),
+          shellProcess: { execute },
+          shellConcurrencyLimit: 1
+        })
+        const scope = { sessionId: 'session-1', workspaceCwd: root }
+        const first = service.executeShell({ ...scope, command: 'first' })
+        let second: ReturnType<typeof service.executeShell> | undefined
+        try {
+          // Filesystem preparation can exceed waitFor's default 1s under CI coverage.
+          await firstStarted.promise
+          const admittedPath = observedPaths[0]
+          const admittedDirectories = admittedPath.split(delimiter)
+          // Platform PATH preparation may deduplicate directories or prepend trusted tools.
+          expect(admittedDirectories).toEqual(
+            expect.arrayContaining([firstDirectory, secondDirectory])
+          )
+          expect(admittedDirectories.indexOf(firstDirectory)).toBeLessThan(
+            admittedDirectories.indexOf(secondDirectory)
+          )
+          second = service.executeShell({ ...scope, command: 'second' })
+          await vi.waitFor(
+            async () => {
+              const state = await service.state(scope)
+              expect(state.runs.find((run) => run.script === 'second')?.status).toBe('queued')
+            },
+            { timeout: 10_000 }
+          )
+          vi.stubEnv('PATH', join(root, 'mutated-after-admission'))
+          releaseFirst()
+          await Promise.all([first, second])
+          expect(observedPaths).toEqual([admittedPath, admittedPath])
+        } finally {
+          releaseFirst()
+          await Promise.allSettled([first, ...(second ? [second] : [])])
+        }
       }
-
-      expect(observedPaths).toEqual([admittedPath, admittedPath])
-    })
+    )
 
     it('prepares queued Shell sandbox permissions before durable admission', async () => {
       const root = await createStorageRoot()
@@ -9658,8 +9766,13 @@ describe('notebook runtime service', () => {
       const root = await createStorageRoot()
       let active = 0
       let maxConcurrent = 0
+      let finishing = false
       const releases: Array<{ language?: string; release: () => void }> = []
       const service = holdingService(root, (request, resolve) => {
+        if (finishing) {
+          resolve()
+          return
+        }
         active += 1
         maxConcurrent = Math.max(maxConcurrent, active)
         releases.push({ language: request.language, release: resolve })
@@ -9701,22 +9814,26 @@ describe('notebook runtime service', () => {
       const r1 = service.runCell({ sessionId: 's', workspaceCwd: root, cellId: 'r1' })
       const py2 = service.runCell({ sessionId: 's', workspaceCwd: root, cellId: 'py2' })
 
-      // python and r are independent processes → both enter the executor at once; the second python
-      // queues behind the first, so exactly two runs (one python, one r) are in flight.
-      await vi.waitFor(() => expect(releases).toHaveLength(2))
-      await new Promise((resolve) => setTimeout(resolve, 20))
-      expect(releases).toHaveLength(2)
-      expect(maxConcurrent).toBe(2)
-      expect(releases.map((entry) => entry.language).sort()).toEqual(['python', 'r'])
+      try {
+        // python and r are independent processes → both enter the executor at once; the second python
+        // queues behind the first, so exactly two runs (one python, one r) are in flight.
+        await vi.waitFor(() => expect(releases).toHaveLength(2), { timeout: 10_000 })
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        expect(releases).toHaveLength(2)
+        expect(maxConcurrent).toBe(2)
+        expect(releases.map((entry) => entry.language).sort()).toEqual(['python', 'r'])
 
-      // Drain the first python; the queued second python now takes the freed python slot (still only
-      // two concurrent, never three).
-      drain(releases.find((entry) => entry.language === 'python')!)
-      await vi.waitFor(() => expect(releases).toHaveLength(3))
-      expect(maxConcurrent).toBe(2)
-
-      releases.forEach((entry) => entry.release())
-      await Promise.all([py1, r1, py2])
+        // Drain the first python; the queued second python now takes the freed python slot (still only
+        // two concurrent, never three).
+        drain(releases.find((entry) => entry.language === 'python')!)
+        await vi.waitFor(() => expect(releases).toHaveLength(3), { timeout: 10_000 })
+        expect(maxConcurrent).toBe(2)
+      } finally {
+        // Settle queued work before afterEach removes the repository, including assertion failures.
+        finishing = true
+        releases.forEach((entry) => entry.release())
+        await Promise.all([py1, r1, py2])
+      }
     })
 
     it('blocks a package install on the same language until an in-flight run finishes (G2)', async () => {

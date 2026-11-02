@@ -3,7 +3,8 @@ import { OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION } from '../skills/runtime-mcp
 import { DelegatedProcessOwnership } from './process-ownership'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { chmod, lstat, mkdir, readdir, rm } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { filterSpecialistConnectorSkills } from '../../shared/specialist'
 import {
   materializeSessionConversationGraph,
   type PersistedChatSession
@@ -14,6 +15,7 @@ import {
 } from '../../shared/permission-profiles'
 import {
   releaseResolvedAgentBackendLeases,
+  type AgentProcessSpawner,
   type ResolvedAgentBackend,
   type SessionSetup
 } from '../agent-framework'
@@ -116,6 +118,8 @@ const createProductionDelegatedFrameworkRuntime = (
           backend: ResolvedAgentBackend
           connection: NotebookRpcConnection
           preparedSkills?: AcpRuntimeCompositionOptions['preparedSkills']
+          assertProcessAdmission(): void
+          registerOpenCodeStoreRelease(release: () => void): void
         }>
       >()
       // The exact provider/model is validated by admission's model resolver. This certification hook
@@ -157,6 +161,15 @@ const createProductionDelegatedFrameworkRuntime = (
             await makeRuntimeCopyRemovable(runtimeHome)
           }
           await rm(runtimeHome, { recursive: true, force: true })
+        }
+        let processCleanupStarted = false
+        const openCodeStoreReleases = new Set<() => void>()
+        const assertProcessAdmission = (): void => {
+          if (processCleanupStarted) throw new Error('Delegated Attempt cleanup has started.')
+        }
+        const registerOpenCodeStoreRelease = (release: () => void): void => {
+          assertProcessAdmission()
+          openCodeStoreReleases.add(release)
         }
         let openCodeRuntime: PreparedOpenCodeRuntime | undefined
         let preparedSkills: AcpRuntimeCompositionOptions['preparedSkills']
@@ -207,11 +220,68 @@ const createProductionDelegatedFrameworkRuntime = (
               frameworkId === 'claude-code' || frameworkId === 'codebuddy'
                 ? join(root, '.claude')
                 : root
-            preparedSkills = await prepareSkills.call(
-              options.runtime.settingsService,
-              configRoot,
-              effective.skillIds
+            const settingsService = options.runtime.settingsService
+            const [connectorNames, connectors] = await Promise.all([
+              settingsService.provisionedConnectorSkillNames(),
+              settingsService.getConnectors()
+            ])
+            const namesById = new Map(
+              (connectors?.customMcpServers ?? []).map((server) => [server.id, server.name])
             )
+            const publicName = (id: string): string => namesById.get(id) ?? id
+            const connectorSkills = filterSpecialistConnectorSkills(connectorNames, {
+              ...specialist,
+              selectedCapabilities: {
+                ...specialist.selectedCapabilities,
+                connectorIds: specialist.selectedCapabilities.connectorIds.map(publicName)
+              },
+              fullAccess: {
+                ...specialist.fullAccess,
+                excludedConnectorIds: specialist.fullAccess.excludedConnectorIds.map(publicName)
+              }
+            })
+            preparedSkills = await prepareSkills.call(
+              settingsService,
+              configRoot,
+              effective.skillIds,
+              connectorSkills
+            )
+            if (frameworkId === 'opencode') {
+              const allowed = new Set([...effective.frameworkNames, ...connectorSkills])
+              const catalog = preparedSkills.catalog.filter(({ name }) => allowed.has(name))
+              const config = JSON.parse(runtimeBackend.env.OPENCODE_CONFIG_CONTENT ?? '{}')
+              runtimeBackend = {
+                ...runtimeBackend,
+                env: {
+                  ...runtimeBackend.env,
+                  OPENCODE_CONFIG_CONTENT: JSON.stringify({
+                    ...config,
+                    permission: {
+                      ...config.permission,
+                      skill: {
+                        '*': 'deny',
+                        ...Object.fromEntries(catalog.map(({ name }) => [name, 'ask']))
+                      },
+                      external_directory: {
+                        '*': 'deny',
+                        ...Object.fromEntries(
+                          catalog.map(({ path }) => [join(dirname(path), '*'), 'allow'])
+                        )
+                      }
+                    }
+                  })
+                }
+              }
+              runtimeBackend.sessionOptions = {
+                ...runtimeBackend.sessionOptions,
+                [OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION]: {
+                  ...(runtimeBackend.sessionOptions?.[
+                    OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION
+                  ] as Record<string, unknown>),
+                  nativeAllowedNames: catalog.map(({ name }) => name)
+                }
+              }
+            }
             const sessionOptions = runtimeBackend.sessionOptions ?? {}
             const skillRuntime = sessionOptions[OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION] as
               Record<string, unknown> | undefined
@@ -281,7 +351,9 @@ const createProductionDelegatedFrameworkRuntime = (
           preparedAttempts.set(input.attemptId, {
             backend: runtimeBackend,
             preparedSkills,
-            connection: capability
+            connection: capability,
+            assertProcessAdmission,
+            registerOpenCodeStoreRelease
           })
           const base: PreparedDelegateExecution = {
             executionId: input.attemptId,
@@ -308,10 +380,14 @@ const createProductionDelegatedFrameworkRuntime = (
               ? { artifactCurrentRunFile: input.artifactCurrentRunFile }
               : {}),
             async confirmProcessCleanup() {
+              processCleanupStarted = true
               const selection = { ...input.session, attemptId: input.attemptId }
               const hadOwnership = ownership.receipts(selection).length > 0
               await ownership.recover(selection, true)
               ownership.assertClear(selection)
+              // A failed runtime shutdown retains these locks until Attempt recovery proves exit.
+              for (const release of openCodeStoreReleases) release()
+              openCodeStoreReleases.clear()
               // Empty receipts alone are not evidence: a runtime can fail before registering
               // a process. Only successful recovery of recorded ownership supersedes its failure.
               return hadOwnership ? true : undefined
@@ -387,7 +463,19 @@ const createProductionDelegatedFrameworkRuntime = (
         if (!owned) throw new Error('Delegated runtime scope is unavailable.')
         let initialProcess = agentProcess
         const backend = withDelegatedChildContext(owned.backend)
+        const spawnOwnedProcess = ownership.createProcessSpawner({
+          projectId: scope.provenance.projectId,
+          sessionId: scope.provenance.sessionId,
+          frameId: scope.provenance.agentFrameId,
+          attemptId: scope.executionId,
+          frameworkId
+        })
+        const spawnProcess: AgentProcessSpawner = (...args) => {
+          owned.assertProcessAdmission()
+          return spawnOwnedProcess(...args)
+        }
         const spawnOwned = (): ChildProcessWithoutNullStreams => {
+          owned.assertProcessAdmission()
           if (initialProcess) {
             const process = initialProcess
             initialProcess = undefined
@@ -400,19 +488,7 @@ const createProductionDelegatedFrameworkRuntime = (
               env: backend.env,
               proxyEnvironmentMode: backend.proxyEnvironmentMode
             }),
-            spawnProcess: (command, args, spawnOptions) =>
-              ownership.spawn(
-                {
-                  projectId: scope.provenance.projectId,
-                  sessionId: scope.provenance.sessionId,
-                  frameId: scope.provenance.agentFrameId,
-                  attemptId: scope.executionId,
-                  frameworkId
-                },
-                command,
-                args,
-                spawnOptions
-              )
+            spawnProcess
           })
         }
         return createAcpRuntime({
@@ -430,7 +506,9 @@ const createProductionDelegatedFrameworkRuntime = (
           ...(scope.artifactCurrentRunFile
             ? { delegatedArtifactCurrentRunFile: scope.artifactCurrentRunFile }
             : {}),
-          spawnAgent: spawnOwned
+          spawnAgent: spawnOwned,
+          spawnProcess,
+          registerOpenCodeStoreRelease: owned.registerOpenCodeStoreRelease
         })
       }
 

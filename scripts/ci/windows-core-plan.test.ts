@@ -39,22 +39,15 @@ const select = (
 const core = select(['src/main/literature/catalog.ts'])
 
 describe('Windows core impact and event selection', () => {
-  it('keeps literature regressions and defers indirect process integration to queue', () => {
-    expect(core.windowsCoreChecks).toContain('windows_regressions')
-    expect(core.windowsCoreChecks).not.toContain('windows_process')
-    expect(core.windowsCoreChecks).not.toContain('windows_wheel_evidence')
-    expect(core.windowsCoreChecks).not.toContain('windows_shell')
-    expect(core.windowsCoreChecks).not.toContain('windows_sandbox')
+  it('keeps all native checks for the reclassified literature boundary on PRs and in queue', () => {
+    expect(core.windowsCoreChecks).toEqual(expect.arrayContaining(Object.keys(windowsCoreChecks)))
     const queue = select(['src/main/literature/catalog.ts'], 'merge_group')
-    expect(queue.windowsCoreChecks).toEqual(
-      expect.arrayContaining([...core.windowsCoreChecks, 'windows_process'])
-    )
-    expect(core.reasonChains).toEqual(
-      expect.arrayContaining([expect.stringContaining('deferred to merge queue')])
-    )
+    expect(queue.windowsCoreChecks).toEqual(expect.arrayContaining(Object.keys(windowsCoreChecks)))
   })
 
   it.each([
+    ['scripts/build-notebook-host.mjs', ['windows_runtime']],
+    ['scripts/windows-dev-notebook-host.integration.test.ts', ['windows_runtime']],
     [
       'src/main/notebook/shell-runtime.ts',
       ['windows_shell', 'windows_service_timeout', 'windows_sandbox']
@@ -92,14 +85,14 @@ describe('Windows core impact and event selection', () => {
     )
   })
 
-  it('keeps manual coverage and does not introduce core for renderer/docs changes', () => {
+  it('keeps manual and reclassified renderer coverage without introducing core for docs', () => {
     expect(
       select(['src/main/literature/catalog.ts'], 'workflow_dispatch').windowsCoreChecks
     ).toEqual(expect.arrayContaining(Object.keys(windowsCoreChecks)))
     expect(select(['docs/testing.md']).windowsCoreChecks).toBeUndefined()
     expect(
       select(['src/renderer/src/pages/literature/LiteratureLibraryPage.tsx']).windowsCoreChecks
-    ).toBeUndefined()
+    ).toEqual(expect.arrayContaining(Object.keys(windowsCoreChecks)))
   })
 
   it('selects the union of stacked merge-group changes', () => {
@@ -111,6 +104,19 @@ describe('Windows core impact and event selection', () => {
     for (const path of paths)
       expect(union).toEqual(expect.arrayContaining(select([path], 'merge_group').windowsCoreChecks))
   })
+
+  it.each(['pull_request', 'merge_group'])(
+    'does not widen %s core checks for a Playwright-only input in a mixed diff',
+    (event) => {
+      const source = select(['src/main/literature/catalog.ts'], event)
+      const mixed = select(
+        ['src/main/literature/catalog.ts', 'e2e/desktop-runtime-recovery.spec.ts'],
+        event
+      )
+      expect(mixed.windowsCoreChecks).toEqual(source.windowsCoreChecks)
+      expect(select(['e2e/fixtures/new-unattributed-helper.ts'], event).mode).toBe('full')
+    }
+  )
 
   it('falls back when a platform overlay has no mapped evidence', () => {
     const plan = selectWindowsCoreChecks(

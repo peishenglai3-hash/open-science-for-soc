@@ -1,7 +1,8 @@
-import { SettingsFormFooter } from './SettingsLayout'
+import { type SettingsEditorLeaveState, SettingsFormFooter } from './SettingsLayout'
+import { dismissSettingsManualUpdateGuide } from './settings-manual-update-guide'
 import { createBookmarkPreviewItem } from '../workspace/annotations/annotation-reveal'
 import type { PdfAnnotation } from '../../../../shared/pdf-annotations'
-import type { PreviewFileItem } from '@/stores/preview-workbench-store'
+import type { PreviewFileItem } from '@/stores/preview-workbench-contract'
 import { Notice } from '@/components/notice'
 import { ErrorNotice } from '@/components/error-notice'
 /* Hallmark · pre-emit critique: P5 H5 E5 S5 R5 V4 */
@@ -98,7 +99,7 @@ import type { ArchivedView } from '@/lib/settings-navigation'
 import type { MemoryView } from '@/lib/settings-navigation'
 import type { TagsView } from '@/lib/settings-navigation'
 import type { CredentialsView } from '@/lib/settings-navigation'
-import { resolveVendorModelsUrl } from '../../../../shared/provider-registry'
+import { resolveVendorModelsUrl } from '@aipoch/providers'
 import { ProviderForm } from './ProviderForm'
 import {
   createEmptyProviderFormValue,
@@ -122,58 +123,58 @@ const AgentPanel = lazy(async () => ({ default: (await import('./AgentPanel')).A
 const GeneralPanel = lazy(async () => ({ default: (await import('./GeneralPanel')).GeneralPanel }))
 const NetworkPanel = lazy(async () => ({ default: (await import('./NetworkPanel')).NetworkPanel }))
 const StoragePanel = lazy(async () => {
-  const module = await loadSettingsPanel(
+  const panelModule = await loadSettingsPanel(
     () => import('./StoragePanel'),
     () =>
       import('@/stores/storage-info-store').then(({ useStorageInfoStore }) =>
         useStorageInfoStore.getState().loadStatus()
       )
   )
-  return { default: module.StoragePanel }
+  return { default: panelModule.StoragePanel }
 })
 const RuntimesPanel = lazy(async () => {
-  const module = await loadSettingsPanel(
+  const panelModule = await loadSettingsPanel(
     () => import('./RuntimesPanel'),
     () =>
       import('@/stores/runtime-settings-store').then(({ useRuntimeSettingsStore }) =>
         useRuntimeSettingsStore.getState().load()
       )
   )
-  return { default: module.RuntimesPanel }
+  return { default: panelModule.RuntimesPanel }
 })
 const RemoteControlPanel = lazy(async () => {
-  const module = await import('./RemoteControlPanel')
-  await module.RemoteControlPanel.preload().catch(() => undefined)
-  return { default: module.RemoteControlPanel }
+  const panelModule = await import('./RemoteControlPanel')
+  await panelModule.RemoteControlPanel.preload().catch(() => undefined)
+  return { default: panelModule.RemoteControlPanel }
 })
 const SkillsPanel = lazy(async () => {
-  const module = await loadSettingsPanel(
+  const panelModule = await loadSettingsPanel(
     () => import('./SkillsPanel'),
     () => useSettingsStore.getState().loadSkills()
   )
-  return { default: module.SkillsPanel }
+  return { default: panelModule.SkillsPanel }
 })
 const ConnectorsPanel = lazy(async () => {
-  const module = await loadSettingsPanel(
+  const panelModule = await loadSettingsPanel(
     () => import('./ConnectorsPanel'),
     () => useSettingsStore.getState().loadConnectors()
   )
-  return { default: module.ConnectorsPanel }
+  return { default: panelModule.ConnectorsPanel }
 })
 const SpecialistsPanel = lazy(async () => {
-  const module = await loadSettingsPanel(
+  const panelModule = await loadSettingsPanel(
     () => import('./SpecialistsPanel'),
     () => useSpecialistStore.getState().load()
   )
-  return { default: module.SpecialistsPanel }
+  return { default: panelModule.SpecialistsPanel }
 })
 const MemoryPanel = lazy(async () => {
-  const module = await import('./MemoryPanel')
-  return { default: module.MemoryPanel }
+  const panelModule = await import('./MemoryPanel')
+  return { default: panelModule.MemoryPanel }
 })
 const TagsPanel = lazy(async () => {
   const tagState = useTagStore.getState()
-  const module = await loadSettingsPanel(
+  const panelModule = await loadSettingsPanel(
     () => import('./TagsPanel'),
     () =>
       Promise.all([
@@ -183,7 +184,7 @@ const TagsPanel = lazy(async () => {
         useSpecialistStore.getState().load()
       ])
   )
-  return { default: module.TagsPanel }
+  return { default: panelModule.TagsPanel }
 })
 const ConnectorDetailView = lazy(async () => ({
   default: (await import('./ConnectorDetailView')).ConnectorDetailView
@@ -198,11 +199,11 @@ const ConnectorImportView = lazy(async () => ({
   default: (await import('./ConnectorImportView')).ConnectorImportView
 }))
 const ComputePanel = lazy(async () => {
-  const module = await loadSettingsPanel(
+  const panelModule = await loadSettingsPanel(
     () => import('./ComputePanel'),
     () => preloadComputeHosts()
   )
-  return { default: module.ComputePanel }
+  return { default: panelModule.ComputePanel }
 })
 const ComputeAddForm = lazy(async () => ({
   default: (await import('./ComputeAddForm')).ComputeAddForm
@@ -211,14 +212,14 @@ const ComputeHostDetail = lazy(async () => ({
   default: (await import('./ComputeHostDetail')).ComputeHostDetail
 }))
 const PermissionsPanel = lazy(async () => {
-  const module = await loadSettingsPanel(
+  const panelModule = await loadSettingsPanel(
     () => import('./PermissionsPanel'),
     () =>
       import('@/stores/permission-grants-store').then(({ usePermissionGrantsStore }) =>
         usePermissionGrantsStore.getState().load()
       )
   )
-  return { default: module.PermissionsPanel }
+  return { default: panelModule.PermissionsPanel }
 })
 const CredentialsPanel = lazy(async () => ({
   default: (await import('./CredentialsPanel')).CredentialsPanel
@@ -261,7 +262,7 @@ const toFormValue = (provider: ProviderView): ProviderFormValue =>
     contextWindow: provider.contextWindow?.toString() ?? '',
     maxInputTokens: provider.maxInputTokens?.toString() ?? '',
     maxOutputTokens: provider.maxOutputTokens?.toString() ?? '',
-    apiEndpoint: provider.apiEndpoints?.[0] ?? 'anthropic',
+    apiEndpoint: provider.apiEndpoints?.[0] ?? 'messages',
     supportsImageInput: provider.supportsImageInput,
     reasoningEffortPreset: provider.reasoningEffortPreset ?? 'standard-5',
     reasoningEffortTransport: provider.reasoningEffortTransport ?? 'reasoning-effort',
@@ -393,8 +394,8 @@ const EMPTY_USAGE_SESSIONS = [] as const
 const EMPTY_USAGE_PROJECTS = [] as const
 
 const PdfAnnotationPreviewDialog = lazy(() =>
-  import('../workspace/pdf-annotations/PdfAnnotationPreviewDialog').then((module) => ({
-    default: module.PdfAnnotationPreviewDialog
+  import('../workspace/pdf-annotations/PdfAnnotationPreviewDialog').then((panelModule) => ({
+    default: panelModule.PdfAnnotationPreviewDialog
   }))
 )
 
@@ -506,15 +507,56 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
   const providerEditorLeaveState = useRef<SkillEditorLeaveState | null>(null)
   const [skillEditorBusy, setSkillEditorBusy] = useState(false)
   const [pendingSkillLeave, setPendingSkillLeave] = useState<(() => void) | null>(null)
+  const pendingSkillLeaveOwner = useRef<
+    'connection' | 'network' | 'provider' | 'skill' | 'resource' | null
+  >(null)
   const onSkillEditorLeaveStateChange = useCallback((state: SkillEditorLeaveState | null) => {
     skillEditorLeaveState.current = state
     setSkillEditorBusy(state?.busy ?? false)
   }, [])
+  const resourceEditorLeaveState = useRef<SettingsEditorLeaveState | null>(null)
+  const [resourceEditorBusy, setResourceEditorBusy] = useState(false)
+  const onResourceEditorLeaveStateChange = useCallback((state: SettingsEditorLeaveState | null) => {
+    resourceEditorLeaveState.current = state
+    setResourceEditorBusy(state?.busy ?? false)
+    if (
+      (!state || (!state.dirty && !state.busy)) &&
+      pendingSkillLeaveOwner.current === 'resource'
+    ) {
+      pendingSkillLeaveOwner.current = null
+      setPendingSkillLeave(null)
+    }
+  }, [])
+  const [resourceDraftGeneration, setResourceDraftGeneration] = useState(0)
+  const [connectionDraftGeneration, setConnectionDraftGeneration] = useState(0)
+  const connectionEditorLeaveState = useRef<SettingsEditorLeaveState | null>(null)
+  const [connectionEditorBusy, setConnectionEditorBusy] = useState(false)
+  const onConnectionEditorLeaveStateChange = useCallback(
+    (state: SettingsEditorLeaveState | null) => {
+      connectionEditorLeaveState.current = state
+      setConnectionEditorBusy(state?.busy ?? false)
+      if (state === null) setPendingSkillLeave(null)
+    },
+    []
+  )
   const requestLeave = useCallback((leave: () => void) => {
+    const owner = connectionEditorLeaveState.current
+      ? 'connection'
+      : networkEditorLeaveState.current
+        ? 'network'
+        : providerEditorLeaveState.current
+          ? 'provider'
+          : skillEditorLeaveState.current
+            ? 'skill'
+            : resourceEditorLeaveState.current
+              ? 'resource'
+              : null
     const state =
+      connectionEditorLeaveState.current ??
       networkEditorLeaveState.current ??
       providerEditorLeaveState.current ??
-      skillEditorLeaveState.current
+      skillEditorLeaveState.current ??
+      resourceEditorLeaveState.current
     if (state?.dirty || state?.busy) {
       const focused = document.activeElement
       if (
@@ -523,6 +565,7 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
       ) {
         skillLeaveReturnFocus.current = focused
       }
+      pendingSkillLeaveOwner.current = owner
       setPendingSkillLeave(() => leave)
     } else leave()
   }, [])
@@ -740,6 +783,23 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
     if (activeTagId) setSelectedTagId(activeTagId)
   }, [activeTagId, setSelectedTagId])
 
+  const retainsConnectorDraft = (target: SettingsRoute): boolean => {
+    if (currentRoute.panel !== 'connectors' || target.panel !== 'connectors') return false
+    if (
+      !['add', 'edit'].includes(currentRoute.view.kind) ||
+      target.view.kind !== currentRoute.view.kind
+    )
+      return false
+    return (
+      JSON.stringify({ ...currentRoute.view, credentialView: undefined }) ===
+      JSON.stringify({ ...target.view, credentialView: undefined })
+    )
+  }
+  const requestRouteLeave = (target: SettingsRoute, leave: () => void): void => {
+    if (retainsConnectorDraft(target)) leave()
+    else requestLeave(leave)
+  }
+
   // Pushes a complete active route, dropping any forward entries. Routes contain only serializable
   // navigation values, so comparing the whole route automatically covers fields added later.
   const navigate = (route: SettingsRoute, onNavigated?: () => void): void => {
@@ -747,7 +807,7 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
       onNavigated?.()
       return
     }
-    requestLeave(() => {
+    requestRouteLeave(route, () => {
       setHistory((entries) => [...entries.slice(0, historyIndex + 1), route])
       setHistoryIndex((index) => index + 1)
       onNavigated?.()
@@ -1064,11 +1124,13 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
               t('Credential'))
             : credentialsView.serviceId === 'github'
               ? t('GitHub')
-              : credentialsView.serviceId === 'openalex'
-                ? t('OpenAlex')
-                : credentialsView.serviceId === 'unpaywall'
-                  ? t('Unpaywall')
-                  : t('Literature access')
+              : credentialsView.serviceId === 'semantic-scholar'
+                ? t('Semantic Scholar')
+                : credentialsView.serviceId === 'openalex'
+                  ? t('OpenAlex')
+                  : credentialsView.serviceId === 'unpaywall'
+                    ? t('Unpaywall')
+                    : t('Literature access')
       return {
         rootLabelKey: 'Credentials',
         rootTo: { panel: 'credentials', view: { kind: 'list' } },
@@ -1089,12 +1151,12 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
 
   const goBack = (): void => {
     if (!canGoBack) return
-    requestLeave(() => setHistoryIndex((index) => index - 1))
+    requestRouteLeave(history[historyIndex - 1], () => setHistoryIndex((index) => index - 1))
   }
 
   const goForward = (): void => {
     if (!canGoForward) return
-    requestLeave(() => setHistoryIndex((index) => index + 1))
+    requestRouteLeave(history[historyIndex + 1], () => setHistoryIndex((index) => index + 1))
   }
 
   useImperativeHandle(ref, () => ({
@@ -1399,6 +1461,8 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
           // closed intentionally via the ✕ button or Escape.
           onInteractOutside={(event) => event.preventDefault()}
           onEscapeKeyDown={(event) => {
+            // The inline guide owns Escape even after focus moves to another Settings control.
+            if (dismissSettingsManualUpdateGuide(event)) return
             if (
               event.target instanceof Element &&
               event.target.closest('[data-testid="permission-undo-stack"]')
@@ -1864,8 +1928,10 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
                           <ErrorNotice tone="amber" description={tagAnnotationError} />
                         ) : null}
                         <TagsPanel
+                          key={`tags-${resourceDraftGeneration}`}
                           view={tagsView}
                           onNavigate={navigateTags}
+                          onLeaveStateChange={onResourceEditorLeaveStateChange}
                           onSelectedTagChange={recordSelectedTag}
                           onOpenResource={(reference) => {
                             if (reference.resourceType === 'catalog.skill') {
@@ -1912,8 +1978,10 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
                       </>
                     ) : activePanel === 'memory' ? (
                       <MemoryPanel
+                        key={`memory-${resourceDraftGeneration}`}
                         view={memoryView}
                         onNavigate={navigateMemory}
+                        onLeaveStateChange={onResourceEditorLeaveStateChange}
                         onOpenProject={(projectId) => {
                           useNavigationStore.getState().openProject(projectId, 'user', onClose)
                         }}
@@ -1951,20 +2019,25 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
                           />
                         </div>
                       ) : connectorsView.kind === 'add' ? (
-                        <ConnectorAddForm
-                          initialTransport={connectorsView.transport}
-                          initialTemplate={connectorsView.template}
-                          credentialViewOpen={connectorsView.credentialView === 'create'}
-                          onCredentialViewChange={(open) => {
-                            if (open) {
-                              navigateConnectors({ ...connectorsView, credentialView: 'create' })
-                            } else {
-                              goBack()
-                            }
-                          }}
-                          onDone={() => navigateConnectors({ kind: 'list' })}
-                          onCancel={() => navigateConnectors({ kind: 'list' })}
-                        />
+                        open && (
+                          <ConnectorAddForm
+                            active={open}
+                            key={connectionDraftGeneration}
+                            onLeaveStateChange={onConnectionEditorLeaveStateChange}
+                            initialTransport={connectorsView.transport}
+                            initialTemplate={connectorsView.template}
+                            credentialViewOpen={connectorsView.credentialView === 'create'}
+                            onCredentialViewChange={(open) => {
+                              if (open) {
+                                navigateConnectors({ ...connectorsView, credentialView: 'create' })
+                              } else {
+                                goBack()
+                              }
+                            }}
+                            onDone={() => navigateConnectors({ kind: 'list' })}
+                            onCancel={() => navigateConnectors({ kind: 'list' })}
+                          />
+                        )
                       ) : connectorsView.kind === 'import' ? (
                         <ConnectorImportView
                           onUse={(template) =>
@@ -1994,23 +2067,36 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
                               onOpenTag={navigateTag}
                             />
                           ) : null}
-                          <ConnectorAddForm
-                            editServer={customServers.find((s) => s.id === connectorsView.id)}
-                            editServerId={connectorsView.id}
-                            credentialViewOpen={connectorsView.credentialView === 'create'}
-                            onCredentialViewChange={(open) => {
-                              if (open) {
-                                navigateConnectors({ ...connectorsView, credentialView: 'create' })
-                              } else {
-                                goBack()
-                              }
-                            }}
-                            onDone={() => navigateConnectors({ kind: 'list' })}
-                            onCancel={() => navigateConnectors({ kind: 'list' })}
-                          />
+                          {open && (
+                            <ConnectorAddForm
+                              active={open}
+                              key={connectionDraftGeneration}
+                              onLeaveStateChange={onConnectionEditorLeaveStateChange}
+                              editServer={customServers.find((s) => s.id === connectorsView.id)}
+                              editServerId={connectorsView.id}
+                              credentialViewOpen={connectorsView.credentialView === 'create'}
+                              onCredentialViewChange={(open) => {
+                                if (open) {
+                                  navigateConnectors({
+                                    ...connectorsView,
+                                    credentialView: 'create'
+                                  })
+                                } else {
+                                  goBack()
+                                }
+                              }}
+                              onDone={() => navigateConnectors({ kind: 'list' })}
+                              onCancel={() => navigateConnectors({ kind: 'list' })}
+                            />
+                          )}
                         </div>
                       ) : (
                         <ConnectorsPanel
+                          recoveryConnectorId={
+                            connectorsView.kind === 'list'
+                              ? connectorsView.recoveryConnectorId
+                              : undefined
+                          }
                           onNavigate={navigateConnectors}
                           onOpenTag={navigateTag}
                           onOpenSpecialist={(usage) =>
@@ -2029,6 +2115,7 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
                         // Revoke completion authority before the dialog's exit animation unmounts.
                         open && (
                           <ComputeAddForm
+                            onLeaveStateChange={onConnectionEditorLeaveStateChange}
                             onCreated={(providerId) =>
                               navigateCompute({ kind: 'detail', providerId })
                             }
@@ -2046,8 +2133,10 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
                       )
                     ) : activePanel === 'credentials' ? (
                       <CredentialsPanel
+                        key={`credentials-${resourceDraftGeneration}`}
                         view={credentialsView}
                         onNavigate={navigateCredentials}
+                        onLeaveStateChange={onResourceEditorLeaveStateChange}
                         onOpenConnector={(id) =>
                           navigate({ panel: 'connectors', view: { kind: 'edit', id } })
                         }
@@ -2284,6 +2373,12 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
                           />
                         ) : null}
                         <ProvidersPanel
+                          recoveryProviderId={
+                            modelView.kind === 'list' ? modelView.recoveryProviderId : undefined
+                          }
+                          recoveryModel={
+                            modelView.kind === 'list' ? modelView.recoveryModel : undefined
+                          }
                           onCreateProvider={openCreate}
                           onEditProvider={openEdit}
                           busyProviderId={busyProviderId}
@@ -2358,23 +2453,42 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
         open={open && pendingSkillLeave !== null}
         title={t('Discard unsaved changes?')}
         description={
-          networkEditorLeaveState.current
-            ? t('Your network rules have not been saved. Discard them and leave?')
-            : isProviderFormOpen
-              ? isSaving
-                ? t('Wait for the provider save to finish before leaving.')
-                : t('Your provider edits have not been saved. Discard them and leave the editor?')
-              : skillEditorBusy
-                ? t('Wait for the current skill operation to finish before leaving.')
-                : t('Your skill edits have not been saved. Discard them and leave the editor?')
+          connectionEditorLeaveState.current
+            ? connectionEditorBusy
+              ? t('Wait for the current save to finish before leaving.')
+              : t('Your changes have not been saved. Discard them and leave?')
+            : networkEditorLeaveState.current
+              ? t('Your network rules have not been saved. Discard them and leave?')
+              : resourceEditorLeaveState.current
+                ? resourceEditorBusy
+                  ? t('Wait for the current save to finish before leaving.')
+                  : t('Your changes have not been saved. Discard them and leave the editor?')
+                : isProviderFormOpen
+                  ? isSaving
+                    ? t('Wait for the provider save to finish before leaving.')
+                    : t(
+                        'Your provider edits have not been saved. Discard them and leave the editor?'
+                      )
+                  : skillEditorBusy
+                    ? t('Wait for the current skill operation to finish before leaving.')
+                    : t('Your skill edits have not been saved. Discard them and leave the editor?')
         }
         cancelLabel={t('Keep editing')}
         confirmLabel={t('Discard changes')}
-        loading={networkEditorBusy || skillEditorBusy || (isProviderFormOpen && isSaving)}
+        loading={
+          connectionEditorBusy ||
+          networkEditorBusy ||
+          skillEditorBusy ||
+          resourceEditorBusy ||
+          (isProviderFormOpen && isSaving)
+        }
         loadingLabel={t('Please wait…')}
         destructive
         testId="skill-discard-confirmation"
-        onCancel={() => setPendingSkillLeave(null)}
+        onCancel={() => {
+          pendingSkillLeaveOwner.current = null
+          setPendingSkillLeave(null)
+        }}
         onCloseAutoFocus={(event) => {
           const target = skillLeaveReturnFocus.current
           skillLeaveReturnFocus.current = null
@@ -2384,8 +2498,10 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
         }}
         onConfirm={() => {
           if (
+            connectionEditorLeaveState.current?.busy ||
             networkEditorLeaveState.current?.busy ||
             skillEditorLeaveState.current?.busy ||
+            resourceEditorLeaveState.current?.busy ||
             providerEditorLeaveState.current?.busy
           )
             return
@@ -2399,7 +2515,13 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
             setSeededModelView(undefined)
             providerEditorLeaveState.current = null
           }
+          if (connectionEditorLeaveState.current) setConnectionDraftGeneration((value) => value + 1)
+          if (resourceEditorLeaveState.current) {
+            setResourceDraftGeneration((value) => value + 1)
+            resourceEditorLeaveState.current = null
+          }
           const leave = pendingSkillLeave
+          pendingSkillLeaveOwner.current = null
           skillLeaveReturnFocus.current = null
           setPendingSkillLeave(null)
           leave?.()

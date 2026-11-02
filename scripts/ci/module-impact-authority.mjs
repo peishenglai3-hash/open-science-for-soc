@@ -16,8 +16,9 @@ import {
   createModuleImpactShadowReport,
   formatModuleImpactShadowSummary
 } from './module-impact-shadow.mjs'
-import { createAffectedTestPlan } from './module-test-impact.mjs'
+import { createAffectedTestPlan, createFullPlanFloor } from './module-test-impact.mjs'
 import { resolveModuleImpactInputs } from './module-impact-inputs.mjs'
+import { loadDerivedConsumers } from './module-graph/policy.mjs'
 import { selectWindowsCoreChecks } from './windows-core-plan.mjs'
 
 const manifestOnlyGraph = Object.freeze({
@@ -61,13 +62,11 @@ export function runModuleImpactAuthorityCli(
 ) {
   const base = requireCommit(argumentValue(arguments_, '--base') ?? environment.BASE_SHA, '--base')
   const head = requireCommit(argumentValue(arguments_, '--head') ?? environment.HEAD_SHA, '--head')
-  const changes = changesFromGit(base, head, { cwd, execute })
-  const { manifest, registrationModules, registrationOnly } = resolveModuleImpactInputs(changes, {
-    base,
-    head,
-    cwd,
-    execute
-  })
+  // An accepted derived index is removed from the changes it would otherwise route as global.
+  const { manifest, registrationModules, registrationOnly, changes } = resolveModuleImpactInputs(
+    changesFromGit(base, head, { cwd, execute }),
+    { base, head, cwd, execute }
+  )
   const candidatePlan = classifyChanges(changes, undefined, {
     moduleManifest: manifest,
     registrationModules,
@@ -77,13 +76,20 @@ export function runModuleImpactAuthorityCli(
     ? createAffectedTestPlan(changes, manifestOnlyGraph, manifest, registrationModules)
     : unusedModulePlan
   const report = createModuleImpactShadowReport(candidatePlan, modulePlan)
+  const unitFloor =
+    report.resolved.mode === 'full' &&
+    report.resolved.bundles.includes('unit') &&
+    createFullPlanFloor(changes, manifest, registrationModules) !== undefined
   const platformPlan =
     environment.PR_GATE_PLATFORM_POLICY === 'risk-v1'
-      ? platformExecutionPlan(report.resolved, changes, environment.EVENT_NAME)
+      ? platformExecutionPlan(report.resolved, changes, environment.EVENT_NAME, { unitFloor })
       : report.resolved
+  // Trusted preflight has no parser to generate the derived index. Without a committed index the
+  // module plan lacks consumer evidence, so Windows core selection must fail closed to all checks.
+  const derivedAvailable = Object.keys(loadDerivedConsumers().modules).length > 0
   const plan = selectWindowsCoreChecks(
     platformPlan,
-    modulePlan,
+    derivedAvailable ? modulePlan : { ...modulePlan, mode: 'full' },
     changes,
     manifest,
     environment.EVENT_NAME

@@ -92,13 +92,14 @@ try {
   const snapshot = await rpc('settings:upsert-provider', {
     type: 'custom',
     name: 'Standalone fixture',
-    apiEndpoints: ['openai'],
+    apiEndpoints: ['chat-completions'],
     baseUrl: 'http://127.0.0.1:9/v1',
     model: 'e2e-model',
     key: 'fixture-key',
     supportsImageInput: true
   })
   const provider = snapshot.providers.find((item) => item.name === 'Standalone fixture')
+  assert.deepEqual(provider?.apiEndpoints, ['chat-completions'])
   await rpc('settings:set-active-provider', { id: provider.id, model: 'e2e-model' })
   await rpc('settings:set-agent-framework', { id: 'opencode' })
   const detected = await rpc('settings:detect-opencode')
@@ -163,7 +164,7 @@ try {
   assert.ok(ownedChildren.length > 0, 'Exercise shutdown with owned child processes.')
   const stopped = JSON.parse(await cli('stop', '--json'))
   running = false
-  assert.equal(stopped.result, 'daemon-stopped')
+  assert.equal(stopped.result, 'stopped')
   for (const child of ownedChildren) {
     const stat = await readFile(`/proc/${child.pid}/stat`, 'utf8').catch(() => '')
     const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ')

@@ -9,13 +9,15 @@ import { ARTIFACT_LITERATURE_SIDECAR_SUFFIX } from '../../shared/artifact-litera
 import * as boundedIo from '../bounded-file-io'
 import { defaultFileDurability } from '@aipoch/durable-files'
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, rm, truncate, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, realpath, rm, stat, truncate, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createArtifactSaveFixture } from './save-test-fixtures'
 import { writeArtifactFileForCurrentRun } from './mcp-server'
 import { ArtifactProvenanceRepository } from './provenance-repository'
 import { ArtifactWriteBudgetOwner } from './write-budget-owner'
+import { createFrameNotebookLane } from '../notebook/lane-identity'
+import { ArtifactTurnOwner } from '../acp/artifact-turn-owner'
 
 const fixtures: Awaited<ReturnType<typeof createArtifactSaveFixture>>[] = []
 const setup = async (): Promise<Awaited<ReturnType<typeof createArtifactSaveFixture>>> => {
@@ -38,6 +40,294 @@ afterEach(async () => {
 const hash = (data: string): string => createHash('sha256').update(data).digest('hex')
 
 describe('complete Artifact save over the production local RPC', () => {
+  it('admits a save as soon as the activating turn publishes its handoff', async () => {
+    const f = await setup()
+    let saved: { versionId: string } | undefined
+    const owner = new ArtifactTurnOwner({
+      dataRoot: f.storageRoot,
+      repository: f.compatibilityRepository,
+      runRegistry: new ArtifactRunRegistry(),
+      issueRpcCapability: (binding, isOwnerActive) =>
+        f.server.issueArtifactRunCapability(binding, undefined, isOwnerActive),
+      revokeRpcCapability: (token) => f.server.revokeArtifactRunCapability(token),
+      writeHandoffFile: async (path, content) => {
+        await writeFile(path, content)
+        if (!JSON.parse(content).rpcCapabilityToken) return
+        saved = await writeArtifactFileForCurrentRun(
+          f.compatibilityRepository,
+          {
+            storageRoot: f.storageRoot,
+            projectId: 'project-1',
+            sessionId: f.binding.artifactStorageSessionId,
+            currentRunFile: path,
+            allowedImportRoots: [],
+            rpcEndpoint: f.connection.endpoint
+          },
+          { filename: 'report.md', content: '# Completed report' }
+        )
+      }
+    })
+    const turn = await owner.openRootExecution({
+      ...f.binding,
+      executionId: 'activating-execution',
+      agentName: 'Test Agent'
+    })
+    try {
+      expect(saved?.versionId).toBeTruthy()
+      expect(await f.client.artifactVersion.count()).toBe(1)
+    } finally {
+      await owner.dispose(turn)
+    }
+  })
+
+  it('keeps the previous handoff usable during and after a failed replacement write', async () => {
+    const f = await setup()
+    let failWrite = false
+    const outcomes: unknown[] = []
+    const save = async (path: string, filename: string): Promise<void> => {
+      outcomes.push(
+        await writeArtifactFileForCurrentRun(
+          f.compatibilityRepository,
+          {
+            storageRoot: f.storageRoot,
+            projectId: 'project-1',
+            sessionId: f.binding.artifactStorageSessionId,
+            currentRunFile: path,
+            allowedImportRoots: [],
+            rpcEndpoint: f.connection.endpoint
+          },
+          { filename, content: '# Completed report' }
+        ).then(
+          () => 'saved',
+          (error: Error) => error.message
+        )
+      )
+    }
+    const owner = new ArtifactTurnOwner({
+      dataRoot: f.storageRoot,
+      repository: f.compatibilityRepository,
+      runRegistry: new ArtifactRunRegistry(),
+      issueRpcCapability: (binding, isOwnerActive) =>
+        f.server.issueArtifactRunCapability(binding, undefined, isOwnerActive),
+      revokeRpcCapability: (token) => f.server.revokeArtifactRunCapability(token),
+      writeHandoffFile: async (path, content) => {
+        if (failWrite) {
+          await save(path, 'during.md')
+          throw new Error('replacement write failed')
+        }
+        await writeFile(path, content)
+      }
+    })
+    const request = { ...f.binding, agentName: 'Test Agent' }
+    const first = await owner.openRootExecution({ ...request, executionId: 'first-execution' })
+    const handoff = await readFile(owner.handoffFile(first), 'utf8')
+    try {
+      failWrite = true
+      await expect(
+        owner.openRootExecution({ ...request, executionId: 'replacement-execution' })
+      ).rejects.toThrow('replacement write failed')
+      await save(owner.handoffFile(first), 'after.md')
+      expect(await readFile(owner.handoffFile(first), 'utf8')).toBe(handoff)
+      expect(outcomes).toEqual(['saved', 'saved'])
+      expect(owner.activeRunIds()).toEqual([JSON.parse(handoff).artifactRunId])
+    } finally {
+      failWrite = false
+      await owner.dispose(first)
+    }
+  })
+
+  it.each([false, true])(
+    'publishes generated files late in an active turn (producerRunId: %s)',
+    async (includeProducer) => {
+      let now = Date.now()
+      vi.spyOn(Date, 'now').mockImplementation(() => now)
+      const f = await setup()
+      const lane = createFrameNotebookLane('project-1', 'session-1', f.binding.agentFrameId)
+      const document = await f.notebookRepository.loadOrCreate({
+        projectId: 'project-1',
+        sessionId: 'session-1',
+        lane,
+        workspaceCwd: f.storageRoot
+      })
+      const dataDir = join(document.notebookSessionRoot, 'data')
+      await mkdir(dataDir, { recursive: true })
+      const sourcePath = join(dataDir, 'report.md')
+      await writeFile(sourcePath, '# Completed report\n')
+      const sourceStat = await stat(sourcePath)
+      const producerRunId = 'notebook-run-report'
+      await f.notebookRepository.appendRun({
+        projectId: 'project-1',
+        sessionId: 'session-1',
+        lane,
+        run: {
+          ...f.binding,
+          runId: producerRunId,
+          cellId: 'report-cell',
+          source: 'agent',
+          kernelKind: 'repl',
+          status: 'completed',
+          startedAt: sourceStat.mtimeMs - 1,
+          endedAt: sourceStat.mtimeMs,
+          script: 'await fs.writeFile("report.md", "# Completed report\\n")',
+          text: { stdout: '', stderr: '', traceback: '', plain: [] },
+          outputs: [],
+          artifacts: [],
+          inputFiles: [],
+          workingFiles: [
+            {
+              path: sourcePath,
+              relativePath: 'data/report.md',
+              kind: 'other',
+              size: sourceStat.size,
+              mtimeMs: sourceStat.mtimeMs,
+              createdByRunId: producerRunId
+            }
+          ]
+        }
+      })
+      const owner = new ArtifactTurnOwner({
+        dataRoot: f.storageRoot,
+        repository: f.compatibilityRepository,
+        runRegistry: new ArtifactRunRegistry(),
+        issueRpcCapability: (binding, isOwnerActive) =>
+          f.server.issueArtifactRunCapability(binding, undefined, isOwnerActive),
+        revokeRpcCapability: (token) => f.server.revokeArtifactRunCapability(token),
+        notebook: f.server,
+        notebookArtifactSourceScope: () => ({
+          notebookSessionId: 'session-1',
+          notebookDataDir: dataDir,
+          notebookSessionRoot: document.notebookSessionRoot
+        })
+      })
+      const turn = await owner.openRootExecution({
+        ...f.binding,
+        executionId: 'active-execution',
+        agentName: 'Test Agent',
+        provenanceContext: {
+          ...f.binding,
+          messageBranchAncestry: [...(f.binding.messageBranchAncestry ?? [])],
+          messageAncestry: [...(f.binding.messageAncestry ?? [])]
+        }
+      })
+      const env = {
+        storageRoot: f.storageRoot,
+        projectId: 'project-1',
+        sessionId: f.binding.artifactStorageSessionId,
+        currentRunFile: owner.handoffFile(turn),
+        allowedImportRoots: [],
+        rpcEndpoint: f.connection.endpoint
+      }
+      const input = {
+        filename: 'report.md',
+        ...(includeProducer ? { producerRunId } : {})
+      }
+      // Establish that this exact file and provenance are valid before the long-running turn.
+      const initial = await writeArtifactFileForCurrentRun(f.compatibilityRepository, env, input)
+      expect(initial.producerRunId).toBe(producerRunId)
+      now += 2 * 60 * 60 * 1_000 + 1
+      const outcomes: unknown[] = []
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        outcomes.push(
+          await writeArtifactFileForCurrentRun(f.compatibilityRepository, env, input).then(
+            (artifact) => ({ saved: true, producerRunId: artifact.producerRunId }),
+            (error: Error) => ({ error: error.message })
+          )
+        )
+      }
+      await owner.dispose(turn)
+      await expect(readFile(sourcePath, 'utf8')).resolves.toBe('# Completed report\n')
+      expect(outcomes).toEqual(
+        Array.from({ length: 2 }, () => ({
+          saved: true,
+          producerRunId
+        }))
+      )
+    }
+  )
+
+  it.each(['ro', 'rw'] as const)(
+    'imports absolute files using current %s folder grants and rejects revoked grants',
+    async (access) => {
+      const f = await setup()
+      const workspace = join(f.storageRoot, 'workspace')
+      const downloads = join(f.storageRoot, 'Downloads')
+      await mkdir(workspace)
+      await mkdir(join(downloads, 'nested'), { recursive: true })
+      const sourcePath = join(downloads, 'nested', 'download.txt')
+      await writeFile(sourcePath, 'downloaded bytes')
+      const env = await f.environment(
+        { allowedImportRoots: [workspace], workspaceCwd: workspace },
+        { notebookSessionId: 'notebook-1' }
+      )
+      const input = {
+        filename: 'download.txt',
+        source: { kind: 'localPath' as const, path: sourcePath }
+      }
+      await expect(
+        writeArtifactFileForCurrentRun(f.compatibilityRepository, env, input)
+      ).rejects.toThrow('outside allowed artifact import roots')
+      await f.grantedRoots.upsertByPath({
+        id: 'downloads',
+        path: await realpath(downloads),
+        name: 'Downloads',
+        access
+      })
+      const result = await writeArtifactFileForCurrentRun(f.compatibilityRepository, env, input)
+      expect(await readFile(result.path, 'utf8')).toBe('downloaded bytes')
+      expect(result.producerRunId).toBeUndefined()
+      await expect(
+        writeArtifactFileForCurrentRun(f.compatibilityRepository, env, {
+          ...input,
+          producerRunId: 'invented-notebook-run'
+        })
+      ).rejects.toThrow('Notebook producer source could not be verified')
+      // A grant added after capability issuance works, but never becomes a relative search base.
+      for (const path of ['download.txt', '../Downloads/nested/download.txt']) {
+        await expect(
+          writeArtifactFileForCurrentRun(f.compatibilityRepository, env, {
+            ...input,
+            source: { kind: 'localPath', path }
+          })
+        ).rejects.toThrow()
+      }
+      await f.grantedRoots.remove('downloads')
+      await expect(
+        writeArtifactFileForCurrentRun(f.compatibilityRepository, env, input)
+      ).rejects.toThrow('outside allowed artifact import roots')
+      expect(await readFile(result.path, 'utf8')).toBe('downloaded bytes')
+      expect(await readFile(sourcePath, 'utf8')).toBe('downloaded bytes')
+      expect(await f.client.artifactVersion.count()).toBe(1)
+    }
+  )
+
+  it('does not accept external folder grants forged in RPC parameters', async () => {
+    const f = await setup()
+    const sourcePath = join(f.storageRoot, 'private.txt')
+    await writeFile(sourcePath, 'private')
+    const env = await f.environment()
+    const context = JSON.parse(await readFile(env.currentRunFile, 'utf8'))
+    const response = await fetch(f.connection.endpoint, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${context.rpcCapabilityToken}`,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        method: 'artifactSaveVersion',
+        params: {
+          ...f.binding,
+          filename: 'private.txt',
+          writeOperationId: 'forged-grant',
+          source: { kind: 'localPath', path: sourcePath },
+          sourceScope: { allowedImportRoots: [f.storageRoot], grantedImportRoots: [f.storageRoot] }
+        }
+      })
+    })
+    expect(response.ok).toBe(false)
+    expect(await response.text()).toContain('outside allowed artifact import roots')
+    expect(await f.client.artifactVersion.count()).toBe(0)
+  })
+
   it('delivers bounded redacted diagnostics with the committed Version identity over RPC and MCP', async () => {
     const f = await setup()
     const env = await f.environment()
@@ -410,57 +700,71 @@ describe('complete Artifact save over the production local RPC', () => {
     expect(await f.client.artifactVersion.count()).toBe(2)
   })
 
-  it('resolves prepared literature in main, checks its digest, and gives explicit literature precedence', async () => {
-    const f = await setup()
-    const workspace = join(f.storageRoot, 'workspace')
-    await mkdir(workspace)
-    const env = await f.environment({ allowedImportRoots: [workspace], workspaceCwd: workspace })
-    await f.client.literatureItem.create({
-      data: { id: 'paper', title: 'A cited paper', itemType: 'journalArticle' }
-    })
-    await f.client.literatureItem.create({
-      data: {
-        id: 'paper-alias',
-        title: 'Merged paper',
-        itemType: 'journalArticle',
-        mergedIntoItemId: 'paper',
-        deletedAt: new Date('2026-01-01T00:00:00.000Z')
+  it.each(['workspace', 'granted-folder'])(
+    'resolves prepared literature from %s, checks its digest, and gives explicit literature precedence',
+    async (location) => {
+      const f = await setup()
+      const workspace = join(f.storageRoot, 'workspace')
+      await mkdir(workspace)
+      const env = await f.environment(
+        location === 'workspace'
+          ? { allowedImportRoots: [workspace], workspaceCwd: workspace }
+          : undefined
+      )
+      if (location === 'granted-folder')
+        await f.grantedRoots.upsertByPath({
+          id: 'reports',
+          path: await realpath(workspace),
+          name: 'Reports',
+          access: 'ro'
+        })
+      await f.client.literatureItem.create({
+        data: { id: 'paper', title: 'A cited paper', itemType: 'journalArticle' }
+      })
+      await f.client.literatureItem.create({
+        data: {
+          id: 'paper-alias',
+          title: 'Merged paper',
+          itemType: 'journalArticle',
+          mergedIntoItemId: 'paper',
+          deletedAt: new Date('2026-01-01T00:00:00.000Z')
+        }
+      })
+      const bytes = Buffer.from(zipSync({ 'main.tex': strToU8('Scientific report') }))
+      const path = join(workspace, 'report.zip')
+      await writeFile(path, bytes)
+      const literature = {
+        styleId: 'apa',
+        locale: 'en-US',
+        citations: [{ citationId: 'cite-1', itemId: 'paper-alias' }]
       }
-    })
-    const bytes = Buffer.from(zipSync({ 'main.tex': strToU8('Scientific report') }))
-    const path = join(workspace, 'report.zip')
-    await writeFile(path, bytes)
-    const literature = {
-      styleId: 'apa',
-      locale: 'en-US',
-      citations: [{ citationId: 'cite-1', itemId: 'paper-alias' }]
+      const sidecar = {
+        schemaVersion: 1,
+        contentChecksum: createHash('sha256').update(bytes).digest('hex'),
+        literature
+      }
+      await writeFile(path + ARTIFACT_LITERATURE_SIDECAR_SUFFIX, JSON.stringify(sidecar))
+      const input = { filename: 'report.zip', source: { kind: 'localPath' as const, path } }
+      const result = await writeArtifactFileForCurrentRun(f.compatibilityRepository, env, input)
+      const row = await f.client.artifactVersion.findUniqueOrThrow({
+        where: { id: result.versionId },
+        include: { literatureManifest: true }
+      })
+      expect(row.literatureManifest?.manifestJson).toContain('A cited paper')
+      expect(JSON.parse(row.literatureManifest!.manifestJson).references[0].itemId).toBe(
+        'paper-alias'
+      )
+      await writeFile(
+        path + ARTIFACT_LITERATURE_SIDECAR_SUFFIX,
+        JSON.stringify({ ...sidecar, contentChecksum: '0'.repeat(64) })
+      )
+      await expect(
+        writeArtifactFileForCurrentRun(f.compatibilityRepository, env, input)
+      ).rejects.toThrow('Prepared citation metadata does not match')
+      await writeArtifactFileForCurrentRun(f.compatibilityRepository, env, { ...input, literature })
+      expect(await f.client.artifactVersion.count()).toBe(2)
     }
-    const sidecar = {
-      schemaVersion: 1,
-      contentChecksum: createHash('sha256').update(bytes).digest('hex'),
-      literature
-    }
-    await writeFile(path + ARTIFACT_LITERATURE_SIDECAR_SUFFIX, JSON.stringify(sidecar))
-    const input = { filename: 'report.zip', source: { kind: 'localPath' as const, path } }
-    const result = await writeArtifactFileForCurrentRun(f.compatibilityRepository, env, input)
-    const row = await f.client.artifactVersion.findUniqueOrThrow({
-      where: { id: result.versionId },
-      include: { literatureManifest: true }
-    })
-    expect(row.literatureManifest?.manifestJson).toContain('A cited paper')
-    expect(JSON.parse(row.literatureManifest!.manifestJson).references[0].itemId).toBe(
-      'paper-alias'
-    )
-    await writeFile(
-      path + ARTIFACT_LITERATURE_SIDECAR_SUFFIX,
-      JSON.stringify({ ...sidecar, contentChecksum: '0'.repeat(64) })
-    )
-    await expect(
-      writeArtifactFileForCurrentRun(f.compatibilityRepository, env, input)
-    ).rejects.toThrow('Prepared citation metadata does not match')
-    await writeArtifactFileForCurrentRun(f.compatibilityRepository, env, { ...input, literature })
-    expect(await f.client.artifactVersion.count()).toBe(2)
-  })
+  )
 
   it('rejects oversized prepared sidecars before pending mutation and leaves the next save usable', async () => {
     const f = await setup()

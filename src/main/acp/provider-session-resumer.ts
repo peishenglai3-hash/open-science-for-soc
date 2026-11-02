@@ -1,3 +1,8 @@
+import type { AcpSpecialistResolutionContext } from './runtime-contract'
+import {
+  recordMainAgentContext,
+  PreviousAgentContextUnavailableError
+} from './main-agent-process-ownership'
 import * as acp from '@agentclientprotocol/sdk'
 import type { ActiveSession, ClientConnection, SessionConfigOption } from '@agentclientprotocol/sdk'
 import { resolve } from 'node:path'
@@ -8,10 +13,15 @@ import type {
 } from '../../shared/acp'
 import {
   DEFAULT_PERMISSION_PROFILE,
-  normalizePermissionProfile
+  normalizePermissionProfile,
+  type SessionPermissionProfileState
 } from '../../shared/permission-profiles'
 import type { EffectiveSpecialistSkills } from '@aipoch/specialists'
-import { createLogger, diagnosticErrorFields, errorLogFields } from '@aipoch/diagnostics/node'
+import {
+  createLogger,
+  diagnosticErrorFields,
+  startDiagnosticOperation
+} from '@aipoch/diagnostics/node'
 import type { AcpBackendGenerationView } from './backend-generation-owner'
 import type { AcpProviderSessionAdopter } from './provider-session-adopter'
 import {
@@ -54,6 +64,7 @@ type AcpProviderSessionResumerDependencies = Readonly<{
   currentConnection: () => ClientConnection | undefined
   ensureConnected: (cwd: string) => Promise<ClientConnection>
   assertCurrentConnection: (connection: ClientConnection) => void
+  assertResumeAllowed?: (frameworkId: string, providerSessionId: string) => Promise<void>
   disconnectTimedOutConnection: () => Promise<void>
   resumeCapabilityAdvertised: () => boolean
   supportsSessionClose: () => boolean
@@ -65,12 +76,17 @@ type AcpProviderSessionResumerDependencies = Readonly<{
   capabilityPolicy: SessionCapabilityPolicy
   configurator: Pick<AcpSessionConfigurator, 'configure' | 'configurePermissionProfile'>
   adopter: Pick<AcpProviderSessionAdopter, 'adopt'>
-  clearLivePermissionProfile: (sessionId: string) => void
+  setLivePermissionProfile: (sessionId: string, profile: SessionPermissionProfileState) => void
+  invalidatePermissionProfile: (sessionId: string) => void
   resolveSpecialistIdentity?: (
     specialistId: string,
     frameworkId: string
   ) => Promise<{ append: string; prefix: string } | undefined>
-  resolveSpecialistSkills?: (specialistId: string) => Promise<EffectiveSpecialistSkills>
+  resolveSpecialistSkills?: (
+    specialistId: string,
+    context?: AcpSpecialistResolutionContext
+  ) => Promise<EffectiveSpecialistSkills>
+  registerSessionSpecialist?: (sessionId: string, specialistId: string | undefined) => void
   // The ACP projectId carries the Project id (see workspace-conversation-controller). Returns
   // undefined when the project has no Agent Context or the lookup fails; failures never block
   // session resume.
@@ -84,9 +100,20 @@ type AcpProviderSessionResumerDependencies = Readonly<{
   diagnosticContext: () => Readonly<Record<string, unknown>>
 }>
 
+// In-process transfer receipt; identity survives retries, release validity ends on reacquisition.
+export type AcpSessionWriterTransfer = {
+  providerSessionId: string
+  writerReleased: boolean
+}
+
 export class AcpProviderSessionResumer {
   private readonly policy = new AcpSessionResumePolicy()
   private readonly presentation = new AcpSessionPresentationPolicy()
+  private readonly writerReleases = new Map<
+    string,
+    { attachment: AcpSessionAttachment; operation: Promise<string | undefined> }
+  >()
+  private readonly pendingResumeTransfers = new Map<string, AcpSessionWriterTransfer>()
   private readonly progressObservers = new Map<string, Set<() => void>>()
 
   constructor(private readonly deps: AcpProviderSessionResumerDependencies) {}
@@ -97,14 +124,88 @@ export class AcpProviderSessionResumer {
     for (const observer of observers) observer()
   }
 
-  async resume(request: AcpResumeSessionRequest): Promise<AcpCreateSessionResponse> {
+  async resume(
+    request: AcpResumeSessionRequest,
+    writerTransfer?: AcpSessionWriterTransfer,
+    isPermissionCurrent: () => boolean = () => true
+  ): Promise<AcpCreateSessionResponse> {
+    if (this.writerReleases.has(request.sessionId)) {
+      const providerSessionId = await this.releaseForTransfer(request.sessionId)
+      if (providerSessionId) {
+        request = { ...request, providerSessionId }
+        writerTransfer = { providerSessionId, writerReleased: true }
+        this.pendingResumeTransfers.set(request.sessionId, writerTransfer)
+      }
+    }
     const attached = this.deps.registry.lookup(request.sessionId)?.attachment
-    if (attached) return this.resumeAttached(request, attached)
+    if (attached) {
+      this.pendingResumeTransfers.delete(request.sessionId)
+      return this.resumeAttached(request, attached, isPermissionCurrent)
+    }
+    writerTransfer ??= this.pendingResumeTransfers.get(request.sessionId)
+    if (writerTransfer)
+      request = { ...request, providerSessionId: writerTransfer.providerSessionId }
+    const response = await this.resumeDetached(request, false, writerTransfer)
+    this.pendingResumeTransfers.delete(request.sessionId)
+    return response
+  }
 
-    return this.resumeDetached(request, false)
+  hasPendingWriterRelease(sessionId: string): boolean {
+    return this.writerReleases.has(sessionId)
+  }
+
+  async releaseForTransfer(sessionId: string): Promise<string | undefined> {
+    let release = this.writerReleases.get(sessionId)
+    if (!release) {
+      const attachment = this.deps.registry.lookup(sessionId)?.attachment
+      if (!attachment) return undefined
+      release = { attachment, operation: this.releaseWriter(sessionId) }
+      this.writerReleases.set(sessionId, release)
+      const current = release
+      void release.operation.catch(() => {
+        if (this.writerReleases.get(sessionId) === current) this.writerReleases.delete(sessionId)
+      })
+    }
+    // Keep ownership discoverable after a caller timeout. Only a caller consuming the confirmed
+    // release may detach it; otherwise sibling state updates could discard the retry identity.
+    const providerSessionId = await this.withTimeout(() => release.operation, [], {
+      preserveConnection: true
+    })
+    const current = this.deps.registry.lookup(sessionId)?.attachment
+    if (current === release.attachment) {
+      if (!this.deps.registry.detach(release.attachment, 'connection')) {
+        throw new Error('ACP session transfer was superseded.')
+      }
+      release.attachment.session.dispose()
+    } else if (current) {
+      if (this.writerReleases.get(sessionId) === release) this.writerReleases.delete(sessionId)
+      throw new Error('ACP session transfer was superseded.')
+    }
+    if (this.writerReleases.get(sessionId) === release) this.writerReleases.delete(sessionId)
+    return providerSessionId
+  }
+
+  private async releaseWriter(sessionId: string): Promise<string | undefined> {
+    const entry = this.deps.registry.lookup(sessionId)
+    const attachment = entry?.attachment
+    if (!attachment) return undefined
+    const connection = this.deps.currentConnection()
+    if (!connection || !this.deps.supportsSessionClose()) {
+      throw new Error('The provider cannot release this Session for a model change.')
+    }
+    // Close only this writer, preserving provider history and sibling Sessions. A failed close
+    // must not allow another generation to resume the same thread.
+    await connection.agent.request(
+      acp.methods.agent.session.close,
+      { sessionId: attachment.providerSessionId },
+      { cancellationSignal: new AbortController().signal }
+    )
+    this.deps.assertCurrentConnection(connection)
+    return attachment.providerSessionId
   }
 
   async reconfigure(request: AcpResumeSessionRequest): Promise<AcpCreateSessionResponse> {
+    this.assertNoPendingWriterRelease(request.sessionId)
     const entry = this.deps.registry.lookup(request.sessionId)
     const attachment = entry?.attachment
     const snapshot = entry?.aggregate.snapshot()
@@ -115,12 +216,15 @@ export class AcpProviderSessionResumer {
         true
       )
     }
-    this.assertSkillScopeRefreshSupported()
+    this.assertSkillScopeRefreshSupported(request.sessionId)
+    const knownWriterConnection = this.deps.currentConnection()
     this.deps.registry.detach(attachment, 'provider')
     try {
       const result = await this.resumeDetached(
         { ...request, providerSessionId: attachment.providerSessionId },
-        true
+        true,
+        undefined,
+        knownWriterConnection
       )
       attachment.session.dispose()
       return result
@@ -174,7 +278,9 @@ export class AcpProviderSessionResumer {
 
   private async resumeDetached(
     request: AcpResumeSessionRequest,
-    compatibleOnly: boolean
+    compatibleOnly: boolean,
+    writerTransfer?: AcpSessionWriterTransfer,
+    knownWriterConnection?: ClientConnection
   ): Promise<AcpCreateSessionResponse> {
     const cwd = resolve(request.cwd || this.deps.currentCwd() || this.deps.defaultCwd)
     const projectId = request.projectId?.trim() || this.deps.defaultProjectId
@@ -195,7 +301,9 @@ export class AcpProviderSessionResumer {
             projectId,
             identity,
             compatibleOnly,
-            cancellationSignal
+            cancellationSignal,
+            writerTransfer,
+            knownWriterConnection
           ),
         this.progressSessionIds(request)
       )
@@ -206,11 +314,16 @@ export class AcpProviderSessionResumer {
 
   private async resumeAttached(
     request: AcpResumeSessionRequest,
-    attachment: AcpSessionAttachment
+    attachment: AcpSessionAttachment,
+    isPermissionCurrent: () => boolean
   ): Promise<AcpCreateSessionResponse> {
     // Refreshing an attachment must not tear down its running turn. Unrelated prompt progress
     // cannot extend this wait, and cancellation prevents late refresh results from committing.
     let permissionUpdateStarted = false
+    const initialConnection = this.deps.currentConnection()
+    const initialProfile = this.deps.registry
+      .lookup(request.sessionId)
+      ?.aggregate.snapshot().permissionProfile
     return this.withTimeout(
       async (cancellationSignal) => {
         if (request.specialistBindingPending === true) {
@@ -218,6 +331,7 @@ export class AcpProviderSessionResumer {
             'A pending Specialist binding cannot be reconciled through an already attached provider session.'
           )
         }
+        if (!isPermissionCurrent()) throw new Error('Permission profile refresh was superseded.')
         const entry = this.deps.registry.lookup(request.sessionId)
         if (!entry) throw new Error(`ACP session is not registered: ${request.sessionId}`)
         const connection = this.deps.currentConnection()
@@ -239,19 +353,39 @@ export class AcpProviderSessionResumer {
         const wslSetup =
           (await this.deps.capabilities.isWslSetupSession?.(request.sessionId)) === true
         cancellationSignal.throwIfAborted()
+        const previousProfile = entry.aggregate.snapshot().permissionProfile
         permissionUpdateStarted = true
-        const permissionProfile = await this.deps.configurator.configurePermissionProfile({
-          backend,
-          connection,
-          session: attachment.session,
-          cancellationSignal,
-          permissionProfile: normalizePermissionProfile(
-            request.permissionProfile ??
-              entry.aggregate.snapshot().permissionProfile?.selectedProfile ??
-              DEFAULT_PERMISSION_PROFILE
-          )
-        })
+        this.deps.invalidatePermissionProfile(request.sessionId)
+        const permissionProfile = await this.deps.configurator
+          .configurePermissionProfile({
+            backend,
+            connection,
+            session: attachment.session,
+            cancellationSignal,
+            permissionProfile: normalizePermissionProfile(
+              request.permissionProfile ??
+                entry.aggregate.snapshot().permissionProfile?.selectedProfile ??
+                DEFAULT_PERMISSION_PROFILE
+            )
+          })
+          .catch((error) => {
+            // A timeout has an unknown provider outcome: stay revoked until an explicit retry.
+            if (
+              !cancellationSignal.aborted &&
+              isPermissionCurrent() &&
+              previousProfile &&
+              this.deps.currentConnection() === connection &&
+              this.deps.registry.lookup(request.sessionId)?.attachment === attachment
+            ) {
+              this.deps.setLivePermissionProfile(request.sessionId, {
+                ...previousProfile,
+                availableModeIds: [...previousProfile.availableModeIds]
+              })
+            }
+            throw error
+          })
         cancellationSignal.throwIfAborted()
+        if (!isPermissionCurrent()) throw new Error('Permission profile refresh was superseded.')
         const current = this.deps.registry.lookup(request.sessionId)
         if (
           current?.attachment?.generation !== attachment.generation ||
@@ -262,10 +396,11 @@ export class AcpProviderSessionResumer {
         this.deps.assertCurrentConnection(connection)
         if (request.specialistId) current.aggregate.setSpecialistId(request.specialistId)
         current.aggregate.setPermissionProfile(structuredClone(permissionProfile))
-        this.deps.clearLivePermissionProfile(request.sessionId)
+        this.deps.setLivePermissionProfile(request.sessionId, permissionProfile)
         this.deps.registry.select(request.sessionId)
         this.deps.updateCwd(cwd)
         current.aggregate.updateLocation(cwd, projectId)
+        this.registerSessionSpecialist(request.sessionId)
         this.deps.emitState()
 
         const responseBackend = this.deps.currentBackend()
@@ -290,7 +425,21 @@ export class AcpProviderSessionResumer {
             ? 'The permission update outcome is unknown.'
             : 'No permission update was attempted.')
       }
-    )
+    ).catch((error) => {
+      if (
+        !permissionUpdateStarted &&
+        isPermissionCurrent() &&
+        initialProfile &&
+        this.deps.currentConnection() === initialConnection &&
+        this.deps.registry.lookup(request.sessionId)?.attachment === attachment
+      ) {
+        this.deps.setLivePermissionProfile(request.sessionId, {
+          ...initialProfile,
+          availableModeIds: [...initialProfile.availableModeIds]
+        })
+      }
+      throw error
+    })
   }
 
   private async withTimeout<Result>(
@@ -364,7 +513,9 @@ export class AcpProviderSessionResumer {
     projectId: string,
     identity: AcpPrimarySessionIdentityReservation,
     compatibleOnly: boolean,
-    cancellationSignal: AbortSignal
+    cancellationSignal: AbortSignal,
+    writerTransfer?: AcpSessionWriterTransfer,
+    knownWriterConnection?: ClientConnection
   ): Promise<AcpCreateSessionResponse> {
     const affinity = this.deps.registry.lookup(request.sessionId)?.aggregate.snapshot()
     const persistedProviderSessionId = affinity?.providerSessionId ?? request.providerSessionId
@@ -389,7 +540,9 @@ export class AcpProviderSessionResumer {
         persistedProviderSessionId,
         true,
         true,
-        cancellationSignal
+        cancellationSignal,
+        writerTransfer,
+        knownWriterConnection
       )
     }
     const decision = this.policy.decide({
@@ -427,7 +580,9 @@ export class AcpProviderSessionResumer {
       decision.providerSessionId,
       persistedProviderSessionId !== undefined,
       compatibleOnly,
-      cancellationSignal
+      cancellationSignal,
+      writerTransfer,
+      knownWriterConnection
     )
   }
 
@@ -440,13 +595,34 @@ export class AcpProviderSessionResumer {
     providerSessionId: string,
     providerSessionIdPersisted: boolean,
     compatibleOnly: boolean,
-    cancellationSignal: AbortSignal
+    cancellationSignal: AbortSignal,
+    writerTransfer?: AcpSessionWriterTransfer,
+    knownWriterConnection?: ClientConnection
   ): Promise<AcpCreateSessionResponse> {
     let capability: SessionCapabilityProvision | undefined
     let provisionalSession: ActiveSession | undefined
     try {
       let backend = this.deps.currentBackend()
-      this.assertSkillScopeRefreshSupported()
+      this.assertSkillScopeRefreshSupported(request.sessionId)
+      const ownsCurrentWriter = knownWriterConnection === connection
+      const releasedWriter =
+        writerTransfer?.writerReleased && writerTransfer.providerSessionId === providerSessionId
+      if (!ownsCurrentWriter && !releasedWriter) {
+        try {
+          await this.deps.assertResumeAllowed?.(backend.framework.id, providerSessionId)
+        } catch (error) {
+          if (!(error instanceof PreviousAgentContextUnavailableError) || compatibleOnly)
+            throw error
+          cancellationSignal.throwIfAborted()
+          this.deps.assertCurrentConnection(connection)
+          identity.assertCurrent()
+          return this.adopt(request, connection, cwd, projectId, identity)
+        }
+      }
+      recordMainAgentContext(connection, providerSessionId)
+      cancellationSignal.throwIfAborted()
+      this.deps.assertCurrentConnection(connection)
+      identity.assertCurrent()
       capability = await this.deps.capabilities.provision({
         stableAppSessionId: request.sessionId,
         framework: backend.framework,
@@ -463,6 +639,7 @@ export class AcpProviderSessionResumer {
       const existingAggregate = this.deps.registry.lookup(request.sessionId)?.aggregate
       let specialistBindingRevision = existingAggregate?.specialistBindingRevision() ?? 0
       let specialistId = request.specialistId ?? existingAggregate?.snapshot().specialistId
+      let bindingSource = request.specialistId !== undefined ? 'request' : 'registry'
       const projectContextAppend = await this.resolveProjectAgentContext(projectId)
       const resolveSpecialistProjection = async (
         currentSpecialistId: string | undefined,
@@ -471,10 +648,33 @@ export class AcpProviderSessionResumer {
         identity: { append: string; prefix: string } | undefined
         setup: AcpSessionSetupPresentation
       }> => {
+        if (currentSpecialistId)
+          log.info('bound specialist resolution started', {
+            operation: 'specialist-resolution',
+            mode: 'resume',
+            phase: 'profile',
+            sessionId: request.sessionId,
+            specialistId: currentSpecialistId,
+            frameworkId: currentBackend.framework.id,
+            modelRoute: currentBackend.modelRoute,
+            bindingSource,
+            bindingRevision: specialistBindingRevision
+          })
         const [identity, skills] = await Promise.all([
-          this.resolveSpecialistIdentity(currentSpecialistId, currentBackend),
-          this.resolveSpecialistSkills(currentSpecialistId)
+          this.resolveSpecialistIdentity(currentSpecialistId, currentBackend, request.sessionId),
+          this.resolveSpecialistSkills(currentSpecialistId, currentBackend, request.sessionId)
         ])
+        if (currentSpecialistId)
+          log.info('bound specialist resolution finished', {
+            operation: 'specialist-resolution',
+            mode: 'resume',
+            phase: 'identity',
+            sessionId: request.sessionId,
+            specialistId: currentSpecialistId,
+            frameworkId: currentBackend.framework.id,
+            modelRoute: currentBackend.modelRoute,
+            outcome: skills?.kind === 'unavailable' ? 'unavailable' : 'resolved'
+          })
         return {
           identity,
           setup: this.presentation.buildSessionSetup({
@@ -501,7 +701,11 @@ export class AcpProviderSessionResumer {
         specialistProjection.setup.mcpServers ?? []
       )
 
-      if (backend.framework.id === 'codex' && backend.session.options?.openScienceSkillRuntime) {
+      if (
+        backend.framework.id === 'codex' &&
+        backend.session.options?.openScienceSkillRuntime &&
+        !(writerTransfer?.writerReleased && writerTransfer.providerSessionId === providerSessionId)
+      ) {
         // Codex reuses the MCP processes of an already loaded thread on resume. Closing the live
         // thread first applies the new scope without deleting its persisted history or replaying it.
         await connection.agent.request(
@@ -509,6 +713,8 @@ export class AcpProviderSessionResumer {
           { sessionId: providerSessionId },
           { cancellationSignal }
         )
+        if (writerTransfer?.providerSessionId === providerSessionId)
+          writerTransfer.writerReleased = true
       }
 
       let resumeResponse: unknown
@@ -529,6 +735,17 @@ export class AcpProviderSessionResumer {
           currentModelRoute: backend.modelRoute,
           providerSessionIdPersisted
         })
+        startDiagnosticOperation(log, {
+          operation: 'acp-provider-resume-rejection',
+          fields: {
+            sessionId: request.sessionId,
+            frameworkId: backend.framework.id,
+            modelRoute: backend.modelRoute,
+            reason: failure.reason,
+            disposition: failure.disposition,
+            contextReplacementAllowed: !compatibleOnly
+          }
+        }).fail(error)
         if (failure.disposition !== 'adoptable' || compatibleOnly) throw error
         try {
           identity.assertCurrent()
@@ -541,7 +758,8 @@ export class AcpProviderSessionResumer {
         capability = undefined
         log.info('resumed session adopted after unrecoverable resume error', {
           sessionId: request.sessionId,
-          ...errorLogFields(error)
+          reason: failure.reason,
+          ...diagnosticErrorFields(error)
         })
         // Adoption now owns cleanup and releases identity even on failure. Do not catch its
         // rejection below: checking that released reservation would mask the provider error as
@@ -549,6 +767,9 @@ export class AcpProviderSessionResumer {
         return this.adopt(request, connection, cwd, projectId, identity)
       }
 
+      // A successful resume has reacquired the writer even if local configuration fails below.
+      if (writerTransfer?.providerSessionId === providerSessionId)
+        writerTransfer.writerReleased = false
       provisionalSession = (
         connection.agent as unknown as ClientContextSessionAttacher
       ).attachSession({ sessionId: providerSessionId, ...(resumeResponse as object) })
@@ -598,6 +819,7 @@ export class AcpProviderSessionResumer {
           const currentAggregate = this.deps.registry.lookup(request.sessionId)?.aggregate
           specialistBindingRevision = currentAggregate?.specialistBindingRevision() ?? 0
           specialistId = currentAggregate?.snapshot().specialistId
+          bindingSource = 'registry'
           specialistProjection = await resolveSpecialistProjection(specialistId, backend)
           continue
         }
@@ -643,6 +865,33 @@ export class AcpProviderSessionResumer {
         ownsStableIdentity = false
       }
       capability?.release({ ownsStableIdentity })
+      if (
+        ownsStableIdentity &&
+        provisionalSession &&
+        writerTransfer?.providerSessionId === providerSessionId
+      ) {
+        // A failed local configuration must release the newly acquired writer before retirement or
+        // retry. Keep sibling Sessions connected and retain the original provider failure.
+        try {
+          this.deps.assertCurrentConnection(connection)
+          await this.withTimeout(
+            async (cleanupSignal) => {
+              await connection.agent.request(
+                acp.methods.agent.session.close,
+                { sessionId: provisionalSession!.sessionId },
+                { cancellationSignal: cleanupSignal }
+              )
+              cleanupSignal.throwIfAborted()
+              this.deps.assertCurrentConnection(connection)
+              writerTransfer.writerReleased = true
+            },
+            [],
+            { preserveConnection: true }
+          )
+        } catch (cleanupError) {
+          this.safeLogError('transferred writer cleanup failed', cleanupError, providerSessionId)
+        }
+      }
       this.disposeProvisional(provisionalSession, 'resumed startup session disposal failed')
       throw startupError
     }
@@ -667,7 +916,17 @@ export class AcpProviderSessionResumer {
     })
   }
 
-  assertSkillScopeRefreshSupported(): void {
+  private assertNoPendingWriterRelease(sessionId: string): void {
+    // A timed-out close can still terminate its writer. Only resume consumes its release receipt.
+    if (this.writerReleases.has(sessionId)) {
+      throw new Error(
+        'Cannot reconfigure a Session while its writer release is pending. Resume the Session first.'
+      )
+    }
+  }
+
+  assertSkillScopeRefreshSupported(sessionId: string): void {
+    this.assertNoPendingWriterRelease(sessionId)
     const backend = this.deps.currentBackend()
     if (backend.framework.id === 'codex' && backend.session.options?.openScienceSkillRuntime) {
       const missingMethod = !this.deps.supportsSessionClose()
@@ -691,34 +950,87 @@ export class AcpProviderSessionResumer {
   }
 
   private async resolveSpecialistSkills(
-    specialistId: string | undefined
+    specialistId: string | undefined,
+    backend: AcpBackendGenerationView,
+    sessionId: string
   ): Promise<EffectiveSpecialistSkills | undefined> {
     if (!specialistId || !this.deps.resolveSpecialistSkills) return undefined
     try {
-      return await this.deps.resolveSpecialistSkills(specialistId)
-    } catch {
+      return await this.deps.resolveSpecialistSkills(specialistId, {
+        sessionId,
+        frameworkId: backend.framework.id,
+        modelRoute: backend.modelRoute
+      })
+    } catch (error) {
+      log.warn('bound specialist capability resolution failed', {
+        operation: 'specialist-resolution',
+        mode: 'resume',
+        phase: 'skills',
+        reason: 'resolver-threw',
+        sessionId,
+        specialistId,
+        frameworkId: backend.framework.id,
+        modelRoute: backend.modelRoute,
+        ...diagnosticErrorFields(error)
+      })
       return { kind: 'unavailable', reason: 'The bound specialist is unavailable.' }
     }
   }
 
   private async resolveSpecialistIdentity(
     specialistId: string | undefined,
-    backend: AcpBackendGenerationView
+    backend: AcpBackendGenerationView,
+    sessionId: string
   ): Promise<{ append: string; prefix: string } | undefined> {
     if (!specialistId) return undefined
+    const context = {
+      operation: 'specialist-resolution',
+      mode: 'resume',
+      phase: 'identity',
+      sessionId,
+      specialistId,
+      frameworkId: backend.framework.id,
+      backendId: backend.backendId,
+      modelRoute: backend.modelRoute
+    }
     if (!this.deps.resolveSpecialistIdentity) {
+      log.warn('bound specialist identity resolution failed', {
+        ...context,
+        reason: 'resolver-missing'
+      })
       throw new Error('The bound specialist is unavailable.')
     }
+    let identity
     try {
-      const identity = await this.deps.resolveSpecialistIdentity(specialistId, backend.framework.id)
-      if (!identity) throw new Error('The bound specialist is unavailable.')
-      return identity
-    } catch {
+      identity = await this.deps.resolveSpecialistIdentity(specialistId, backend.framework.id)
+    } catch (error) {
+      log.warn('bound specialist identity resolution failed', {
+        ...context,
+        reason: 'resolver-threw',
+        ...diagnosticErrorFields(error)
+      })
       throw new Error('The bound specialist is unavailable.')
+    }
+    if (!identity) {
+      log.warn('bound specialist identity resolution failed', { ...context, reason: 'unavailable' })
+      throw new Error('The bound specialist is unavailable.')
+    }
+    return identity
+  }
+
+  private registerSessionSpecialist(sessionId: string): void {
+    try {
+      this.deps.registerSessionSpecialist?.(
+        sessionId,
+        this.deps.registry.lookup(sessionId)?.aggregate.snapshot().specialistId
+      )
+    } catch (error) {
+      this.safeLogError('register resumed session specialist failed', error, sessionId)
     }
   }
 
   private publish(sessionId: string, cwd: string): void {
+    this.registerSessionSpecialist(sessionId)
     this.deps.updateCwd(cwd)
     try {
       this.deps.pushEvent({

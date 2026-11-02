@@ -33,7 +33,15 @@
     "src/main/pdf-annotations/sharing.ts",
     "src/main/pdf-annotations/sharing.integration.test.ts",
     "src/renderer/src/pages/workspace/pdf-annotations/PdfReconciliationDialog.tsx",
-    "src/renderer/src/pages/workspace/pdf-annotations/PdfDocumentDialogs.test.tsx"
+    "src/renderer/src/pages/workspace/pdf-annotations/PdfDocumentDialogs.test.tsx",
+    "src/main/pdf-annotations/source-bindings.ts",
+    "src/main/pdf-annotations/public-boundary.architecture.test.ts",
+    "src/main/pdf-annotations/agent-geometry-core.ts",
+    "src/main/pdf-annotations/agent-geometry-worker-entry.ts",
+    "src/main/pdf-annotations/agent-geometry.ts",
+    "src/main/pdf-annotations/agent-geometry.test.ts",
+    "src/main/pdf-annotations/agent-tools.ts",
+    "src/main/pdf-annotations/agent-tools.test.ts"
   ],
   "interfacePaths": [
     "src/main/pdf-annotations/application-commands.ts",
@@ -43,7 +51,10 @@
     "src/renderer/src/pages/workspace/pdf-annotations/use-pdf-export.ts",
     "src/renderer/src/pages/workspace/pdf-annotations/PdfExportProvider.tsx",
     "src/main/pdf-annotations/native-import.ts",
-    "src/renderer/src/pages/workspace/pdf-annotations/PdfAnnotationPreviewDialog.tsx"
+    "src/renderer/src/pages/workspace/pdf-annotations/PdfAnnotationPreviewDialog.tsx",
+    "src/main/pdf-annotations/source-bindings.ts",
+    "src/main/pdf-annotations/agent-geometry.ts",
+    "src/main/pdf-annotations/agent-tools.ts"
   ],
   "consumerModules": [
     "workspace_previews",
@@ -66,7 +77,10 @@
       "src/renderer/src/pages/workspace/pdf-annotations/use-native-pdf-visibility.test.tsx",
       "src/renderer/src/pages/workspace/pdf-annotations/native-pdf-rendering.test.ts",
       "src/main/pdf-annotations/sharing.integration.test.ts",
-      "src/renderer/src/pages/workspace/pdf-annotations/PdfDocumentDialogs.test.tsx"
+      "src/renderer/src/pages/workspace/pdf-annotations/PdfDocumentDialogs.test.tsx",
+      "src/main/pdf-annotations/public-boundary.architecture.test.ts",
+      "src/main/pdf-annotations/agent-geometry.test.ts",
+      "src/main/pdf-annotations/agent-tools.test.ts"
     ],
     "contract": [
       "src/main/database/pdf-annotations-migration.test.ts",
@@ -672,7 +686,8 @@
       "src/main/node-entry.test.ts",
       "src/main/desktop-runtime-session-size.integration.test.ts",
       "src/main/notebook-payload.integration.test.ts",
-      "src/main/web-service/session-payload.integration.test.ts"
+      "src/main/web-service/session-payload.integration.test.ts",
+      "src/main/composition/session-packages.test.ts"
     ]
   },
   "capabilityOverlays": ["e2e_regressions"],

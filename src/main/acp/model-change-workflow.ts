@@ -2,7 +2,7 @@ import * as acp from '@agentclientprotocol/sdk'
 import type { ActiveSession, SessionConfigOption } from '@agentclientprotocol/sdk'
 
 import type { AcpStateSnapshot } from '../../shared/acp'
-import type { ResolvedReasoningEffort } from '../../shared/reasoning-effort'
+import type { ResolvedReasoningEffort } from '@aipoch/providers'
 import type { AgentModelChangeTarget } from '../agent-framework'
 import { createLogger, diagnosticErrorFields } from '@aipoch/diagnostics/node'
 import type { AcpBackendGenerationOwner } from './backend-generation-owner'
@@ -24,11 +24,11 @@ type AcpModelChangeWorkflowOptions = Readonly<{
     | 'epoch'
     | 'connection'
     | 'isShuttingDown'
-    | 'anthropicBridgeAvailable'
+    | 'messagesBridgeAvailable'
     | 'providerTransportAvailable'
     | 'assertCurrentConnection'
     | 'setProviderTransportTarget'
-    | 'setAnthropicBridgeTarget'
+    | 'setMessagesBridgeTarget'
     | 'setBridgeModelTarget'
     | 'setBridgeReasoningEffort'
   >
@@ -186,8 +186,8 @@ class AcpModelChangeWorkflow {
       backend.backendId === target.backendId ||
       (backend.framework.id === 'claude-code' &&
         target.route === 'claude-anthropic' &&
-        target.anthropicBridgeTargetId !== undefined &&
-        resources.anthropicBridgeAvailable) ||
+        target.messagesBridgeTargetId !== undefined &&
+        resources.messagesBridgeAvailable) ||
       (target.providerTransportTargetId !== undefined && resources.providerTransportAvailable)
     return (
       !resources.isShuttingDown &&
@@ -207,6 +207,7 @@ class AcpModelChangeWorkflow {
       backend.backendId === target.backendId &&
       backend.providerId === target.providerId &&
       backend.context.model === target.model &&
+      (backend.framework.id !== 'codex' || backend.context.window === target.contextWindow) &&
       backend.session.model === target.sessionModel &&
       backend.context.supportsImageInput === target.supportsImageInput &&
       (backend.session.effort ?? 'default') === target.reasoningEffort
@@ -217,6 +218,11 @@ class AcpModelChangeWorkflow {
     const connection = this.options.connectionResources.connection
     if (!connection) return false
     const backend = this.options.backendGeneration.current
+    // Codex reads context/compaction overrides at process startup; an ACP model switch cannot
+    // replace them. Equal overrides remain valid across models: Codex resolves native caps per turn.
+    if (backend.framework.id === 'codex' && backend.context.window !== target.contextWindow) {
+      return false
+    }
     // ACP Sessions retain provider-side context that the host cannot inspect. Crossing the image
     // capability boundary requires a fresh Session when canonical history contains images. A Codex
     // bridge also binds its provider Session to the upstream model even when the current history is
@@ -247,8 +253,8 @@ class AcpModelChangeWorkflow {
         return false
       }
       if (
-        target.anthropicBridgeTargetId &&
-        !this.options.connectionResources.setAnthropicBridgeTarget(target.anthropicBridgeTargetId)
+        target.messagesBridgeTargetId &&
+        !this.options.connectionResources.setMessagesBridgeTarget(target.messagesBridgeTargetId)
       ) {
         return false
       }

@@ -1,3 +1,4 @@
+import { normalizeLiteratureDoiKeyV1, normalizeLiteratureDoiValueV1 } from './doi.js'
 import { z } from 'zod'
 const nonEmptyTextSchema = z.string().trim().min(1)
 const optionalTextSchema = z.string().trim().optional()
@@ -66,26 +67,12 @@ const lastLineBreak = (value: string): number =>
     value.lastIndexOf('\u2029')
   )
 
-const stripDoiCopyright = (value: string): string => {
-  // The separator after Copyright may itself be the final line break.
-  const start = Math.max(0, lastLineBreak(value) - 'Copyright'.length)
-  const suffix = /Copyright(?:\s|$)/iu.exec(value.slice(start))
-  return suffix ? value.slice(0, start + suffix.index) : value
-}
-
 const normalizeLiteratureIdentifierValue = (
   scheme: LiteratureIdentifierScheme,
   value: string
 ): string => {
   const trimmed = value.trim()
-  if (scheme === 'doi') {
-    const candidate = stripDoiCopyright(
-      trimmed.replace(/^doi:\s*/iu, '').replace(/^https?:\/\/(?:dx\.)?doi\.org\//iu, '')
-    )
-    let end = candidate.length
-    while (end > 0 && '.,;:)}]'.includes(candidate[end - 1])) end--
-    return candidate.slice(0, end).trim()
-  }
+  if (scheme === 'doi') return normalizeLiteratureDoiValueV1(value)
   if (scheme === 'pmid') {
     const candidate = trimmed.replace(/^PMID\s*:\s*/iu, '')
     return (
@@ -119,14 +106,29 @@ const normalizeLiteratureIdentifierValue = (
   return trimmed
 }
 
+// Extract a bibliographic year without interpreting opaque date text as a calendar date.
+export const literatureIssuedYear = (date: string): number | undefined => {
+  const match = date.match(/(?:^|\D)(\d{4})(?:\D|$)/u)
+  return match ? Number(match[1]) : undefined
+}
+
+export const normalizeLiteratureIdentifierKey = (
+  scheme: LiteratureIdentifierScheme,
+  value: string
+): string =>
+  scheme === 'doi'
+    ? normalizeLiteratureDoiKeyV1(value)
+    : normalizeLiteratureIdentifierValue(scheme, value).toLowerCase()
+
 const createLiteratureIdentifierUrl = (
   scheme: LiteratureIdentifierScheme,
   value: string
 ): string | undefined => {
   const normalized = normalizeLiteratureIdentifierValue(scheme, value)
-  if (scheme === 'doi' && /^10\.\d{4,9}\/\S+$/u.test(normalized)) {
-    const encoded = normalized.split('/').map(encodeURIComponent).join('/')
-    return `https://doi.org/${encoded}`
+  if (scheme === 'doi') {
+    const parts = /^(10\.\d{4,9})\/(\S+)$/u.exec(normalized)
+    if (!parts || parts[2] === '.' || parts[2] === '..') return undefined
+    return `https://doi.org/${encodeURIComponent(parts[1])}/${encodeURIComponent(parts[2])}`
   }
   if (scheme === 'pmid' && /^\d+$/u.test(normalized)) {
     return `https://pubmed.ncbi.nlm.nih.gov/${normalized}/`
@@ -193,6 +195,26 @@ const literatureCitationStyleViewSchema = z
   })
   .strict()
 
+const literatureCitationStylesRequestSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('list') }).strict(),
+  z
+    .object({ kind: z.literal('import'), content: z.string().min(1).max(LITERATURE_CSL_MAX_BYTES) })
+    .strict(),
+  z.object({ kind: z.literal('delete'), styleId: nonEmptyTextSchema }).strict(),
+  z.object({ kind: z.literal('preview'), styleId: nonEmptyTextSchema }).strict()
+])
+
+const literatureCitationStylesResultSchema = z
+  .object({
+    styles: z.array(literatureCitationStyleViewSchema),
+    changedStyleId: nonEmptyTextSchema.optional(),
+    preview: literatureCitationStylePreviewSchema
+      .extend({ styleId: nonEmptyTextSchema })
+      .strict()
+      .optional()
+  })
+  .strict()
+
 type LiteratureItemType = z.infer<typeof bibliographicRecordSchema>['itemType']
 
 type LiteratureIdentityScheme = (typeof LITERATURE_IDENTITY_SCHEMES)[number]
@@ -209,8 +231,8 @@ function preferredLiteratureIdentifier(
     .filter((identifier) => identifier.scheme === scheme)
     .sort((a, b) => {
       const priority = Number(b.isPrimary) - Number(a.isPrimary)
-      const left = normalizeLiteratureIdentifierValue(scheme, a.value).toLowerCase()
-      const right = normalizeLiteratureIdentifierValue(scheme, b.value).toLowerCase()
+      const left = normalizeLiteratureIdentifierKey(scheme, a.value)
+      const right = normalizeLiteratureIdentifierKey(scheme, b.value)
       return (
         priority ||
         (left < right ? -1 : left > right ? 1 : a.value < b.value ? -1 : a.value > b.value ? 1 : 0)
@@ -232,6 +254,9 @@ function normalizeLiteratureIdentifierPreferences<T extends LiteratureIdentifier
     isPrimary: identifier.isPrimary && preferred.get(identifier.scheme) === identifier
   }))
 }
+
+type LiteratureCitationStylesRequest = z.infer<typeof literatureCitationStylesRequestSchema>
+type LiteratureCitationStylesResult = z.infer<typeof literatureCitationStylesResultSchema>
 
 type LiteratureCitationStyle = string
 
@@ -279,6 +304,8 @@ export {
   literatureOrganizationCreatorSchema,
   literatureCreatorInputSchema,
   literatureIdentifierInputSchema,
+  literatureCitationStylesRequestSchema,
+  literatureCitationStylesResultSchema,
   literatureCitationStylePreviewSchema,
   literatureCitationStyleViewSchema,
   preferredLiteratureIdentifier,
@@ -291,6 +318,8 @@ export type {
   LiteratureIdentityScheme,
   LiteratureCreatorInput,
   LiteratureIdentifierInput,
+  LiteratureCitationStylesRequest,
+  LiteratureCitationStylesResult,
   LiteratureCitationStyle,
   LiteratureCitationLocale,
   LiteratureCitationStyleView,

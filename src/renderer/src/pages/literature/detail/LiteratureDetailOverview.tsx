@@ -1,19 +1,18 @@
-import { FileDropOverlay } from '@/components/FileDropOverlay'
+import { useLiteratureHost } from '../renderer-host'
+import type { LiteraturePreviewItem } from '../renderer-host'
+import { FileDropZone } from '@/components/FileDropZone'
+import { ErrorNotice } from '@/components/error-notice'
 import { Button } from '@/components/ui/button'
-import type { useFileDropZone } from '@/hooks/useFileDropZone'
-import type { PreviewFileItem } from '@/stores/preview-workbench-store'
-import type { LiteratureItemType } from '@aipoch/literature-citations/contracts'
 import type { LiteratureDetailController } from '@aipoch/literature-library/client'
 import type {
   LiteratureCollectionView,
   LiteratureItemView
 } from '@aipoch/literature-library/contracts'
 import type { SmartCollectionView } from '@aipoch/literature-screening/contracts'
-import { Download, FilePlus2, LoaderCircle, Upload } from 'lucide-react'
+import { Search, BookOpen, Quote } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { createLiteratureAttachmentVersionReference } from '../../../../../shared/literature-attachment-reference'
-import { ResourceTagSummary } from '../../settings/ResourceTagControls'
-import { LITERATURE_PREVIEW_SESSION_ID } from '../../workspace/preview-file-item'
+import { LITERATURE_PREVIEW_SESSION_ID } from '../../../../../shared/literature-attachment-reference'
 import {
   SmartCollectionAssessment,
   SmartCollectionDecisionActions
@@ -40,8 +39,6 @@ export function LiteratureDetailOverview({
   pendingDecisions,
   smartRunningCollection,
   confirmSmartDecision,
-  itemTypeLabels,
-  handleDetailTagMenuOpenChange,
   activeProjects,
   projectLinkError,
   projectsLoaded,
@@ -49,15 +46,15 @@ export function LiteratureDetailOverview({
   displayCollections,
   collectionLinkError,
   setCollectionLink,
+  onRelated,
   changeDetailMode,
   isAddingPdf,
   pdfInputRef,
-  addPdf,
+  addPdfs,
   pdfError,
   detailController,
   setPreviewItem,
-  pdfDropZoneProps,
-  isDraggingPdf
+  pdfProgress
 }: {
   selectedCollection: LiteratureCollectionView | undefined
   updateSmartEvidence: () => Promise<void>
@@ -77,8 +74,6 @@ export function LiteratureDetailOverview({
     itemIds?: string[],
     singleRecord?: boolean
   ) => Promise<void>
-  itemTypeLabels: Record<LiteratureItemType, string>
-  handleDetailTagMenuOpenChange: (open: boolean) => void
   activeProjects: React.ComponentProps<typeof LiteratureDetailLinkList>['entries']
   projectLinkError: string | undefined
   projectsLoaded: boolean
@@ -86,17 +81,18 @@ export function LiteratureDetailOverview({
   displayCollections: LiteratureCollectionView[]
   collectionLinkError: string | undefined
   setCollectionLink: (targetCollectionId: string, included: boolean) => Promise<boolean>
+  onRelated: (direction: 'references' | 'citations') => void
   changeDetailMode: ReturnType<typeof useLiteratureMetadata>['changeMode']
   isAddingPdf: boolean
   pdfInputRef: React.RefObject<HTMLInputElement | null>
-  addPdf: (file: File) => Promise<void>
+  addPdfs: (files: File[]) => Promise<void>
   pdfError: string | undefined
   detailController: LiteratureDetailController
-  setPreviewItem: React.Dispatch<React.SetStateAction<PreviewFileItem | undefined>>
-  pdfDropZoneProps: ReturnType<typeof useFileDropZone>['dropZoneProps']
-  isDraggingPdf: boolean
+  setPreviewItem: React.Dispatch<React.SetStateAction<LiteraturePreviewItem | undefined>>
+  pdfProgress: string | undefined
 }): React.JSX.Element | null {
   const { t } = useTranslation()
+  const { getPreviewFormatForFile } = useLiteratureHost()
   return (
     <div className="relative min-h-0 flex-1 divide-y divide-border-300/80 overflow-y-auto px-5 text-sm">
       {selectedCollection?.smart && (
@@ -151,23 +147,33 @@ export function LiteratureDetailOverview({
           </p>
         </section>
       )}
-      <LiteratureBibliographicDetails selectedItem={selectedItem} itemTypeLabels={itemTypeLabels} />
-      <div className="py-4">
-        <ResourceTagSummary
-          reference={{
-            resourceType: 'literature.item',
-            resourceId: selectedItem.id
-          }}
-          onMenuOpenChange={handleDetailTagMenuOpenChange}
-          keepMenuOpenOnSelect
-        />
-      </div>
+      <LiteratureBibliographicDetails selectedItem={selectedItem} />
+      <section className="flex flex-wrap items-center justify-between gap-3 py-4">
+        <h3 className="font-medium">{t('Citation discovery')}</h3>
+        <div className="ml-auto flex shrink-0 gap-2">
+          <Button
+            data-related-entry="references"
+            size="sm"
+            variant="outline"
+            onClick={() => onRelated('references')}
+          >
+            <BookOpen className="size-4" aria-hidden="true" />
+            {t('References')}
+          </Button>
+          <Button
+            data-related-entry="citations"
+            size="sm"
+            variant="outline"
+            onClick={() => onRelated('citations')}
+          >
+            <Quote className="size-4" aria-hidden="true" />
+            {t('Cited by')}
+          </Button>
+        </div>
+      </section>
       <div className="grid divide-y divide-border-300/80 sm:grid-cols-2 sm:divide-x sm:divide-y-0">
         <section className="min-w-0 py-4 sm:pr-4">
           <h3 className="font-medium">{t('Projects')}</h3>
-          <p className="mt-1 text-xs text-muted-foreground">
-            {t('Use this reference in projects.')}
-          </p>
           <LiteratureDetailLinkList
             key={`${selectedItem.id}:projects`}
             checkedIds={selectedItem.projectIds}
@@ -180,9 +186,6 @@ export function LiteratureDetailOverview({
         </section>
         <section className="py-4 sm:pl-4">
           <h3 className="font-medium">{t('Collections')}</h3>
-          <p className="mt-1 text-xs text-muted-foreground">
-            {t('Use this reference in collections.')}
-          </p>
           <LiteratureDetailLinkList
             key={`${selectedItem.id}:collections`}
             checkedIds={selectedItem.collectionIds}
@@ -202,99 +205,66 @@ export function LiteratureDetailOverview({
             className="ml-auto"
             onClick={() => changeDetailMode('full-text')}
           >
-            <Download className="size-3.5" aria-hidden="true" />
+            <Search className="size-3.5" aria-hidden="true" />
             {t('Find full-text PDF')}
           </Button>
-          {selectedItem.attachments.length > 0 ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              disabled={isAddingPdf}
-              onClick={() => pdfInputRef.current?.click()}
-            >
-              {isAddingPdf ? (
-                <LoaderCircle
-                  className="size-3.5 animate-spin motion-reduce:animate-none"
-                  aria-hidden="true"
-                />
-              ) : (
-                <FilePlus2 className="size-3.5" aria-hidden="true" />
-              )}
-              {t('Add PDF')}
-            </Button>
+          <Button variant="outline" size="sm" onClick={() => changeDetailMode('supplements')}>
+            <Search className="size-3.5" aria-hidden="true" />
+            {t('Find supplementary materials')}
+          </Button>
+        </div>
+        <FileDropZone
+          key={selectedItem.id}
+          data-slot="literature-pdf-drop-zone"
+          className="mt-3"
+          busy={isAddingPdf}
+          onFiles={(files) => void addPdfs(files)}
+          dropLabel={t('Drop files to attach to this reference')}
+          picker={{
+            label: t('Add files'),
+            accept: '',
+            description: t('Drop files here to attach to this reference, or choose files.'),
+            multiple: true,
+            inputRef: pdfInputRef
+          }}
+        >
+          {pdfProgress ? (
+            <p role="status" className="mt-2 break-words text-xs text-muted-foreground">
+              {pdfProgress}
+            </p>
           ) : null}
-          <input
-            ref={pdfInputRef}
-            type="file"
-            accept="application/pdf,.pdf"
-            className="sr-only"
-            aria-label={t('Add PDF')}
-            onChange={(event) => {
-              const file = event.currentTarget.files?.[0]
-              event.currentTarget.value = ''
-              if (file) void addPdf(file)
+          {pdfError ? (
+            <ErrorNotice inline role="alert" tone="amber" description={pdfError} />
+          ) : null}
+          <LiteratureAttachments
+            readItem={detailController.read}
+            key={selectedItem.id}
+            item={selectedItem}
+            onPreview={(version) => {
+              const attachment = selectedItem.attachments.find((candidate) =>
+                candidate.versions.some((candidateVersion) => candidateVersion.id === version.id)
+              )
+              if (!attachment) return
+              setPreviewItem({
+                id: `literature:${version.id}`,
+                sessionId: LITERATURE_PREVIEW_SESSION_ID,
+                title: version.filename,
+                type: 'file',
+                source: 'literature',
+                managedFileId: attachment.id,
+                path: createLiteratureAttachmentVersionReference(version.id),
+                format: getPreviewFormatForFile({
+                  name: version.filename,
+                  mimeType: version.contentType
+                }),
+                name: version.filename,
+                mimeType: version.contentType,
+                size: version.sizeBytes,
+                versionNumber: version.versionNumber
+              })
             }}
           />
-        </div>
-        {pdfError ? (
-          <p role="alert" className="mt-2 text-sm text-danger-000">
-            {pdfError}
-          </p>
-        ) : null}
-        <LiteratureAttachments
-          readItem={detailController.read}
-          key={selectedItem.id}
-          item={selectedItem}
-          onPreview={(version) => {
-            const attachment = selectedItem.attachments.find((candidate) =>
-              candidate.versions.some((candidateVersion) => candidateVersion.id === version.id)
-            )
-            if (!attachment) return
-            setPreviewItem({
-              id: `literature:${version.id}`,
-              sessionId: LITERATURE_PREVIEW_SESSION_ID,
-              title: version.filename,
-              type: 'file',
-              source: 'literature',
-              managedFileId: attachment.id,
-              path: createLiteratureAttachmentVersionReference(version.id),
-              format: 'pdf',
-              name: version.filename,
-              mimeType: version.contentType,
-              size: version.sizeBytes,
-              versionNumber: version.versionNumber
-            })
-          }}
-        />
-        {selectedItem.attachments.length === 0 ? (
-          <button
-            type="button"
-            data-slot="literature-pdf-drop-zone"
-            {...pdfDropZoneProps}
-            disabled={isAddingPdf}
-            className="relative mt-2 flex w-full cursor-pointer flex-col items-center gap-2 overflow-hidden rounded-lg border border-dashed border-border bg-muted/20 px-6 py-8 text-center transition-colors hover:bg-muted/40 disabled:cursor-not-allowed disabled:opacity-60"
-            onClick={() => pdfInputRef.current?.click()}
-          >
-            {isDraggingPdf ? (
-              <FileDropOverlay label={t('Drop to upload')} className="rounded-lg" />
-            ) : null}
-            <span className="inline-flex size-10 items-center justify-center rounded-full bg-muted text-muted-foreground">
-              {isAddingPdf ? (
-                <LoaderCircle
-                  className="size-4 animate-spin motion-reduce:animate-none"
-                  aria-hidden="true"
-                />
-              ) : (
-                <Upload className="size-4" aria-hidden="true" />
-              )}
-            </span>
-            <span className="text-sm font-medium text-foreground">{t('Add PDF')}</span>
-            <span className="text-xs text-muted-foreground">
-              {t('Drag and drop or click to upload')}
-            </span>
-          </button>
-        ) : null}
+        </FileDropZone>
       </section>
     </div>
   )

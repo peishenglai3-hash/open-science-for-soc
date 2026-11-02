@@ -4,8 +4,15 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { ProjectPackageDropZone } from './ProjectPackageDropZone'
 import { usePackageOperationStore } from '@/stores/package-operation-store'
 import { WEB_EVENT_SURFACE_ATTRIBUTE } from '../../../shared/web-event-connection'
+import { WEB_CALLER_LOCATION_ATTRIBUTE } from '../../../shared/web-caller-location'
 import { useFileDropZone } from '@/hooks/useFileDropZone'
 import { createPortal } from 'react-dom'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { ActiveTransferOwner } from '../../../main/uploads/active-transfer-owner'
+import { useWorkspaceComposerController } from '@/pages/workspace/workspace-composer-controller'
+import { WorkspaceComposerDraftsProvider } from '@/pages/workspace/workspace-composer-drafts'
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -23,6 +30,7 @@ afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
   document.documentElement.removeAttribute(WEB_EVENT_SURFACE_ATTRIBUTE)
+  document.documentElement.removeAttribute(WEB_CALLER_LOCATION_ATTRIBUTE)
 })
 const drop = (target: Element, names: string[]): void => {
   fireEvent.drop(target, {
@@ -61,6 +69,153 @@ it('stages ordinary file drops exactly once before nested targets', () => {
   expect(attach).toHaveBeenCalledExactlyOnceWith([expect.objectContaining({ name: 'data.csv' })])
   expect(importPackage).not.toHaveBeenCalled()
 })
+
+it('does not report storage exhaustion when a real directory is dropped on the composer', async () => {
+  const storageRoot = await mkdtemp(join(tmpdir(), 'composer-directory-drop-'))
+  const sourcePath = join(storageRoot, 'raw-data')
+  await mkdir(sourcePath)
+  await writeFile(join(storageRoot, 'existing.txt'), 'kept')
+  const owner = new ActiveTransferOwner(storageRoot)
+  const uploadApi = {
+    stageLocalFile: (file: File, request: Parameters<typeof owner.beginTransfer>[0]) =>
+      owner.stageLocalFile({ ...request, sourcePath: join(storageRoot, file.name) }),
+    beginTransfer: owner.beginTransfer.bind(owner),
+    appendTransfer: owner.appendTransfer.bind(owner),
+    getTransferStatus: owner.getTransferStatus.bind(owner),
+    finishTransfer: owner.finishTransfer.bind(owner),
+    abortTransfer: owner.abortTransfer.bind(owner),
+    deleteUpload: async () => {}
+  }
+  const Composer = (): React.JSX.Element => {
+    const composer = useWorkspaceComposerController({
+      currentDraftKey: 'directory-drop',
+      newConversationDraftKey: 'new:project',
+      activeProjectId: 'project',
+      activeSession: { id: 'directory-drop', projectId: 'project' },
+      pendingCustomizePrefill: undefined,
+      onCustomizePrefillApplied: () => {},
+      historyEntries: [],
+      historyPolicy: {
+        catalogSkillIds: new Set(),
+        allowedSkillIds: undefined,
+        skillCatalogReady: true,
+        refreshSkillCatalog: false,
+        specialistCatalogReady: true,
+        specialistId: undefined,
+        loadSkills: async () => {},
+        loadSpecialists: async () => {}
+      },
+      canStageAttachments: true,
+      supportsImageInput: true,
+      uploads: uploadApi
+    })
+    return (
+      <ProjectPackageDropZone canImport={false} canAttach onFiles={composer.actions.stageFiles}>
+        <div data-testid="directory-composer" />
+        <div data-testid="upload-error">{composer.view.error}</div>
+        <div data-testid="upload-transfers">{JSON.stringify(composer.view.transfers)}</div>
+        <div data-testid="uploaded-files">
+          {composer.view.attachments.map((attachment) => attachment.originalName).join(',')}
+        </div>
+      </ProjectPackageDropZone>
+    )
+  }
+  try {
+    render(
+      <WorkspaceComposerDraftsProvider>
+        <Composer />
+      </WorkspaceComposerDraftsProvider>
+    )
+    fireEvent.drop(screen.getByTestId('directory-composer'), {
+      dataTransfer: { types: ['Files'], files: [new File(['kept'], 'existing.txt')] }
+    })
+    await vi.waitFor(() =>
+      expect(screen.getByTestId('uploaded-files').textContent).toBe('existing.txt')
+    )
+    // Native directory drops expose a File plus a directory entry, rather than child files.
+    const file = new File([], 'raw-data')
+    fireEvent.drop(screen.getByTestId('directory-composer'), {
+      dataTransfer: {
+        types: ['Files'],
+        files: [file],
+        items: [
+          {
+            kind: 'file',
+            getAsFile: () => file,
+            webkitGetAsEntry: () => ({ isDirectory: true, isFile: false, name: file.name })
+          }
+        ]
+      }
+    })
+    await vi.waitFor(() => {
+      expect(screen.getByTestId('upload-transfers').textContent).not.toMatch(/queued|uploading/)
+    })
+    expect(screen.getByTestId('upload-error').textContent).not.toBe(
+      'Could not attach the file. Check available storage and try again.'
+    )
+    expect(screen.getByRole('status').textContent).toBe(
+      'Folders cannot be attached. Select files inside the folder instead. No files were added.'
+    )
+    expect(screen.getByTestId('upload-transfers').textContent).toBe('[]')
+    expect(screen.getByTestId('uploaded-files').textContent).toBe('existing.txt')
+  } finally {
+    cleanup()
+    await rm(storageRoot, { recursive: true, force: true })
+  }
+})
+
+it.each([
+  ['raw-data'],
+  ['raw-data', 'data.csv'],
+  ['data.csv', 'raw-data'],
+  ['raw-data.science'],
+  ['research.science', 'raw-data']
+])('rejects the complete native batch containing a folder: %j', (...names) => {
+  const attach = mount()
+  const target = screen.getByTestId('composer')
+  const files = names.map((name) => new File([], name))
+  const dataTransfer = {
+    types: ['Files'],
+    files,
+    items: files.map((file) => ({
+      kind: 'file',
+      webkitGetAsEntry: () => ({ isDirectory: file.name.startsWith('raw-data') })
+    }))
+  }
+  fireEvent.dragEnter(target, { dataTransfer })
+  expect(screen.getByText('Drop files to attach or import a .science package')).toBeTruthy()
+  expect(fireEvent.drop(target, { dataTransfer })).toBe(false)
+  expect(attach).not.toHaveBeenCalled()
+  expect(importPackage).not.toHaveBeenCalled()
+  expect(screen.getByRole('status').textContent).toContain('Folders cannot be attached.')
+  expect(screen.queryByText('Drop files to attach or import a .science package')).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+  expect(screen.queryByRole('status')).toBeNull()
+  drop(target, ['data.csv'])
+  expect(attach).toHaveBeenCalledOnce()
+})
+
+it.each(['file', 'unavailable'])(
+  'accepts empty extensionless files when the native entry is %s',
+  (entryKind) => {
+    const attach = mount()
+    const file = new File([], 'README')
+    fireEvent.drop(screen.getByTestId('composer'), {
+      dataTransfer: {
+        types: ['Files'],
+        files: [file],
+        items: [
+          {
+            kind: 'file',
+            webkitGetAsEntry: () => (entryKind === 'file' ? { isDirectory: false } : null)
+          }
+        ]
+      }
+    })
+    expect(attach).toHaveBeenCalledExactlyOnceWith([file])
+    expect(screen.queryByRole('status')).toBeNull()
+  }
+)
 it.each([
   ['first.science', 'second.science'],
   ['first.science', 'data.csv']
@@ -103,8 +258,9 @@ it('ignores portal drops outside the Project DOM', () => {
   drop(screen.getByTestId('modal'), ['study.science'])
   expect(importPackage).not.toHaveBeenCalled()
 })
-it('does not advertise desktop import in Web', () => {
+it('does not advertise desktop import on remote Web', () => {
   document.documentElement.setAttribute(WEB_EVENT_SURFACE_ATTRIBUTE, 'true')
+  document.documentElement.setAttribute(WEB_CALLER_LOCATION_ATTRIBUTE, 'remote')
   mount()
   fireEvent.dragEnter(screen.getByTestId('composer'), { dataTransfer: { types: ['Files'] } })
   expect(screen.getByText('Drop files to attach')).toBeTruthy()
@@ -223,8 +379,9 @@ it.each(['blur', 'dragend', 'drop'])('clears the destination-free overlay on %s'
   expect(screen.queryByText('Drop a .science file to import')).toBeNull()
 })
 
-it('does not enable destination-free desktop import on Web', () => {
+it('does not enable destination-free desktop import on remote Web', () => {
   document.documentElement.setAttribute(WEB_EVENT_SURFACE_ATTRIBUTE, 'true')
+  document.documentElement.setAttribute(WEB_CALLER_LOCATION_ATTRIBUTE, 'remote')
   render(<ProjectPackageDropZone canImport data-testid="home" />)
   const home = screen.getByTestId('home')
   const dataTransfer = { types: ['Files'], dropEffect: 'copy' }
@@ -234,6 +391,63 @@ it('does not enable destination-free desktop import on Web', () => {
   expect(screen.queryByText('Drop a .science file to import')).toBeNull()
   drop(home, ['research.science'])
   expect(importPackage).not.toHaveBeenCalled()
+})
+
+it('advertises and routes package import on local Web through chunk staging', async () => {
+  document.documentElement.setAttribute(WEB_EVENT_SURFACE_ATTRIBUTE, 'true')
+  document.documentElement.setAttribute(WEB_CALLER_LOCATION_ATTRIBUTE, 'local')
+  const beginTransfer = vi.fn(async () => ({
+    transferId: 'transfer',
+    name: 'study.science',
+    receivedBytes: 0,
+    totalBytes: 7
+  }))
+  const appendTransfer = vi.fn(async (request: { offset: number; chunk: Uint8Array }) => ({
+    transferId: 'transfer',
+    name: 'study.science',
+    receivedBytes: request.offset + request.chunk.byteLength,
+    totalBytes: 7
+  }))
+  const deleteUpload = vi.fn(async () => {})
+  const webImportPackage = vi.fn(async () => ({
+    imported: { projectId: 'target', sessionId: 'imported' }
+  }))
+  vi.stubGlobal('api', {
+    sessions: { importPackage: webImportPackage, packageOperation: vi.fn(async () => null) },
+    uploads: {
+      beginTransfer,
+      appendTransfer,
+      getTransferStatus: vi.fn(async () => null),
+      finishTransfer: vi.fn(async () => ({ path: '/uploads/study.science' })),
+      abortTransfer: vi.fn(async () => {}),
+      deleteUpload
+    },
+    projects: { list: vi.fn(async () => []) }
+  })
+  mount()
+  fireEvent.dragEnter(screen.getByTestId('composer'), { dataTransfer: { types: ['Files'] } })
+  expect(screen.getByText('Drop files to attach or import a .science package')).toBeTruthy()
+  drop(screen.getByTestId('composer'), ['study.science'])
+  await vi.waitFor(() =>
+    expect(webImportPackage).toHaveBeenCalledExactlyOnceWith(
+      { projectId: 'target' },
+      '/uploads/study.science'
+    )
+  )
+  expect(beginTransfer).toHaveBeenCalledOnce()
+  expect(deleteUpload).not.toHaveBeenCalled()
+})
+
+it('enables destination-free import on local Web', () => {
+  document.documentElement.setAttribute(WEB_EVENT_SURFACE_ATTRIBUTE, 'true')
+  document.documentElement.setAttribute(WEB_CALLER_LOCATION_ATTRIBUTE, 'local')
+  render(<ProjectPackageDropZone canImport data-testid="home" />)
+  const home = screen.getByTestId('home')
+  const dataTransfer = { types: ['Files'], dropEffect: 'copy' as const }
+  fireEvent.dragEnter(home, { dataTransfer })
+  fireEvent.dragOver(home, { dataTransfer })
+  expect(dataTransfer.dropEffect).toBe('copy')
+  expect(screen.getByText('Drop a .science file to import')).toBeTruthy()
 })
 
 it('keeps an explicitly empty Project target unavailable', () => {

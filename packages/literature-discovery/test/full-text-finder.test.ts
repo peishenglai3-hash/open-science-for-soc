@@ -2,7 +2,11 @@ import { readFile } from 'node:fs/promises'
 
 import { describe, expect, it, vi } from 'vitest'
 
-import { discoveryRecordSchema, type DiscoveryReference } from '../src/contracts.js'
+import {
+  discoveryRecordSchema,
+  getFullTextFilename,
+  type DiscoveryReference
+} from '../src/contracts.js'
 
 import {
   LiteratureFullTextFinder,
@@ -251,7 +255,7 @@ describe('Literature full-text discovery and attachment', () => {
       expect.objectContaining({
         itemId: item.id,
         pageCount: 8,
-        filename: 'Example paper.pdf',
+        filename: 'paper.pdf',
         checksum: 'a'.repeat(64)
       })
     )
@@ -776,4 +780,60 @@ it('keeps authentication and rate-limit diagnostics separate from provider respo
     ])
   })
   expect(JSON.stringify(result)).not.toMatch(/private-api-key|secret provider body/)
+})
+
+describe('getFullTextFilename', () => {
+  it.each([
+    ['https://example.org/paper%20final.pdf', 'Title', 'paper final.pdf'],
+    ['https://example.org/download?filename=original.pdf', 'Title', 'original.pdf'],
+    ['https://example.org/download?file=original.pdf', 'Title', 'original.pdf'],
+    ['https://example.org/articles/PMC1?pdf=render', 'Example paper', 'Example paper.pdf'],
+    ['https://example.org/%ZZ.pdf', 'Example paper', 'Example paper.pdf'],
+    ['https://example.org/download', 'Title.pdf', 'Title.pdf'],
+    ['https://example.org/download', '', 'paper.pdf'],
+    [`https://example.org/${'-'.repeat(100_000)}`, 'Title', 'Title.pdf'],
+    ['https://example.org/.pdf', 'Title', 'Title.pdf'],
+    ['https://example.org/a%3Ab.pdf', 'Title', 'a b.pdf']
+  ])('names %s consistently for display and storage', (url, title, expected) => {
+    expect(getFullTextFilename(url, title)).toBe(expected)
+  })
+})
+
+describe('opaque DOI discovery', () => {
+  it.each([
+    ['10.1000/term.#', 'https://doi.org/10.1000/term.%23'],
+    ['10.1000/term.%23', 'https://doi.org/10.1000/term.%2523']
+  ])(
+    'encodes opaque DOI suffixes in OpenAlex filters and fallback source links: %s',
+    async (doi, resolverUrl) => {
+      const { finder, options, item } = setup()
+      item.item.identifiers = [{ scheme: 'doi', value: doi, isPrimary: true }]
+      options.openAlexKey = vi.fn(async () => 'test-key')
+      const originalFetch = options.fetch!
+      options.fetch = vi.fn(async (input, init) => {
+        const url = new URL(String(input))
+        if (url.hostname === 'api.openalex.org') {
+          expect(url.searchParams.get('filter')).toBe(`doi:${resolverUrl}`)
+          return Response.json({
+            results: [
+              {
+                doi: resolverUrl,
+                best_oa_location: { is_oa: true, pdf_url: 'https://repository.example/opaque.pdf' }
+              }
+            ]
+          })
+        }
+        return originalFetch(input, init)
+      })
+      const result = await finder.run({ mode: 'search', itemId: item.id })
+      if (result.mode !== 'search') throw new Error('Expected search')
+      expect(result.candidates.find(({ provider }) => provider === 'openalex')).toMatchObject({
+        sourceUrl: resolverUrl
+      })
+      expect(options.fetch).toHaveBeenCalledWith(
+        expect.stringContaining('api.openalex.org'),
+        expect.anything()
+      )
+    }
+  )
 })

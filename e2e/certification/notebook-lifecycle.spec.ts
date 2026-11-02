@@ -2,7 +2,7 @@ import { expect } from '@playwright/test'
 import { mkdir, readFile, readdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { RUNTIME_LOCK_FILE } from '../../src/main/runtime-ownership'
-import { test } from '../fixtures/electron-app'
+import { test as baseTest } from '../fixtures/electron-app'
 import { createProject, openRecentSession, sendPrompt } from './helpers'
 
 const captureLifecycleEvidence = async (
@@ -16,6 +16,39 @@ const captureLifecycleEvidence = async (
 
 const controlledWindowsFixtureAvailable =
   process.platform === 'win32' && Boolean(process.env.OPEN_SCIENCE_E2E_MICROMAMBA_EVENTS)
+
+// Native sandbox provisioning has its own budget; it must not consume the mutation deadline.
+const test = baseTest.extend<{ controlledSandbox: void }>({
+  controlledSandbox: [
+    async ({ app }, runTest) => {
+      if (!controlledWindowsFixtureAvailable) {
+        await runTest()
+        return
+      }
+      await app.completeOnboarding()
+      const page = await app.configureFakeAgent()
+      expect(await page.evaluate(() => window.api.settings.installNotebookNetwork())).toMatchObject(
+        {
+          kind: 'ready'
+        }
+      )
+      try {
+        await runTest()
+      } finally {
+        expect(
+          await app.page.evaluate(() => window.api.settings.removeNotebookNetwork())
+        ).toMatchObject({
+          kind: 'setupRequired'
+        })
+      }
+    },
+    { auto: true, timeout: 180_000 }
+  ]
+})
+
+test.beforeEach(() => {
+  if (controlledWindowsFixtureAvailable) test.setTimeout(180_000)
+})
 
 const sendReviewedPrompt = async (
   page: Parameters<typeof sendPrompt>[0],
@@ -167,8 +200,7 @@ test('cancels a timed-out environment mutation before allowing a retry', async (
     !controlledWindowsFixtureAvailable,
     'Requires the controlled Windows micromamba process fixture.'
   )
-  await app.completeOnboarding()
-  const page = await app.configureFakeAgent()
+  const page = app.page
   await createProject(page, 'Notebook mutation cancellation')
   await sendPrompt(
     page,
@@ -187,8 +219,7 @@ test('keeps a healthy environment mutation alive beyond the client idle timeout'
     !controlledWindowsFixtureAvailable,
     'Requires the controlled Windows micromamba process fixture.'
   )
-  await app.completeOnboarding()
-  const page = await app.configureFakeAgent()
+  const page = app.page
   await createProject(page, 'Long Notebook mutation')
   await sendPrompt(
     page,
@@ -227,8 +258,7 @@ test('cancels a timed-out package mutation before allowing a retry', async ({ ap
     !controlledWindowsFixtureAvailable,
     'Requires the controlled Windows micromamba process fixture.'
   )
-  await app.completeOnboarding()
-  const page = await app.configureFakeAgent()
+  const page = app.page
   await createProject(page, 'Notebook package cancellation')
   await sendPrompt(
     page,

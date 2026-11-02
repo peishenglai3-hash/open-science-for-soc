@@ -12,6 +12,8 @@ import {
 } from '@aipoch/compute/node'
 import type { ComputeJob } from '../../shared/compute'
 import { SshConfigComputeConnectionBroker } from './connection-broker'
+import { PasswordSshAdapter } from './connection-adapters'
+import type { CredentialVault } from './credential-vault'
 import type { ComputeJobRepository } from './job-repository'
 import type { ComputeHostRepository } from './repository'
 
@@ -260,7 +262,7 @@ describe('compute_done notification on dispatch_failed (error) jobs', () => {
     })
 
     await poller.tick()
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    await poller.pause()
 
     // Only one update call (the status=error write), no notifiedAt write
     expect(update).toHaveBeenCalledOnce()
@@ -309,7 +311,7 @@ describe('compute_done notification on dispatch_failed (error) jobs', () => {
     })
 
     await poller.tick()
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    await poller.pause()
 
     // notifiedAt written and broadcast fired for the error job
     expect(claimNotification).toHaveBeenCalledWith('job-1', expect.any(Date))
@@ -371,7 +373,7 @@ describe('compute_done notification on dispatch_failed (error) jobs', () => {
     const t2 = poller.tick()
     releaseUpdate()
     await Promise.all([t1, t2])
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    await poller.pause()
 
     // Only ONE emit despite two overlapping ticks selecting the same unnotified row.
     expect(claimNotification).toHaveBeenCalledTimes(1)
@@ -380,6 +382,80 @@ describe('compute_done notification on dispatch_failed (error) jobs', () => {
 })
 
 describe('host password breaker integration', () => {
+  it.each(['ssh_config', 'password'] as const)(
+    'keeps controller fallback available through the real %s broker after squeue service failure',
+    async (mode) => {
+      const currentHost = {
+        ...sampleHost(),
+        sshOverrides: { user: 'researcher', port: 2222 },
+        authentication: {
+          mode,
+          credentialStatus: 'configured' as const,
+          revision: 1,
+          lastVerifiedAt: undefined
+        }
+      }
+      const job = makeJob({
+        execution_mode: 'slurm',
+        remote_handle: JSON.stringify({
+          driver: 'slurm',
+          version: 1,
+          scheduler_job_id: '2',
+          workdir: '~/.openscience/jobs/job-1',
+          stdout_path: '~/.openscience/jobs/job-1/stdout',
+          stderr_path: '~/.openscience/jobs/job-1/stderr'
+        })
+      })
+      const runner: SshRunner = {
+        run: vi.fn(async (_target, command) => ({
+          exitCode: command.startsWith('squeue ') ? 1 : 0,
+          stdout: command.startsWith('scontrol ') ? 'JobId=2 JobState=RUNNING ExitCode=0:0' : '',
+          stderr: command.startsWith('squeue ') ? 'slurm_load_jobs error: Connection refused' : '',
+          timedOut: false,
+          truncated: false
+        }))
+      }
+      const passwordAdapter = new PasswordSshAdapter(
+        {
+          acquirePasswordLease: async () => ({
+            withPassword: (operation: (password: string) => Promise<unknown>) =>
+              operation('test password')
+          })
+        } as unknown as CredentialVault,
+        runner,
+        async () => ({ sshBinary: 'ssh', host: 'cluster', extraArgs: [] }),
+        async () => ({}),
+        async () => ({ env: {}, wasAnswered: () => true, dispose: async () => undefined })
+      )
+      const broker = new SshConfigComputeConnectionBroker({
+        getHost: async () => currentHost,
+        runner,
+        resolveTarget: async () => ({ sshBinary: 'ssh', host: 'cluster', extraArgs: [] }),
+        passwordAdapter
+      })
+      const updateIfStatus = vi.fn(async () => job)
+      await createNotifyingJobPoller({
+        connectionBroker: broker,
+        hostRepository: {} as ComputeHostRepository,
+        jobRepository: {
+          findNonTerminal: async () => [job],
+          findTerminalUnharvested: async () => [],
+          updateIfStatus
+        } as unknown as ComputeJobRepository
+      }).tick()
+      expect(runner.run).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.stringContaining('scontrol show job 2 '),
+        expect.anything()
+      )
+      expect(updateIfStatus).toHaveBeenCalledWith(
+        'job-1',
+        ['running'],
+        expect.objectContaining({ lastPollError: null })
+      )
+    }
+  )
+
   it('stops submitting a background password after the first batch rejects authentication', async () => {
     const jobs = Array.from({ length: 10 }, (_, i) =>
       makeJob({

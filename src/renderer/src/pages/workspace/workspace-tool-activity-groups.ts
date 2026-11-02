@@ -1,10 +1,18 @@
 import type { PersistedActivityGroup } from '../../../../shared/session-persistence'
-import type { ToolActivity } from '@/stores/session-store'
+import type { ToolActivity } from '@/stores/session-store-contract'
 
-import { isActivityActive, type ConversationItem } from './workspace-conversation-items'
 import {
+  formatActivityTitle,
+  isActivityActive,
+  type ConversationItem
+} from './workspace-conversation-items'
+import {
+  buildToolActivityDetails,
+  getToolDisplayName,
+  translateToolDetailCopy,
   isEditActivity,
   isSkillActivity,
+  isToolSearchActivity,
   getNotebookRunIdFromActivity
 } from './workspace-tool-activity-details'
 import { hasWebSearchContentEvidence } from './workspace-web-search-details'
@@ -18,6 +26,7 @@ import {
 import type { SessionPermissionRuntimeContext } from '../../../../shared/session-persistence'
 import type { NotebookRunRecord } from '../../../../shared/notebook'
 import type { TFunction } from 'i18next'
+import { isAuthorizedDirectoryTool, matchNotebookControlTool } from './notebook-tool-names'
 import { notebookInput } from './notebook-tool-presentation'
 import { i18next } from '@/i18n'
 
@@ -164,6 +173,7 @@ type ActivityCategory =
   | 'read'
   | 'edit'
   | 'skill'
+  | 'directoryAccess'
   | 'environment'
   | 'call'
   | 'artifact'
@@ -192,6 +202,7 @@ const ACTIVITY_CATEGORY_ORDER: ActivityCategory[] = [
   'read',
   'edit',
   'skill',
+  'directoryAccess',
   'environment',
   'call',
   'artifact',
@@ -220,12 +231,13 @@ const categorizeActivity = (
           hasToolSearchInferenceEvidence(activity) &&
           hasEarlierToolSearchWrapper)
   if (isSearch) return 'search'
-  if (isToolSearchWrapperActivity(activity)) return 'toolSearch'
+  if (isToolSearchActivity(activity)) return 'toolSearch'
 
   const providerName = getNormalizedProviderName(activity)
 
   // A Notebook execution is one run; use the shared provider-name matcher for every ACP backend.
   if (isNotebookExecutionActivity(activity)) return 'notebook'
+  if (isAuthorizedDirectoryTool(activity.providerToolName, activity.title)) return 'directoryAccess'
   if (isSkillActivity(activity)) return 'skill'
   if (providerName === 'save_artifacts' || providerName.includes('artifact')) return 'artifact'
   if (providerName === 'manage_packages' || providerName.includes('package')) return 'environment'
@@ -263,6 +275,8 @@ const formatCategoryClause = (
       return count === 1 ? t('edited a file') : t('edited {{count}} files', { count })
     case 'skill':
       return count === 1 ? t('loaded a skill') : t('loaded {{count}} skills', { count })
+    case 'directoryAccess':
+      return t('checked directory access')
     case 'environment':
       return count === 1 ? t('managed an environment') : t('managed environments')
     case 'call':
@@ -305,9 +319,15 @@ const formatActivityGroupTitle = (
 
     if (category === 'search' && !categoryCounts.has('search')) {
       // A concrete search supersedes any wrappers encountered earlier in this same pass.
-      categoryCounts.delete('toolSearch')
+      const discoveryCount = activities
+        .slice(0, activityIndex)
+        .filter(
+          (candidate) => isToolSearchActivity(candidate) && !isToolSearchWrapperActivity(candidate)
+        ).length
+      if (discoveryCount) categoryCounts.set('toolSearch', discoveryCount)
+      else categoryCounts.delete('toolSearch')
     }
-    if (category === 'toolSearch' && categoryCounts.has('search')) {
+    if (isToolSearchWrapperActivity(activity) && categoryCounts.has('search')) {
       hasEarlierToolSearchWrapper = true
       return
     }
@@ -332,12 +352,45 @@ const formatActivityGroupPresentationTitle = (
   t: TFunction = i18next.t.bind(i18next)
 ): string => {
   if (activities.some(isPendingNotebookCodeReview)) return t('Waiting for your approval')
-  const activityPhases = activities.map((activity) => ({
-    isNotebook: isNotebookExecutionActivity(activity),
-    phase: getToolExecutionPhase(activity, permission, notebookRunsById)
-  }))
+  const activityPhases = getRenderableActivityEntries(activities).map(
+    ({ activity, activityIndex }) => ({
+      activity,
+      activityIndex,
+      isNotebook: isNotebookExecutionActivity(activity),
+      phase: getToolExecutionPhase(activity, permission, notebookRunsById)
+    })
+  )
+  if (activityPhases.some(({ phase }) => phase === 'awaiting-approval'))
+    return t('Waiting for your approval')
+  const executing = activityPhases.filter(({ phase }) => phase === 'executing')
+  const current =
+    executing.find(({ activity }) => activity.status === 'in_progress') ?? executing[0]
+  if (current) {
+    if (isSearchActivity(current.activity, activities, current.activityIndex))
+      return t('Using tool: {{name}}', { name: t('Web Search') })
+    const details = buildToolActivityDetails(current.activity, t)
+    const notebookControlTool =
+      matchNotebookControlTool(current.activity.providerToolName) ??
+      matchNotebookControlTool(current.activity.title)
+    if (details?.displayName === getToolDisplayName(current.activity) && notebookControlTool)
+      // Canonicalize provider spellings before reusing the existing chip-name mapping.
+      return formatActivityTitle(
+        {
+          ...current.activity,
+          providerToolName: `mcp__open-science-notebook__${notebookControlTool}`
+        },
+        'executing',
+        t
+      )
+    if (details)
+      return t('Using tool: {{name}}', { name: translateToolDetailCopy(details.displayName, t) })
+    if (current.activity.providerToolName?.trim() || current.activity.title.trim())
+      return formatActivityTitle(current.activity, 'executing', t)
+  }
   const phases = activityPhases.filter(({ isNotebook }) => isNotebook).map(({ phase }) => phase)
   const notebookCount = phases.length
+  if (!phases.includes('executing') && activityPhases.some(({ phase }) => phase === 'executing'))
+    return declaredTitle?.trim() || t('Running')
   if (notebookCount === 0) {
     if (activityPhases.length > 0 && activityPhases.every(({ phase }) => phase === 'closed')) {
       return activityPhases.length === 1 ? t('Tool request ended') : t('Tool requests ended')

@@ -1,3 +1,10 @@
+import { SkillSourceRepository } from '../skills/source-repository'
+import type {
+  SavedSkillSource,
+  AddSkillSourceRequest,
+  RemoveSkillSourceRequest
+} from '../../shared/skill-sources'
+import type { SetSemanticScholarCredentialRequest } from '../../shared/settings'
 import { SkillReleaseInstallConflict as MarketplaceInstallConflict } from '@aipoch/skills'
 import { readFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -33,7 +40,12 @@ import { ClassificationSettingsOwner } from './classification-settings'
 import { ClassificationUsageRecorder } from './classification-usage'
 import { ProviderRuntimeHealthOwner } from './provider-runtime-health-owner'
 
-import { createLogger, startDiagnosticOperation, type Logger } from '@aipoch/diagnostics/node'
+import {
+  createLogger,
+  diagnosticErrorFields,
+  startDiagnosticOperation,
+  type Logger
+} from '@aipoch/diagnostics/node'
 import type { BundledSkill, SkillRegistry } from '@aipoch/skills'
 import type {
   AgentHomeSkillView,
@@ -46,13 +58,14 @@ import { SKILL_IMPORT_LIMITS } from '@aipoch/skills/sources'
 import type { GrantedLocalRoot } from '../../shared/local-fs'
 import type { PackageMirror } from '../../shared/mirror'
 import type { ReasoningEffort } from '../../shared/model-preference-contract'
+import type { ResolvedReasoningEffort } from '@aipoch/providers'
 import type { NetworkProxySettings } from '../../shared/network-proxy'
 import type { NotebookLanguage } from '../../shared/notebook-language-contract'
 import type { NotebookNetworkStatus } from '../../shared/notebook-network'
 import type { NotebookNetworkSettings } from '../../shared/notebook-network-settings'
 import type { RuntimeEnablement } from '../../shared/notebook-runtime'
 import type { PermissionProfileId } from '../../shared/permission-profiles'
-import type { ResolvedReasoningEffort } from '../../shared/reasoning-effort'
+
 import type {
   AddCustomServerRequest,
   AppIconVariant,
@@ -80,6 +93,7 @@ import type {
   ImportSkillZipRequest,
   InstallClaudeRequest,
   InstallCodeBuddyRequest,
+  InstallPiRequest,
   InstallCodexRequest,
   InstallOpencodeRequest,
   OpenAlexCredentialValidation,
@@ -236,6 +250,7 @@ export type SettingsServiceOptions = {
   withMarketplaceImpactLock?: <T>(operation: () => Promise<T>) => Promise<T>
   // OpenAlex validation transport. Production injects Electron net.fetch so proxy settings apply.
   onProviderHealthChanged?: () => Promise<void>
+  onNotebookNetworkDomainAllowed?: () => Promise<void>
   openAlexFetch?: typeof fetch
   // One-shot Claude command runner, injectable so validation tests can inspect the exact auth env.
   executeClaudeProbe?: ExecuteClaudeProbe
@@ -257,6 +272,8 @@ export type SettingsServiceOptions = {
   // Projects a persisted proxy preference into the live Electron Session and future child process
   // environment. Tests omit it to keep SettingsService free of host-global side effects.
   applyNetworkProxy?: (settings: NetworkProxySettings) => Promise<void>
+  // Runs the settings commit while interpreter teardown and new execution admission are fenced.
+  withNotebookFolderPolicyChange?: (commit: () => Promise<void>) => Promise<void>
   // Applies a committed Notebook egress policy to live kernels without requiring a restart.
   applyNotebookNetwork?: (settings: NotebookNetworkSettings) => Promise<void>
   validatePackageMirror?: (settings: SetPackageMirrorRequest) => Promise<void>
@@ -451,9 +468,13 @@ class SettingsService {
   private readonly installCoordinator: SettingsInstallCoordinator
   private readonly backendResolver: AgentBackendResolver
   private readonly scenarioModels: ScenarioModelOwner
+  private readonly skillSources: SkillSourceRepository
   private readonly configRoot: string
   private readonly networkProxy: NetworkProxySettingsOwner
   private readonly notebookNetwork: NotebookNetworkSettingsOwner
+  private readonly onNotebookNetworkDomainAllowed?: () => Promise<void>
+  private readonly withNotebookFolderPolicyChange: (commit: () => Promise<void>) => Promise<void>
+  private notebookFolderPolicyWrite: Promise<unknown> = Promise.resolve()
   private readonly packageMirror: PackageMirrorSettingsOwner
   private readonly getNotebookNetworkStatusImpl: () => Promise<NotebookNetworkStatus>
   private readonly installNotebookNetworkImpl: () => Promise<{ cancelled: boolean }>
@@ -503,8 +524,14 @@ class SettingsService {
 
   constructor(options: SettingsServiceOptions = {}) {
     this.configRoot = options.configRoot ?? resolveConfigRoot()
+    this.skillSources = new SkillSourceRepository(this.configRoot)
     this.installCoordinator = options.installCoordinator ?? new SettingsInstallCoordinator()
     this.repository = options.repository ?? new SettingsRepository(this.configRoot)
+    this.withNotebookFolderPolicyChange =
+      options.withNotebookFolderPolicyChange ??
+      (async () => {
+        throw new Error('Notebook policy lifecycle is not ready.')
+      })
     this.classification = new ClassificationSettingsOwner(
       this.repository,
       undefined,
@@ -515,6 +542,7 @@ class SettingsService {
       repository: this.repository,
       apply: options.applyNetworkProxy ?? (async () => undefined)
     })
+    this.onNotebookNetworkDomainAllowed = options.onNotebookNetworkDomainAllowed
     this.notebookNetwork = new NotebookNetworkSettingsOwner({
       repository: this.repository,
       apply: options.applyNotebookNetwork ?? (async () => undefined)
@@ -715,6 +743,24 @@ class SettingsService {
     return this.networkProxy.set(request)
   }
 
+  async getNotebookFolderRestrictionEnabled(): Promise<boolean> {
+    return (await this.repository.getSettings()).notebookFolderRestrictionEnabled !== false
+  }
+
+  setNotebookFolderRestrictionEnabled(enabled: boolean): Promise<SettingsSnapshot> {
+    if (typeof enabled !== 'boolean') throw new Error('Invalid Notebook folder restriction flag.')
+    const operation = this.notebookFolderPolicyWrite.then(async () => {
+      if ((await this.getNotebookFolderRestrictionEnabled()) !== enabled) {
+        await this.withNotebookFolderPolicyChange(async () => {
+          await this.repository.setNotebookFolderRestrictionEnabled(enabled)
+        })
+      }
+      return this.getSettingsView()
+    })
+    this.notebookFolderPolicyWrite = operation.catch(() => undefined)
+    return operation
+  }
+
   async setNotebookNetwork(request: SetNotebookNetworkRequest): Promise<NotebookNetworkSettings> {
     return this.notebookNetwork.set(request)
   }
@@ -729,8 +775,22 @@ class SettingsService {
     return this.notebookNetwork.get()
   }
 
-  allowNotebookNetworkDomain(hostname: string): Promise<NotebookNetworkSettings> {
-    return this.notebookNetwork.allowDomain(hostname)
+  async allowNotebookNetworkDomain(
+    hostname: string,
+    assertCurrent?: () => Promise<void>,
+    finalize?: () => Promise<void>
+  ): Promise<NotebookNetworkSettings> {
+    const settings = await this.notebookNetwork.allowDomain(hostname, assertCurrent, finalize)
+    try {
+      await this.onNotebookNetworkDomainAllowed?.()
+    } catch (error) {
+      // Publication must not undo consent that has already committed.
+      this.log.warn(
+        'Network access saved, but settings publication failed.',
+        diagnosticErrorFields(error)
+      )
+    }
+    return settings
   }
 
   getNotebookNetworkStatus(): Promise<NotebookNetworkStatus> {
@@ -1076,6 +1136,16 @@ class SettingsService {
     return this.getSettingsView()
   }
 
+  listSkillSources(): Promise<SavedSkillSource[]> {
+    return this.skillSources.list()
+  }
+  addSkillSource(request: AddSkillSourceRequest): Promise<SavedSkillSource[]> {
+    return this.skillSources.add(request)
+  }
+  removeSkillSource(request: RemoveSkillSourceRequest): Promise<SavedSkillSource[]> {
+    return this.skillSources.remove(request)
+  }
+
   async listSkills(): Promise<SkillView[]> {
     return this.skills.listSkills()
   }
@@ -1121,10 +1191,8 @@ class SettingsService {
     return this.skills.listSpecialistSkillCatalog(options)
   }
 
-  // Returns the mcp-<id> skill names for connectors provisioned at the Main Agent level (enabled
-  // bundled connectors + enabled custom MCP servers). Specialist sessions merge these into their
-  // skill whitelist so the agent can discover connector tools; the per-call ConnectorService gate
-  // still enforces the specialist's own connector access config.
+  // Source definitions available for Specialist authorization, independent of Main toggles.
+  // Each Specialist filters this list through its own Connector access configuration.
   async provisionedConnectorSkillNames(): Promise<string[]> {
     return this.connectors.provisionedConnectorSkillNames()
   }
@@ -1135,39 +1203,74 @@ class SettingsService {
   // Returns the subset of forced ids that are currently disabled in settings — i.e. the picks that need
   // a respawn to materialize. Enabled picks are already present and need no reconnect.
   async skillsNeedingForceLoad(forcedIds: string[]): Promise<string[]> {
-    return this.skills.skillsNeedingForceLoad(forcedIds)
+    const [managed, connectors] = await Promise.all([
+      this.skills.skillsNeedingForceLoad(forcedIds),
+      this.connectors.getConnectors()
+    ])
+    const enabled = new Set(this.connectors.enabledConnectorIds(connectors))
+    return [
+      ...managed,
+      ...forcedIds.filter(
+        (id) =>
+          id.startsWith('mcp-') &&
+          ALL_CONNECTOR_IDS.includes(id.slice(4)) &&
+          !enabled.has(id.slice(4))
+      )
+    ]
   }
 
   // Resolves picker ids to the names the agent's Skill tool accepts. Bundled skills use their
   // manifest id as frontmatter name, while personal/imported ids have an app-owned source prefix and
   // must use the frontmatter name kept in the user skill catalog.
   async skillNudgeNamesForIds(ids: string[]): Promise<string[]> {
-    return this.skills.skillNudgeNamesForIds(ids)
+    const connectorNames = new Set(await this.connectors.provisionedConnectorSkillNames())
+    return [
+      ...(await this.skills.skillNudgeNamesForIds(ids)),
+      ...ids.filter((id) => connectorNames.has(id))
+    ]
   }
 
   async codexSkillDescriptorsForIds(
     ids: string[],
     codexHome: string | undefined
   ): Promise<Array<{ name: string; path: string }>> {
-    return this.skills.codexSkillDescriptorsForIds(ids, codexHome)
+    const [managed, connectors] = await Promise.all([
+      this.skills.codexSkillDescriptorsForIds(ids, codexHome),
+      this.codexSkillCatalog(
+        codexHome,
+        ids.filter((id) => id.startsWith('mcp-'))
+      )
+    ])
+    return [...managed, ...connectors.filter(({ name }) => ids.includes(name))]
   }
 
-  async codexSkillCatalog(codexHome: string | undefined): Promise<SkillCatalogEntry[]> {
-    return this.skills.codexSkillCatalog(codexHome, (settings) =>
-      this.connectors.connectorSkillCatalogEntries(settings.connectors)
+  async codexSkillCatalog(
+    codexHome: string | undefined,
+    allowedNames?: readonly string[]
+  ): Promise<SkillCatalogEntry[]> {
+    return this.skills.codexSkillCatalog(
+      codexHome,
+      (settings) => this.connectors.connectorSkillCatalogEntries(settings.connectors, allowedNames),
+      allowedNames
     )
   }
 
-  async codeBuddySkillCatalog(runtimeRoot: string | undefined): Promise<SkillCatalogEntry[]> {
-    return this.skills.codeBuddySkillCatalog(runtimeRoot, (settings) =>
-      this.connectors.connectorSkillCatalogEntries(settings.connectors)
+  async codeBuddySkillCatalog(
+    runtimeRoot: string | undefined,
+    allowedNames?: readonly string[]
+  ): Promise<SkillCatalogEntry[]> {
+    return this.skills.codeBuddySkillCatalog(
+      runtimeRoot,
+      (settings) => this.connectors.connectorSkillCatalogEntries(settings.connectors, allowedNames),
+      allowedNames
     )
   }
 
   // Attempt-owned projection: never changes Main toggles or the admitted provider/model.
   async prepareDelegatedSkills(
     configRoot: string,
-    skillIds: readonly string[]
+    skillIds: readonly string[],
+    connectorSkillNames?: readonly string[]
   ): Promise<{
     skillIds: string[]
     catalog: SkillCatalogEntry[]
@@ -1181,12 +1284,13 @@ class SettingsService {
         await this.repository.getSettings(),
         configRoot,
         forced,
-        { directoryLayout: 'agent-facing' }
+        { directoryLayout: 'agent-facing', ...(connectorSkillNames ? { connectorSkillNames } : {}) }
       )
       const catalog = await this.skills.delegatedSkillCatalog(
         join(configRoot, 'skills'),
         forced,
-        (settings) => this.connectors.connectorSkillCatalogEntries(settings.connectors)
+        (settings) =>
+          this.connectors.connectorSkillCatalogEntries(settings.connectors, connectorSkillNames)
       )
       const names = new Set(catalog.map((entry) => entry.name))
       const prepared = (await this.skills.listSpecialistSkillCatalog())
@@ -1207,10 +1311,10 @@ class SettingsService {
 
   // Resolves a renderable SKILL.md document by canonical invocation name across every source the
   // runtime can load from. The permission card and transcript rows need this because connector
-  // skills (mcp-<id> for enabled bundled connectors, materialized custom MCP server skills) are
+  // skills (mcp-<id> for bundled connectors, materialized custom MCP server skills) are
   // invocable through load_skill but are NOT part of the renderer's managed catalog. Sources, in
   // order: the managed catalog (an enabled entry wins a name collision, mirroring the renderer's
-  // own rule), enabled bundled connectors (document rendered on the fly), then materialized custom
+  // own rule), bundled connectors (document rendered on the fly), then materialized custom
   // server skills (read from the provisioned source dir, gated by the provisioned-name projection
   // so arbitrary directories are never served). Returns null when no source provides the name.
   async resolveSkillDocument(
@@ -1236,10 +1340,6 @@ class SettingsService {
 
     const bundledId = /^mcp-(.+)$/.exec(name)?.[1]
     if (bundledId && ALL_CONNECTOR_IDS.includes(bundledId)) {
-      const settings = await this.repository.getSettings()
-      if (!this.connectors.enabledConnectorIds(settings.connectors).includes(bundledId)) {
-        return null
-      }
       const meta = CONNECTOR_CATALOG.find((connector) => connector.id === bundledId)
       const { fields, body } = parseFrontmatter(renderSkillDoc(bundledId))
       return {
@@ -1485,6 +1585,13 @@ class SettingsService {
     return this.runtimeManager.installCodeBuddy(request, onEvent)
   }
 
+  async installPi(
+    request: InstallPiRequest,
+    onEvent: (event: ClaudeInstallEvent) => void
+  ): Promise<ClaudeInstallResult> {
+    return this.runtimeManager.installPi(request, onEvent)
+  }
+
   async installCodex(
     request: InstallCodexRequest,
     onEvent: (event: ClaudeInstallEvent) => void
@@ -1514,6 +1621,11 @@ class SettingsService {
 
   async uninstallCodeBuddy(): Promise<UninstallResult> {
     const { activeBackendAffected } = await this.runtimeManager.uninstallCodeBuddy()
+    return { snapshot: await this.getSettingsView(), activeBackendAffected }
+  }
+
+  async uninstallPi(): Promise<UninstallResult> {
+    const { activeBackendAffected } = await this.runtimeManager.uninstallPi()
     return { snapshot: await this.getSettingsView(), activeBackendAffected }
   }
 
@@ -1776,6 +1888,12 @@ class SettingsService {
   // Sets or clears the shared contact email and NCBI API key (encrypted at rest), returning state.
   async setNcbiCredentials(request: SetNcbiCredentialsRequest): Promise<ConnectorsSnapshot> {
     return this.connectors.setNcbiCredentials(request)
+  }
+
+  async setSemanticScholarCredential(
+    request: SetSemanticScholarCredentialRequest
+  ): Promise<ConnectorsSnapshot> {
+    return this.connectors.setSemanticScholarCredential(request)
   }
 
   async setOpenAlexCredential(request: SetOpenAlexCredentialRequest): Promise<ConnectorsSnapshot> {

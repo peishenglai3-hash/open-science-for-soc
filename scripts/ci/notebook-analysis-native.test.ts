@@ -3,7 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { expect, it } from 'vitest'
 import { loadModuleImpactManifest } from './load-module-impact.mjs'
-import { loadDerivedConsumers } from './module-derived-consumers.mjs'
+import { loadDerivedConsumers } from './module-graph/policy.mjs'
 import { createModuleTestPlan, modulesForPath } from './module-test-impact.mjs'
 import suite from './notebook-analysis-native/suite.json'
 
@@ -52,6 +52,12 @@ it('retains explicit native behavioral evidence outside ordinary module test sel
 it('ordinary discovery does not collect the native entrypoint', () => {
   const files = execFileSync(process.execPath, [vitest, 'list', '--filesOnly', '--json'], {
     cwd: root,
+    env: {
+      ...process.env,
+      VITEST_PORTABLE_CI: '0',
+      OPEN_SCIENCE_CI_EXCLUDED_PACKAGE_ROOTS: '[]',
+      OPEN_SCIENCE_CI_SELECTED_PACKAGE_ROOTS: '[]'
+    },
     encoding: 'utf8',
     maxBuffer: 8 * 1024 * 1024
   })
@@ -67,7 +73,7 @@ it('the dedicated configuration discovers every declared native file', () => {
   )
   expect(
     JSON.parse(output)
-      .map(({ file }: { file: string }) => file)
+      .map(({ file }: { file: string }) => resolve(file))
       .sort()
   ).toEqual(suite.testFiles.map((path) => resolve(root, path)).sort())
 }, 30000)

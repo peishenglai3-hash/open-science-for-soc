@@ -1,3 +1,4 @@
+import { allowedDuringServiceStop } from './service-command-admission'
 import { ApplicationCommandError } from '../shared/application-command-contract'
 import {
   ELECTRON_APPLICATION_COMMAND_CHANNELS,
@@ -130,9 +131,13 @@ type NotebookEnvironmentDependencies = Parameters<
 >[1]
 type PermissionGrantDependencies = Parameters<typeof registerPermissionGrantApplicationCommands>[1]
 
+type CommandModuleInstallation = ApplicationCommandInstallation & {
+  whenIdle?: () => Promise<void>
+}
+
 type ApplicationCommandModuleDescriptor = Readonly<{
   groups: readonly AnyApplicationCommandGroup[]
-  install: (registrar: ApplicationCommandRegistrar) => ApplicationCommandInstallation
+  install: (registrar: ApplicationCommandRegistrar) => CommandModuleInstallation
 }>
 
 type ApplicationCommandCompositionDependencies = Readonly<{
@@ -171,6 +176,8 @@ const ELECTRON_NATIVE_COMMAND_NAMES = Object.freeze([
   'specialist:cancel-handoff',
   'file:save-blob',
   'file:save-managed',
+  'file:artifact-save-progress',
+  'file:cancel-artifact-save',
   'file:save-session-artifacts',
   'file:save-project-artifacts',
   'specialist:create',
@@ -220,7 +227,6 @@ const ELECTRON_NATIVE_COMMAND_NAMES = Object.freeze([
   'locale:set-preference',
   'network:get-info',
   'network:check-connectivity',
-  'managed-file-versions:inspect',
   'managed-file-versions:save-text-edit',
   'managed-file-versions:diff-text',
   'managed-file-versions:cancel-diff',
@@ -235,9 +241,6 @@ const ELECTRON_NATIVE_COMMAND_NAMES = Object.freeze([
   'sessions:inspect-diagnostics',
   'sessions:export-diagnostics',
   'sessions:cancel-diagnostics',
-  'sessions:export-package',
-  'sessions:import-package',
-  'sessions:package-operation',
   'uploads:stage-local-file'
 ])
 
@@ -525,8 +528,10 @@ const createApplicationCommandComposition = (
   const modules = createApplicationCommandModules(dependencies, remoteAccess.owner)
   const certified = certifyInventory(modules.flatMap(({ groups }) => groups))
   const router = createApplicationCommandRouter(onDiagnostic)
-  const installations: ApplicationCommandInstallation[] = []
-  let disposed = false
+  const installations: CommandModuleInstallation[] = []
+  let disposal: Promise<void> | undefined
+  let stopping = false
+  let updateHolds = 0
 
   try {
     for (const module of modules) installations.push(module.install(router.registrar))
@@ -561,6 +566,11 @@ const createApplicationCommandComposition = (
     return Object.freeze({
       commandNames: (): readonly string[] => names,
       invoke: (commandName, invocation): Promise<unknown> => {
+        if ((stopping || updateHolds > 0) && !allowedDuringServiceStop(commandName)) {
+          return Promise.reject(
+            new ApplicationCommandError('command-unavailable', 'The local service is stopping.')
+          )
+        }
         if (rejected.has(commandName)) {
           return Promise.reject(
             new ApplicationCommandError(
@@ -604,27 +614,51 @@ const createApplicationCommandComposition = (
     localWeb,
     remoteWeb,
     task,
+    holdUpdateAdmission: (): (() => void) => {
+      updateHolds++
+      let active = true
+      return () => {
+        if (!active) return
+        active = false
+        updateHolds--
+      }
+    },
+    beginStopping: (): void => {
+      stopping = true
+    },
     bindRemoteAccess: remoteAccess.bind,
-    dispose: (): void => {
-      if (disposed) return
-      disposed = true
+    dispose: (): Promise<void> => {
+      if (disposal) return disposal
+      const completion = Promise.withResolvers<void>()
+      disposal = completion.promise
       const failures: unknown[] = []
-      for (const installation of [...installations].reverse()) {
+      const reverseInstallations = [...installations].reverse()
+      for (const installation of reverseInstallations) {
         try {
           installation.uninstall()
         } catch (error) {
           failures.push(error)
         }
       }
-      try {
-        router.dispose()
-      } catch (error) {
-        failures.push(error)
-      }
       remoteAccess.dispose()
-      if (failures.length > 0) {
-        throw new AggregateError(failures, 'Application command composition cleanup failed.')
-      }
+      void (async (): Promise<void> => {
+        for (const installation of reverseInstallations) {
+          try {
+            await installation.whenIdle?.()
+          } catch (error) {
+            failures.push(error)
+          }
+        }
+        try {
+          router.dispose()
+        } catch (error) {
+          failures.push(error)
+        }
+        if (failures.length > 0) {
+          throw new AggregateError(failures, 'Application command composition cleanup failed.')
+        }
+      })().then(completion.resolve, completion.reject)
+      return disposal
     }
   })
 }

@@ -1,3 +1,4 @@
+import type { ClassifiedFailure } from './failure/contract'
 import type { ToolCallContent, ToolCallLocation, ToolKind, Usage } from '@agentclientprotocol/sdk'
 import type { AcpMessageImage, AcpReplayMessageImage } from './acp-image-contract'
 import { ACP_MESSAGE_IMAGE_EVENT_TEXT, sanitizeAcpMessageImage } from './acp-image-contract'
@@ -64,7 +65,8 @@ export {
   isDurableAgentUserChoiceRequest,
   isValidElicitationValue,
   MAX_ELICITATION_MESSAGE_CHARS,
-  resolveAgentUserChoiceQuestions
+  resolveAgentUserChoiceQuestions,
+  normalizeAgentUserChoiceAnswers
 } from './elicitation'
 export type {
   AgentTurnProvenanceContext,
@@ -128,6 +130,9 @@ export type AcpHandoffFailure = {
 // ancillary session-scoped errors (artifact cleanup, cancel timeout) — a copy edit here updates
 // both sides at once.
 export const ACP_PROMPT_FAILED_EVENT_TITLE = 'Prompt failed'
+
+// An application continuation can fail before acquiring a durable turn outcome.
+export const ACP_APP_CONTINUATION_FAILED_EVENT_TITLE = 'Could not continue the Agent task'
 
 // Live, non-terminal notice that Artifact cleanup failed after the turn settled. It never rewrites
 // the Turn Outcome and is not an Artifact publication failure.
@@ -413,13 +418,6 @@ type AcpRuntimeEventBase = {
   // prompt text deliberately remain in the main-process recovery store, not this event.
   handoffFailure?: AcpHandoffFailure
   planProjection?: import('./session-plan/contract').ActivePlanProjection
-  // Set on an error event whose failure originates upstream of the app — the agent relayed a
-  // model/provider error (bad key, rate limit, quota, provider 5xx/overloaded, wrong model id). The
-  // renderer uses this to withhold the "Report error" affordance: a provider-side problem is the user's
-  // or provider's to resolve, not an app bug worth a GitHub issue. Absent (falsy) means the failure came
-  // from the ACP layer itself (our runtime) and stays reportable unless it is one of our own crafted,
-  // actionable reminder messages.
-  providerError?: boolean
   // Main-owned terminal classification, independent of provider error wording.
   interruptionCause?: 'app-restart' | 'connection-lost' | 'terminal-commit-failed'
   // Live-only release after bounded terminal persistence retries. Never written to Session JSON.
@@ -434,7 +432,7 @@ type AcpRuntimeEventBase = {
     messageBranchId: string
     runtimeSegmentId: string
   }
-  errorReportable?: boolean
+  failure?: ClassifiedFailure
   // A post-terminal Artifact failure still belongs to the original prompt.
   artifactFailure?: true
   // Main has durably committed this event's Message/Artifact projection before publication.
@@ -471,6 +469,10 @@ type AcpRuntimeEventBase = {
   // user turn. App-owned continuations retain it after the renderer's ordinary active run has settled.
   runId?: string
   promptMessageId?: string
+  // Existing application-continuation provenance, copied from AgentTurnProvenanceContext by Main.
+  // Optional for provider events and older snapshots that only carry the prompt identity.
+  agentFrameId?: string
+  messageBranchId?: string
   // Mid-turn injected user messages persist composer uploads/parts without opening a new run.
   uploads?: PersistedUploadedAttachment[]
   parts?: MessagePart[]

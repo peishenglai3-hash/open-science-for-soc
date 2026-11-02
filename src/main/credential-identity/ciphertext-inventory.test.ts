@@ -1,4 +1,7 @@
+import { spawnSync } from 'node:child_process'
+import { createCipheriv, createHash } from 'node:crypto'
 import {
+  copyFileSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
@@ -15,6 +18,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { readCredentialCiphertexts, verifyCredentialCiphertexts } from './ciphertext-inventory'
 import { prepareCredentialValidation, selectStartupCredentialIdentity } from './bootstrap'
 import { CredentialIdentityError } from './selection'
+import { createCredentialAccess } from './access'
+import { createNodeSecureStorageCipher } from './node-cipher'
 import { resolveBootstrapConfigRoot, resolveElectronProfile } from '../storage/electron-profile'
 
 const roots: string[] = []
@@ -31,6 +36,175 @@ const ref = (text: string): string => `enc:${Buffer.from(text).toString('base64'
 afterEach(() => roots.splice(0).forEach((path) => rmSync(path, { recursive: true, force: true })))
 
 describe('read-only ciphertext inventory', () => {
+  it.each([23, 24])(
+    'accepts a valid Windows cookie from Chromium schema v%i at startup',
+    (version) => {
+      const paths = fixture()
+      const identity = { backend: 'windows-dpapi', appName: 'Open-Science' } as const
+      const key = Buffer.alloc(32, 0x63)
+      const nonce = Buffer.alloc(12, 0x42)
+      const host = 'example.com'
+      // Chromium v24 encrypts the binary SHA-256 domain digest before the cookie value.
+      // Produce the record independently of the application's string encryption API.
+      const plaintext = Buffer.concat([
+        ...(version >= 24 ? [createHash('sha256').update(host).digest()] : []),
+        Buffer.from('session-value')
+      ])
+      const producer = createCipheriv('aes-256-gcm', key, nonce)
+      const encrypted = Buffer.concat([
+        Buffer.from('v10'),
+        nonce,
+        producer.update(plaintext),
+        producer.final(),
+        producer.getAuthTag()
+      ])
+      const statePath = join(paths.profilePath, 'Local State')
+      const state = JSON.stringify({
+        os_crypt: { encrypted_key: Buffer.from('DPAPIfixture').toString('base64') }
+      })
+      writeFileSync(statePath, state)
+      const cookiePath = join(paths.profilePath, 'Cookies')
+      const db = new DatabaseSync(cookiePath)
+      db.exec(
+        'CREATE TABLE meta(key TEXT PRIMARY KEY, value INTEGER); CREATE TABLE cookies(host_key TEXT, encrypted_value BLOB)'
+      )
+      db.prepare('INSERT INTO meta VALUES (?, ?)').run('version', version)
+      db.prepare('INSERT INTO cookies VALUES (?, ?)').run(host, encrypted)
+      db.close()
+      const original = readFileSync(cookiePath)
+      // Only the OS key retrieval is injected, using its existing public dependency boundary.
+      const cipher = createNodeSecureStorageCipher(identity, paths.profilePath, {
+        readPassword: vi.fn(),
+        unprotect: () => Buffer.from(key)
+      })
+      const recover = vi.fn()
+      const access = createCredentialAccess({ identity, cipher, probe: vi.fn(), recover })
+      let failure: unknown
+      try {
+        const inventory = readCredentialCiphertexts(paths)
+        expect(inventory).toEqual([encrypted])
+        try {
+          verifyCredentialCiphertexts(inventory, (value) => access.decryptString(value))
+        } catch (error) {
+          failure = error
+        }
+        expect(readFileSync(cookiePath)).toEqual(original)
+        expect(readFileSync(statePath, 'utf8')).toBe(state)
+        expect(failure, 'valid cookie ciphertext must not block startup').toBeUndefined()
+        expect(recover).not.toHaveBeenCalled()
+      } finally {
+        cipher.dispose()
+        key.fill(0)
+      }
+    }
+  )
+
+  it('includes the Semantic Scholar credential in startup key validation', () => {
+    const paths = fixture()
+    writeFileSync(
+      join(paths.configRoot, 'settings.json'),
+      JSON.stringify({
+        version: 1,
+        connectors: { semanticScholarApiKeyRef: ref('semantic-scholar-ciphertext') }
+      })
+    )
+    expect(readCredentialCiphertexts(paths).map((value) => value.toString())).toContain(
+      'semantic-scholar-ciphertext'
+    )
+  })
+
+  it('does not let an inactive journal bypass an unreadable application database', () => {
+    const paths = fixture()
+    const path = join(paths.configRoot, 'open-science.db')
+    const original = Buffer.from('not a SQLite database')
+    const journal = Buffer.alloc(28)
+    writeFileSync(path, original)
+    writeFileSync(`${path}-journal`, journal)
+    expect(() => readCredentialCiphertexts(paths)).toThrow(
+      expect.objectContaining({ reason: 'ciphertext-inventory-unavailable' })
+    )
+    expect(readFileSync(path)).toEqual(original)
+    expect(readFileSync(`${path}-journal`)).toEqual(journal)
+  })
+
+  it.each([
+    ['application', 'before journal sync'],
+    ['cookies', 'before journal sync'],
+    ['application', 'after spilling uncommitted pages'],
+    ['cookies', 'after spilling uncommitted pages']
+  ])('reads committed %s ciphertext after a writer exits %s', (store, stage) => {
+    const paths = fixture()
+    const path = join(
+      store === 'application' ? paths.configRoot : paths.profilePath,
+      store === 'application' ? 'open-science.db' : 'Cookies'
+    )
+    const table = store === 'application' ? 'ComputeCredential' : 'cookies'
+    const column = store === 'application' ? 'ciphertext' : 'encrypted_value'
+    const spill = stage === 'after spilling uncommitted pages'
+    // Let SQLite create both crash states, without fabricating a journal header.
+    const writer = spawnSync(process.execPath, [
+      '--no-warnings',
+      '-e',
+      `
+        const { DatabaseSync } = require('node:sqlite')
+        const db = new DatabaseSync(process.argv[1])
+        db.exec('PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=5; PRAGMA cache_spill=${spill ? 'ON' : 'OFF'}')
+        db.exec('CREATE TABLE ${table}(${column} BLOB, padding BLOB)')
+        db.prepare('INSERT INTO ${table} VALUES (?, zeroblob(65536))').run(Buffer.from('committed-ciphertext'))
+        db.exec('BEGIN IMMEDIATE')
+        db.prepare('UPDATE ${table} SET ${column}=?, padding=randomblob(65536)').run(Buffer.from('uncommitted-ciphertext'))
+        require('node:fs').writeSync(1, 'journal-written')
+        process.kill(process.pid, 'SIGKILL')
+        `,
+      path
+    ])
+    expect(writer.error).toBeUndefined()
+    expect(writer.stdout.toString()).toBe('journal-written')
+    expect(writer.status).toBe(process.platform === 'win32' ? 1 : null)
+    expect(writer.signal).toBe(process.platform === 'win32' ? null : 'SIGKILL')
+    const original = readFileSync(path)
+    const journal = readFileSync(`${path}-journal`)
+    expect(journal.length).toBeGreaterThan(512)
+    if (spill) expect(journal.subarray(0, 8).toString('hex')).toBe('d9d505f920a163d7')
+    else {
+      expect(journal.subarray(0, 12)).toEqual(Buffer.alloc(12))
+      expect(journal.subarray(12, 28)).not.toEqual(Buffer.alloc(16))
+    }
+
+    // Establish the reported contrast using SQLite itself on an independent copy.
+    const controlPath = join(paths.configRoot, 'control.db')
+    copyFileSync(path, controlPath)
+    copyFileSync(`${path}-journal`, `${controlPath}-journal`)
+    const control = new DatabaseSync(controlPath, { readOnly: !spill })
+    try {
+      expect(control.prepare('PRAGMA integrity_check').get()?.integrity_check).toBe('ok')
+      expect(
+        Buffer.from(
+          control.prepare(`SELECT ${column} FROM ${table}`).get()![column] as Uint8Array
+        ).toString()
+      ).toBe('committed-ciphertext')
+    } finally {
+      control.close()
+    }
+
+    const inspect = (): string[] | string => {
+      try {
+        return readCredentialCiphertexts(paths).map((value) => value.toString())
+      } catch (error) {
+        if (!(error instanceof CredentialIdentityError)) throw error
+        return error.reason
+      }
+    }
+    const first = inspect()
+    const second = inspect()
+    expect(readFileSync(path)).toEqual(original)
+    expect(readFileSync(`${path}-journal`)).toEqual(journal)
+    expect({ first, second }).toEqual({
+      first: ['committed-ciphertext'],
+      second: ['committed-ciphertext']
+    })
+  })
+
   it.each(['DELETE', 'PERSIST'])(
     'accepts an existing .open-science directory without renaming it after a completed %s transaction',
     (mode) => {

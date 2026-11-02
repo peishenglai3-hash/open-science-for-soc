@@ -9,6 +9,7 @@ const PYTHON_FILE_CALL_EFFECTS: ReadonlyMap<string, NotebookFileCallEffect> = ne
       [name, { kind: 'read', position: 0, keywords: ['fname'], inputForm: 'lines' }] as const
   ),
   ['scipy.io.loadmat', { kind: 'read', position: 0, keywords: ['file_name'] }],
+  ['scipy.io.mminfo', { kind: 'read', position: 0, keywords: ['source'] }],
   ['scipy.sparse.load_npz', { kind: 'read', position: 0, keywords: ['file'] }],
   [
     'scipy.sparse.save_npz',
@@ -40,6 +41,7 @@ const PYTHON_FILE_CALL_EFFECTS: ReadonlyMap<string, NotebookFileCallEffect> = ne
   ),
   ['pandas.to_pickle', { kind: 'write', position: 1, keywords: ['filepath_or_buffer'] }],
   ['pandas.read_pickle', { kind: 'read', position: 0, keywords: ['filepath_or_buffer'] }],
+  ['pandas.read_json', { kind: 'read', position: 0, keywords: ['path_or_buf'] }],
   ['pandas.ExcelFile', { kind: 'read', position: 0, keywords: ['path_or_buffer'] }],
   ['scanpy.read_10x_h5', { kind: 'read', position: 0, keywords: ['filename'] }],
   ...[
@@ -130,12 +132,6 @@ const PYTHON_FILE_CALL_EFFECTS: ReadonlyMap<string, NotebookFileCallEffect> = ne
       ] as const
   ),
   ['dump', { kind: 'write', position: 1, keywords: ['file', 'filename', 'fp'] }],
-  // Atomic publication moves a temporary file into its final destination. The
-  // source path is intentionally not recorded as a read because mkstemp or a
-  // tempfile helper commonly makes it dynamic; the destination is the durable
-  // notebook output that downstream cells consume.
-  ['os.replace', { kind: 'write', position: 1, keywords: ['dst'] }],
-  ['shutil.move', { kind: 'write', position: 1, keywords: ['dst'] }],
   ['dcmwrite', { kind: 'write', position: 0, keywords: ['filename'] }],
   ['imwrite', { kind: 'write', position: 0, keywords: ['filename'] }],
   ['imsave', { kind: 'write', position: 0, keywords: ['fname'] }],
@@ -224,6 +220,25 @@ const PYTHON_UNSUPPORTED_EXTERNAL_STATE_CALLS = new Set([
   'datetime.datetime.now',
   'datetime.datetime.today',
   'datetime.date.today',
+  'os.chdir',
+  'os.fchdir',
+  'os.rename',
+  'os.replace',
+  'os.unlink',
+  'os.remove',
+  'os.rmdir',
+  'os.removedirs',
+  'os.truncate',
+  'os.ftruncate',
+  'os.link',
+  'os.symlink',
+  'shutil.rmtree',
+  'shutil.move',
+  'shutil.copy',
+  'shutil.copy2',
+  'shutil.copytree',
+  'shutil.unpack_archive',
+  'shutil.make_archive',
   'os.getenv',
   'os.getlogin',
   'os.urandom',

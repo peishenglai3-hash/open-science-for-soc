@@ -1,16 +1,19 @@
 import { z } from 'zod'
-import type { ReasoningEffort } from '../../shared/model-preference-contract'
-import { usesVendorAnthropicApiKeyHeader } from '../../shared/provider-registry'
+import { type ReasoningEffort } from '../../shared/model-preference-contract'
 import {
-  resolveReasoningEffortValue,
+  usesVendorMessagesApiKeyHeader,
   type ModelReasoningEffort,
   type ResolvedReasoningEffort
-} from '../../shared/reasoning-effort'
+} from '@aipoch/providers'
+import { resolveReasoningEffortValue } from '../../shared/reasoning-effort'
+
 import {
   canUseClaudeProviderTransport,
   CODEX_ISOLATED_PROVIDER_ID,
   DEFAULT_REASONING_EFFORT,
   isCodexSubscriptionProvider,
+  isXaiSubscriptionProvider,
+  preferredEndpoint,
   shareProviderTransportFamily,
   usesAppProviderTransport
 } from '../../shared/settings'
@@ -28,18 +31,20 @@ import {
 } from '../agent-framework'
 import { CODEX_BRIDGE_MODEL, resolveResponsesBaseUrl } from '../agent-framework/codex'
 import { opencodeTransportProviderId } from '../agent-framework/opencode'
+import { piModelId, piSessionModel, type PiModelWire } from '../agent-framework/pi'
 import { REVIEWER_BRIDGE_NAMESPACED_TOOLS } from '../reviewer/bridge-tools'
 import { requestSkillImportToolSchema } from '../skills/mcp-server'
-import type { AnthropicProviderBridgeTarget } from './anthropic-provider-bridge'
+import type { MessagesBridgeTarget } from './messages-bridge'
 import {
-  normalizeAnthropicBaseUrl,
-  openAiChatCompletionsUrl,
-  openAiCompletionsBase
-} from './base-url'
+  normalizeMessagesRootUrl,
+  resolveChatCompletionsUrl,
+  resolveChatCompletionsBaseUrl,
+  type ResponsesNamespacedTool
+} from '@aipoch/providers/protocol'
 import type { ClaudeRuntimeModelConfig } from './claude-config-provision'
 import { codexBridgeStaticMcpTools } from './codex-bridge-tools'
 import type { ProviderAccountsModule, ProviderRuntimeTarget } from './provider-accounts'
-import type { ResponsesBridgeNamespacedTool } from './responses-bridge'
+
 import type { StoredSettings } from './types'
 type BackendRouteProviderPort = Pick<
   ProviderAccountsModule,
@@ -64,15 +69,23 @@ type PlannedProviderTarget = Readonly<{
   reasoningEffort?: ModelReasoningEffort
   reasoningEfforts?: readonly ModelReasoningEffort[]
 }>
+export type PiPlannedTarget = PlannedProviderTarget &
+  Readonly<{
+    wire: PiModelWire
+    // Upstream URL for API-key providers. xAI subscription targets use the app OAuth bridge.
+    endpoint?: string
+    oauth?: 'xai'
+  }>
 type BackendTransportPlan =
   | Readonly<{ kind: 'direct' }>
+  | Readonly<{ kind: 'pi'; targets: readonly PiPlannedTarget[]; initialTargetId: string }>
   | Readonly<{
       kind: 'codebuddy-provider-compatibility'
-      wire: 'anthropic' | 'responses'
+      wire: 'messages' | 'responses'
     }>
   | Readonly<{
       kind: 'claude-anthropic'
-      targets: readonly (AnthropicProviderBridgeTarget & {
+      targets: readonly (MessagesBridgeTarget & {
         runtimeTarget?: ProviderRuntimeTarget
       })[]
       initialTargetId: string
@@ -95,8 +108,8 @@ type BackendRoutePlan = Readonly<{
   providerModelCatalog: readonly AgentModelCatalogEntry[]
   transport: BackendTransportPlan
   claudeModelConfig?: ClaudeRuntimeModelConfig
-  codexBridgeTools?: readonly ResponsesBridgeNamespacedTool[]
-  reviewerBridgeTools?: readonly ResponsesBridgeNamespacedTool[]
+  codexBridgeTools?: readonly ResponsesNamespacedTool[]
+  reviewerBridgeTools?: readonly ResponsesNamespacedTool[]
 }>
 const modelRouteFor = (
   frameworkId: AgentFrameworkId,
@@ -104,12 +117,36 @@ const modelRouteFor = (
 ): AgentModelRoute => {
   if (frameworkId === 'claude-code') return 'claude-anthropic'
   if (frameworkId === 'opencode') {
-    return target.apiEndpoints.includes('openai') ? 'opencode-openai' : 'opencode-anthropic'
+    return target.apiEndpoints.includes('chat-completions')
+      ? 'opencode-openai'
+      : 'opencode-anthropic'
   }
   if (frameworkId === 'codebuddy') return 'codebuddy-openai'
-  if (target.needsChatResponsesBridge) return 'codex-bridge'
+  if (frameworkId === 'pi') return 'pi'
+  if (target.needsChatResponsesToChatCompletionsBridge) return 'codex-bridge'
   if (target.needsNativeResponsesCompatibility) return 'codex-responses-compatibility'
   return 'codex-responses'
+}
+// Pi speaks every API-key protocol natively, so each target keeps its preferred wire. xAI
+// subscriptions use the shared OAuth bridge; other subscription logins stay with their own harness.
+const piWireFor = (
+  target: ProviderRuntimeTarget
+): Pick<PiPlannedTarget, 'wire' | 'endpoint' | 'oauth'> | undefined => {
+  if (isXaiSubscriptionProvider(target.provider.type)) {
+    return { wire: 'chat-completions', oauth: 'xai' }
+  }
+  if (target.provider.type !== 'custom' && target.provider.type !== 'official') return undefined
+  const wire = preferredEndpoint(target.apiEndpoints, ['responses', 'chat-completions', 'messages'])
+  const responses = resolveResponsesBaseUrl(target.provider)
+  const endpoint =
+    wire === 'responses'
+      ? responses && `${responses}/responses`
+      : wire === 'chat-completions'
+        ? resolveChatCompletionsUrl(target.provider)
+        : wire === 'messages'
+          ? normalizeMessagesRootUrl(target.provider.baseUrl ?? '')
+          : undefined
+  return wire && endpoint ? { wire, endpoint } : undefined
 }
 const modelEffort = (
   intent: ReasoningEffort,
@@ -128,14 +165,14 @@ const transportTargetId = (
 const namespaceFor = (serverName: string): string =>
   `mcp__${serverName.replace(/[^a-zA-Z0-9_]/g, '_')}`
 const STATIC_APP_MCP_TOOLS = codexBridgeStaticMcpTools()
-const SKILL_IMPORT_TOOLS: ResponsesBridgeNamespacedTool[] = [
+const SKILL_IMPORT_TOOLS: ResponsesNamespacedTool[] = [
   {
     namespace: namespaceFor(SKILL_IMPORT_MCP_SERVER_NAME),
     name: REQUEST_SKILL_IMPORT_TOOL_NAME,
     description: REQUEST_SKILL_IMPORT_TOOL_DESCRIPTION,
     parameters: z.toJSONSchema(z.object(requestSkillImportToolSchema), {
       target: 'draft-7'
-    }) as ResponsesBridgeNamespacedTool['parameters']
+    }) as ResponsesNamespacedTool['parameters']
   }
 ]
 class BackendRoutePlanner {
@@ -144,6 +181,9 @@ class BackendRoutePlanner {
     this.providers = providers
   }
   planBackend(input: BackendRoutePlanInput): BackendRoutePlan {
+    if (input.frameworkId === 'pi' && !piWireFor(input.target)) {
+      throw new Error('Pi cannot use this provider. Subscription logins stay with their own agent.')
+    }
     const configuredRoute = modelRouteFor(input.frameworkId, input.target)
     const forcedCompatibility =
       input.forceNativeResponsesCompatibility === true &&
@@ -223,6 +263,7 @@ class BackendRoutePlanner {
     })
   }
   projectModelChange(input: BackendModelChangePlanInput): AgentModelChangeTarget | undefined {
+    if (input.frameworkId === 'pi' && !piWireFor(input.target)) return undefined
     const model = input.target.effectiveModel ?? input.target.provider.model
     if (!model) return undefined
     const route = modelRouteFor(input.frameworkId, input.target)
@@ -233,6 +274,7 @@ class BackendRoutePlanner {
       input.frameworkId === 'claude-code' && customTarget && candidates.includes(input.target)
     const hasProviderTransport =
       input.frameworkId === 'opencode' ||
+      input.frameworkId === 'pi' ||
       (input.frameworkId === 'codex' &&
         (retargetable || (route === 'codex-responses' && customTarget)))
     const providerTransportTargetId = hasProviderTransport
@@ -253,13 +295,15 @@ class BackendRoutePlanner {
           ? CODEX_BRIDGE_MODEL
           : input.frameworkId === 'opencode'
             ? `${opencodeTransportProviderId(input.target.providerId, model)}/${model}`
-            : model,
+            : input.frameworkId === 'pi'
+              ? piSessionModel(piModelId(input.target.providerId, model))
+              : model,
       sessionModelRequired:
         input.frameworkId === 'codex' && isCodexSubscriptionProvider(input.target.provider.type),
       supportsImageInput: input.target.provider.supportsImageInput === true,
       reasoningEffort: modelEffort(input.effortIntent, input.target),
       ...(hasClaudeTransport
-        ? { anthropicBridgeTargetId: claudeTargetId(input.target.providerId, model) }
+        ? { messagesBridgeTargetId: claudeTargetId(input.target.providerId, model) }
         : {}),
       ...(providerTransportTargetId ? { providerTransportTargetId } : {}),
       ...(input.target.provider.contextWindow
@@ -293,11 +337,9 @@ class BackendRoutePlanner {
         return Object.freeze({ kind: 'direct' })
       }
       const targets = candidates.flatMap(
-        (
-          candidate
-        ): (AnthropicProviderBridgeTarget & { runtimeTarget?: ProviderRuntimeTarget })[] => {
+        (candidate): (MessagesBridgeTarget & { runtimeTarget?: ProviderRuntimeTarget })[] => {
           const model = candidate.effectiveModel ?? candidate.provider.model
-          const baseUrl = normalizeAnthropicBaseUrl(candidate.provider.baseUrl ?? '')
+          const baseUrl = normalizeMessagesRootUrl(candidate.provider.baseUrl ?? '')
           return !model || !baseUrl
             ? []
             : [
@@ -311,7 +353,7 @@ class BackendRoutePlanner {
                     ? { backgroundModel: 'apodex-1.1-mini' }
                     : {}),
                   ...(candidate.provider.vendorId &&
-                  usesVendorAnthropicApiKeyHeader(candidate.provider.vendorId)
+                  usesVendorMessagesApiKeyHeader(candidate.provider.vendorId)
                     ? { useApiKeyHeader: true }
                     : {})
                 })
@@ -335,11 +377,27 @@ class BackendRoutePlanner {
         targets: this.plannedTargets(candidates, frameworkId, effortIntent)
       })
     }
+    if (frameworkId === 'pi') {
+      const model = active.effectiveModel ?? active.provider.model
+      if (!model || !piWireFor(active)) throw new Error('The Pi provider target is incomplete.')
+      // One Pi generation can mix wires: every compatible model joins the in-session catalog.
+      const targets = this.plannedTargets(candidates, frameworkId, effortIntent).flatMap(
+        (planned): PiPlannedTarget[] => {
+          const wire = piWireFor(planned.target)
+          return wire ? [Object.freeze({ ...planned, ...wire })] : []
+        }
+      )
+      return Object.freeze({
+        kind: 'pi',
+        targets: Object.freeze(targets),
+        initialTargetId: transportTargetId(frameworkId, active.providerId, model)
+      })
+    }
     if (frameworkId === 'codebuddy') {
-      if (active.apiEndpoints.includes('openai')) return Object.freeze({ kind: 'direct' })
+      if (active.apiEndpoints.includes('chat-completions')) return Object.freeze({ kind: 'direct' })
       return Object.freeze({
         kind: 'codebuddy-provider-compatibility',
-        wire: active.apiEndpoints.includes('responses') ? 'responses' : 'anthropic'
+        wire: active.apiEndpoints.includes('responses') ? 'responses' : 'messages'
       })
     }
     if (route === 'codex-bridge' || route === 'codex-responses-compatibility') {
@@ -393,19 +451,26 @@ class BackendRoutePlanner {
     const seen = new Set<string>()
     return this.enumerateCandidates(settings, active, frameworkId).filter((candidate) => {
       const model = candidate.effectiveModel ?? candidate.provider.model
-      if (!shareProviderTransportFamily(active.provider.type, candidate.provider.type)) return false
+      // Pi gives every target its own bridge, so xAI OAuth and API-key models can share a catalog.
+      if (
+        frameworkId !== 'pi' &&
+        !shareProviderTransportFamily(active.provider.type, candidate.provider.type)
+      )
+        return false
       const endpoint =
         frameworkId === 'claude-code'
-          ? normalizeAnthropicBaseUrl(candidate.provider.baseUrl ?? '')
-          : frameworkId === 'opencode'
-            ? route === 'opencode-openai'
-              ? openAiChatCompletionsUrl(candidate.provider)
-              : normalizeAnthropicBaseUrl(candidate.provider.baseUrl ?? '')
-            : frameworkId === 'codebuddy'
-              ? openAiChatCompletionsUrl(candidate.provider)
-              : route === 'codex-bridge'
-                ? openAiCompletionsBase(candidate.provider)
-                : resolveResponsesBaseUrl(candidate.provider)
+          ? normalizeMessagesRootUrl(candidate.provider.baseUrl ?? '')
+          : frameworkId === 'pi'
+            ? piWireFor(candidate)?.wire
+            : frameworkId === 'opencode'
+              ? route === 'opencode-openai'
+                ? resolveChatCompletionsUrl(candidate.provider)
+                : normalizeMessagesRootUrl(candidate.provider.baseUrl ?? '')
+              : frameworkId === 'codebuddy'
+                ? resolveChatCompletionsUrl(candidate.provider)
+                : route === 'codex-bridge'
+                  ? resolveChatCompletionsBaseUrl(candidate.provider)
+                  : resolveResponsesBaseUrl(candidate.provider)
       const id = model
         ? frameworkId === 'claude-code'
           ? claudeTargetId(candidate.providerId, model)

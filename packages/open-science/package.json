@@ -4,6 +4,10 @@
   "description": "Node.js SDK and CLI for the Open-Science local daemon",
   "type": "module",
   "exports": {
+    "./browser-import": {
+      "types": "./browser-import.d.ts",
+      "import": "./browser-import.mjs"
+    },
     ".": {
       "types": "./index.d.ts",
       "import": "./index.mjs"
@@ -18,7 +22,8 @@
     "*.d.ts",
     "LICENSE",
     "README.md",
-    "CLI.md"
+    "CLI.md",
+    "BROWSER_IMPORT.md"
   ],
   "engines": {
     "node": ">=22.5.0"
@@ -31,5 +36,9 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "zod": "^4.6.6"
   }
 }

@@ -43,6 +43,7 @@ describe('computePreflight', () => {
       opencodeReady: false,
       codebuddyReady: false,
       codexReady: false,
+      piReady: false,
       agentFrameworkId: 'claude-code',
       agentReady: true,
       activeProviderReady: true,
@@ -124,9 +125,9 @@ describe('computePreflight', () => {
   it('is not provider-ready when only another model target was validated', () => {
     const validatedForAnotherModel = {
       ...customProvider,
-      lastValidatedTarget: { model: 'model-a', endpoint: 'anthropic' as const }
+      lastValidatedTarget: { model: 'model-a', endpoint: 'messages' as const }
     } as StoredProvider & {
-      lastValidatedTarget: { model: string; endpoint: 'anthropic' }
+      lastValidatedTarget: { model: string; endpoint: 'messages' }
     }
     const settings = baseSettings({
       providers: [validatedForAnotherModel],
@@ -136,7 +137,7 @@ describe('computePreflight', () => {
     expect(
       run({
         settings,
-        activeValidationTarget: { model: 'model-b', endpoint: 'anthropic' }
+        activeValidationTarget: { model: 'model-b', endpoint: 'messages' }
       }).activeProviderReady
     ).toBe(false)
   })

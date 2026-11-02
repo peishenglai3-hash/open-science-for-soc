@@ -346,6 +346,17 @@ describe('post-merge Windows validation', () => {
       }
     })
     expect(findStep(dependencies, 'Install dependencies').run).toBe('node scripts/ci/npm-ci.mjs')
+    const dependencySteps = dependencies.steps ?? []
+    const dependencyHost = findStep(dependencies, 'Build Windows sandbox native host')
+    expect(dependencyHost.run).toBe(
+      'node packages/notebook-network-sandbox/vendor/windows/build.mjs x64'
+    )
+    expect(dependencySteps.indexOf(dependencyHost)).toBeGreaterThan(
+      dependencySteps.indexOf(findStep(dependencies, 'Install dependencies'))
+    )
+    expect(dependencySteps.indexOf(dependencyHost)).toBeLessThan(
+      dependencySteps.indexOf(findStep(dependencies, 'Pack dependencies'))
+    )
     expect(findStep(dependencies, 'Pack dependencies').run).toContain('pack-dependencies')
     expect(findStep(dependencies, 'Pack dependencies').shell).toBe('bash')
     expect(findStep(job, 'Restore dependencies').run).toContain('restore-dependencies')
@@ -379,6 +390,9 @@ describe('post-merge Windows validation', () => {
     expect(scheduledFixes.run).toContain('src/main/notebook/runtime-service.rpc-retirement.test.ts')
     expect(scheduledFixes.run).toContain('src/main/notebook/shell-npm-environment.test.ts')
     for (const test of [
+      'src/main/session-package/browser-import.test.ts',
+      'src/main/notebook/working-file-observer.test.ts',
+      'src/main/session-persistence/projection.test.ts',
       'scripts/windows-notebook-sandbox-uninstall.test.ts',
       'scripts/windows-release-workflows.test.ts',
       'src/main/notebook/kernel-executor.test.ts',
@@ -618,8 +632,8 @@ describe('post-merge Windows validation', () => {
     const verification = readFileSync('scripts/ci/verify-windows-signature.ps1', 'utf8')
     expect(verification).toContain('Get-ChildItem -LiteralPath $unpacked -File -Recurse')
     expect(verification).toContain('Test-PortableExecutable $_.FullName')
-    expect(verification).toContain('resources/micromamba.exe')
-    expect(verification).toContain('resources/micromamba-compat.exe')
+    expect(verification).toContain('resources/backend/resources/micromamba.exe')
+    expect(verification).toContain('resources/backend/resources/micromamba-compat.exe')
     expect(verification).toContain('notebook-appcontainer-host.exe')
   })
 
@@ -918,7 +932,7 @@ describe('post-merge Windows validation', () => {
     }
   )
 
-  it('builds every platform without repeating the verified typecheck', () => {
+  it('builds every platform without repeating Web compilation or the verified typecheck', () => {
     const workflow = readWorkflow('build.yml')
     const verifyTypecheck = findStep(workflow.jobs.verify, 'Typecheck')
     const build = findStep(workflow.jobs.build, 'Build & package')
@@ -928,7 +942,7 @@ describe('post-merge Windows validation', () => {
     expect(verifyTypecheck.env).toEqual({ NODE_OPTIONS: '--max-old-space-size=4096' })
     expect(build.env).toMatchObject({ NODE_OPTIONS: '--max-old-space-size=8192' })
     expect(commands).toContain('npm run build:e2e')
-    expect(commands).toContain('npm run build:web')
+    expect(commands.some((command) => /^npm run build:web\b/.test(command))).toBe(false)
     expect(commands).not.toContain('npm run build')
     expect(commands.some((command) => command.startsWith('npm run typecheck'))).toBe(false)
   })

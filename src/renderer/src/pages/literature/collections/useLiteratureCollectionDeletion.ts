@@ -1,3 +1,4 @@
+import { useLiteratureHost } from '../renderer-host'
 import { useRetainedDialogValue } from '@/components/ui/use-retained-dialog-value'
 import {
   LITERATURE_COLLECTION_NAME_CONFLICT,
@@ -38,6 +39,8 @@ export function useLiteratureCollectionDeletion({
   conflictingCollections: LiteratureCollectionView[]
   deleteCollection: () => Promise<void>
 } {
+  const { api: hostApi } = useLiteratureHost()
+
   const { t } = useTranslation()
   const [collectionPendingDelete, setCollectionPendingDelete] = useState<LiteratureCollectionView>()
   const [isDeletingCollection, setIsDeletingCollection] = useState(false)
@@ -46,7 +49,9 @@ export function useLiteratureCollectionDeletion({
     if (!collectionPendingDelete) return undefined
     const promoted = collections.filter(({ parentId }) => parentId === collectionPendingDelete.id)
     const rootNames = new Set(
-      collections.filter(({ parentId }) => !parentId).map(({ name }) => name.toLowerCase())
+      collections
+        .filter(({ id, parentId }) => !parentId && id !== collectionPendingDelete.id)
+        .map(({ name }) => name.toLowerCase())
     )
     return {
       collection: collectionPendingDelete,
@@ -65,7 +70,7 @@ export function useLiteratureCollectionDeletion({
     setIsDeletingCollection(true)
     setCollectionDeleteError(undefined)
     try {
-      await window.api.literature.transact({
+      await hostApi.literature.transact({
         kind: 'delete-collection',
         collectionId: deletingCollection.id
       })

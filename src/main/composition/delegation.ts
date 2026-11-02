@@ -159,7 +159,8 @@ export function composeDelegation({
     repository: artifactRepository,
     runRegistry: artifactRunRegistry,
     notebookArtifactSourceScope: createNotebookArtifactSourceScopeProvider(dataRoot),
-    issueRpcCapability: (binding) => requireNotebookRpcServer().issueArtifactRunCapability(binding),
+    issueRpcCapability: (binding, isOwnerActive) =>
+      requireNotebookRpcServer().issueArtifactRunCapability(binding, undefined, isOwnerActive),
     revokeRpcCapability: (token) => requireNotebookRpcServer().revokeArtifactRunCapability(token),
     provenance: artifactProvenanceRepository
   })
@@ -320,7 +321,7 @@ export function composeDelegation({
               runtimeSegmentId: `delegated-message-${delivery.messageId}`
             }
           },
-          async () => {
+          async (resumeSession) => {
             let latest = await sessionRepository.loadSession(
               delivery.session.projectId,
               delivery.session.sessionId
@@ -350,7 +351,7 @@ export function composeDelegation({
               })
             }
             if (!runtime.hasLiveSession(latest.projectId, latest.id) || agentTarget) {
-              await runtime.resumeSession({
+              await resumeSession({
                 sessionId: latest.id,
                 cwd: latest.cwd,
                 projectId: latest.projectId,

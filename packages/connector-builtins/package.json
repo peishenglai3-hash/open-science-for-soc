@@ -283,6 +283,46 @@
     "./catalog": {
       "types": "./dist/catalog.d.ts",
       "default": "./dist/catalog.js"
+    },
+    "./orphadata": {
+      "types": "./dist/orphadata.d.ts",
+      "default": "./dist/orphadata.js"
+    },
+    "./rxnorm": {
+      "types": "./dist/rxnorm.d.ts",
+      "default": "./dist/rxnorm.js"
+    },
+    "./dailymed": {
+      "types": "./dist/dailymed.d.ts",
+      "default": "./dist/dailymed.js"
+    },
+    "./biosamples": {
+      "types": "./dist/biosamples.d.ts",
+      "default": "./dist/biosamples.js"
+    },
+    "./wikipathways": {
+      "types": "./dist/wikipathways.d.ts",
+      "default": "./dist/wikipathways.js"
+    },
+    "./tcia": {
+      "types": "./dist/tcia.d.ts",
+      "default": "./dist/tcia.js"
+    },
+    "./kegg": {
+      "types": "./dist/kegg.d.ts",
+      "default": "./dist/kegg.js"
+    },
+    "./research-datasets": {
+      "types": "./dist/research-datasets.d.ts",
+      "default": "./dist/research-datasets.js"
+    },
+    "./molecular-data": {
+      "types": "./dist/molecular-data.d.ts",
+      "default": "./dist/molecular-data.js"
+    },
+    "./literature-europepmc": {
+      "types": "./dist/literature-europepmc.d.ts",
+      "default": "./dist/literature-europepmc.js"
     }
   },
   "files": [
@@ -299,14 +339,14 @@
   "devDependencies": {
     "@types/node": "^22.19.1",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.11",
+    "vitest": "^4.1.12",
     "ajv": "^8.20.0",
     "@types/js-yaml": "^4.0.9",
     "@types/papaparse": "^5.5.2"
   },
   "dependencies": {
     "@xmldom/xmldom": "0.8.15",
-    "zod": "^4.6.5",
+    "zod": "^4.6.6",
     "js-yaml": "^4.1.0",
     "parse5": "^7.3.0",
     "openchemlib": "^9.25.0",

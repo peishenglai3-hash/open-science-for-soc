@@ -1,3 +1,4 @@
+import type { LiteratureReadingStatus } from '../workflows/useLiteratureReadingStatus'
 import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import {
@@ -14,7 +15,7 @@ import { useTranslation } from 'react-i18next'
 import type { LiteratureItemType } from '@aipoch/literature-citations/contracts'
 import type { LiteratureCollectionView } from '@aipoch/literature-library/contracts'
 import type { SmartCollectionView } from '@aipoch/literature-screening/contracts'
-import { setJournalSourceYear } from '../journals/journal-attribute-store'
+import { useJournalStore } from '../journals/journal-attribute-store'
 import type { LiteratureTableColumn } from './literature-table-preferences'
 import { JournalDatasetChoices, LiteratureColumnCustomizer } from './LiteratureColumnCustomizer'
 import { LiteratureFilters } from './LiteratureFilters'
@@ -40,6 +41,8 @@ export function LiteratureViewControls({
   itemTypeLabels,
   filterHasPdf,
   setFilterHasPdf,
+  filterReadingStatus,
+  setFilterReadingStatus,
   journalFilterDatasets,
   journalAttributeFilters,
   setJournalAttributeFilters,
@@ -123,6 +126,8 @@ export function LiteratureViewControls({
     >
   >
   itemTypeLabels: Record<LiteratureItemType, string>
+  filterReadingStatus: LiteratureReadingStatus | 'all'
+  setFilterReadingStatus: React.Dispatch<React.SetStateAction<LiteratureReadingStatus | 'all'>>
   filterHasPdf: 'with' | 'all' | 'without'
   setFilterHasPdf: React.Dispatch<React.SetStateAction<'with' | 'all' | 'without'>>
   journalFilterDatasets: JournalDataset[]
@@ -157,6 +162,8 @@ export function LiteratureViewControls({
   moveTableColumnBy: (column: LiteratureTableColumn, delta: -1 | 1) => void
   setVisibleTableColumns: React.Dispatch<React.SetStateAction<Set<LiteratureTableColumn>>>
 }): React.JSX.Element {
+  const { setJournalSourceYear } = useJournalStore()
+
   const { t } = useTranslation()
   return (
     <div className="flex shrink-0 items-center justify-end gap-2">
@@ -238,6 +245,8 @@ export function LiteratureViewControls({
             itemTypeLabels={itemTypeLabels}
             hasPdf={filterHasPdf}
             onHasPdfChange={setFilterHasPdf}
+            readingStatus={filterReadingStatus}
+            onReadingStatusChange={setFilterReadingStatus}
             yearFilter={yearFilter}
             datasets={journalFilterDatasets}
             journalFilters={journalAttributeFilters}

@@ -1,3 +1,4 @@
+import type { SetSemanticScholarCredentialRequest } from '../../shared/settings'
 import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { BootstrapError } from '../../shared/bootstrap'
@@ -40,12 +41,15 @@ import {
   customConnectorNameFromSkillName,
   isCustomConnectorName
 } from '../../shared/custom-connector'
-import { CONNECTOR_CATALOG } from '../connectors/catalog'
+import { CONNECTOR_CATALOG, isBundledConnectorEnabled } from '../connectors/catalog'
 import {
   hasUsableCustomMcpCredentials,
   isCustomMcpServerRouteSafe
 } from '../connectors/custom-mcp-config'
-import { hasAmbiguousCustomMcpCredentialNames } from '@aipoch/connector-mcp-client'
+import {
+  hasAmbiguousCustomMcpCredentialNames,
+  clearUnboundOAuthCredentials
+} from '@aipoch/connector-mcp-client'
 import { getConnectorTools } from '../connectors/registry'
 import { encryptKey, isEncryptionAvailable, tryDecryptKey } from './crypto'
 import { getCredentialStore } from './credential-store-mode'
@@ -215,12 +219,11 @@ class ConnectorSettingsModule {
     this.customServerRuntimeProjectionProvider = provider
   }
 
-  // Bundled connectors are default-on. Keep this projection on the durable owner so runtime
-  // configuration, Skill provisioning, and renderer views all apply the same opt-out rule.
+  // Runtime configuration, Skill provisioning and views share the catalog/explicit-choice rule.
   enabledConnectorIds(connectors: StoredConnectors | undefined): string[] {
-    const disabled = new Set(connectors?.disabledConnectorIds ?? [])
-
-    return CONNECTOR_CATALOG.map((meta) => meta.id).filter((id) => !disabled.has(id))
+    return CONNECTOR_CATALOG.filter((meta) => isBundledConnectorEnabled(meta.id, connectors)).map(
+      (meta) => meta.id
+    )
   }
 
   materializedCustomSkillNames(): string[] {
@@ -235,31 +238,50 @@ class ConnectorSettingsModule {
     ]
   }
 
-  connectorSkillNames(connectors: StoredConnectors | undefined): string[] {
-    const bundled = this.enabledConnectorIds(connectors).map((id) => `mcp-${id}`)
-    return [...new Set([...bundled, ...this.materializedCustomSkillNames()])]
+  connectorSkillNames(
+    connectors: StoredConnectors | undefined,
+    allowedNames?: readonly string[]
+  ): string[] {
+    const bundled = (
+      allowedNames === undefined
+        ? this.enabledConnectorIds(connectors)
+        : CONNECTOR_CATALOG.filter(({ id }) => allowedNames.includes(`mcp-${id}`)).map(
+            ({ id }) => id
+          )
+    ).map((id) => `mcp-${id}`)
+    return [...new Set([...bundled, ...this.materializedCustomSkillNames()])].filter(
+      (name) => allowedNames === undefined || allowedNames.includes(name)
+    )
   }
 
-  connectorSkillCatalogEntries(connectors: StoredConnectors | undefined): Array<{
+  connectorSkillCatalogEntries(
+    connectors: StoredConnectors | undefined,
+    allowedNames?: readonly string[]
+  ): Array<{
     directory: string
     name: string
     description?: string
     source: 'connector'
   }> {
-    const bundled = this.enabledConnectorIds(connectors).map((id) => {
-      const connector = CONNECTOR_CATALOG.find((candidate) => candidate.id === id)!
-      return {
-        directory: `mcp-${id}`,
-        name: `mcp-${id}`,
-        description: connector.useWhen,
-        source: 'connector' as const
+    const names = this.connectorSkillNames(connectors, allowedNames)
+    const bundled = CONNECTOR_CATALOG.filter(({ id }) => names.includes(`mcp-${id}`)).map(
+      ({ id }) => {
+        const connector = CONNECTOR_CATALOG.find((candidate) => candidate.id === id)!
+        return {
+          directory: `mcp-${id}`,
+          name: `mcp-${id}`,
+          description: connector.useWhen,
+          source: 'connector' as const
+        }
       }
-    })
-    const custom = this.materializedCustomSkillNames().map((name) => ({
-      directory: name,
-      name,
-      source: 'connector' as const
-    }))
+    )
+    const custom = this.materializedCustomSkillNames()
+      .filter((name) => names.includes(name))
+      .map((name) => ({
+        directory: name,
+        name,
+        source: 'connector' as const
+      }))
     return [...bundled, ...custom]
   }
 
@@ -341,8 +363,10 @@ class ConnectorSettingsModule {
   }
 
   async provisionedConnectorSkillNames(): Promise<string[]> {
-    const connectors = await this.getConnectors()
-    return this.connectorSkillNames(connectors)
+    return [
+      ...CONNECTOR_CATALOG.map(({ id }) => `mcp-${id}`),
+      ...this.materializedCustomSkillNames()
+    ]
   }
 
   async listConnectors(): Promise<ConnectorsSnapshot> {
@@ -585,6 +609,21 @@ class ConnectorSettingsModule {
 
     await this.repository.setNcbiCredentials(request.contactEmail?.trim() || undefined, apiKeyRef)
 
+    return this.connectorsSnapshot()
+  }
+
+  async setSemanticScholarCredential(
+    request: SetSemanticScholarCredentialRequest
+  ): Promise<ConnectorsSnapshot> {
+    if (
+      !request ||
+      typeof request.apiKey !== 'string' ||
+      request.apiKey.length > 4096 ||
+      /[\s\p{Cc}]/u.test(request.apiKey.trim())
+    )
+      throw new Error('Invalid API key format.')
+    const apiKey = request.apiKey.trim()
+    await this.repository.setSemanticScholarCredential(apiKey ? encryptKey(apiKey) : undefined)
     return this.connectorsSnapshot()
   }
 
@@ -1176,16 +1215,16 @@ class ConnectorSettingsModule {
     if (!value) return undefined
     try {
       const parsed: unknown = JSON.parse(value)
-      return parsed && typeof parsed === 'object'
-        ? (parsed as StoredCustomMcpOAuthState)
-        : undefined
+      if (!parsed || typeof parsed !== 'object') return undefined
+      const state = parsed as StoredCustomMcpOAuthState
+      clearUnboundOAuthCredentials(state)
+      return state
     } catch {
       return undefined
     }
   }
 
   private toConnectorViews(connectors: StoredConnectors | undefined): ConnectorView[] {
-    const disabled = new Set(connectors?.disabledConnectorIds ?? [])
     const autoAllow = new Set(connectors?.autoAllowIds ?? [])
 
     return CONNECTOR_CATALOG.map((meta) => ({
@@ -1195,7 +1234,7 @@ class ConnectorSettingsModule {
       description: meta.description,
       sources: meta.sources,
       requiresNcbi: meta.requiresNcbi,
-      enabled: !disabled.has(meta.id),
+      enabled: isBundledConnectorEnabled(meta.id, connectors),
       autoAllow: autoAllow.has(meta.id),
       group: meta.group ?? 'featured'
     })).sort((a, b) => a.displayName.localeCompare(b.displayName))
@@ -1314,6 +1353,9 @@ class ConnectorSettingsModule {
         : {}),
       reservedCustomServerIds: connectors?.pendingCustomServerDeletionIds ?? [],
       ncbi: this.ncbiView(connectors),
+      semanticScholar: {
+        hasApiKey: tryDecryptKey(connectors?.semanticScholarApiKeyRef) !== undefined
+      },
       openAlex: this.openAlexView(connectors)
     }
   }

@@ -1,6 +1,6 @@
 import { previewSharing, commitSharing } from './sharing'
 import { registerVerifiedPdfContent } from '../pdf-documents/identity'
-import type { PdfNativeAnnotationDraft } from './native-import-core'
+import type { PdfNativeAnnotationDraft } from '../../shared/pdf-annotations'
 import type { PdfSharingPreview, PdfSharingDecision } from '../../shared/pdf-annotations'
 import {
   bindingId,
@@ -584,7 +584,10 @@ class PdfAnnotationRepository {
     })
   }
 
-  async create(input: CreatePdfAnnotationRequest): Promise<PdfAnnotation> {
+  async create(
+    input: CreatePdfAnnotationRequest,
+    beforeWrite?: () => void
+  ): Promise<PdfAnnotation> {
     const request = createPdfAnnotationRequestSchema.parse(input)
     if (request.projectId !== request.target.source.projectId)
       throw new Error('PDF annotation source project does not match.')
@@ -605,6 +608,7 @@ class PdfAnnotationRepository {
           checksum: source.checksum
         })
         const binding = await ensureBinding(transaction, source)
+        beforeWrite?.()
         const row = await transaction.pdfAnnotation.create({
           data: {
             id: request.id,

@@ -4,6 +4,8 @@ import { captionKind } from './literature-pdf-caption-group.mjs'
 import { createHash } from 'node:crypto'
 import { Path2D } from '@napi-rs/canvas'
 import { OPS, Util, version } from 'pdfjs-dist/legacy/build/pdf.mjs'
+import { nativeRecoveryGroupDepth } from './literature-pdf-native-figure-recovery-profile.mjs'
+import { nativeCompositingPaintSpan } from './literature-pdf-native-compositing-profile.mjs'
 import { nativeClosedRuleFrames } from './literature-pdf-figure-connectivity.mjs'
 
 // Locate small tables missed by the detector. The structure model still owns
@@ -156,7 +158,9 @@ export function findCaptionedNumericTableRegions(items, rules, detectedRects = [
 // Keep closed stroke rectangles separate from table-rule discovery: a path's
 // bounding box does not prove four edges. Explicit closed outlines and four
 // separately painted, connected sides establish frames after exact clipping.
-export function collectClosedFigureFrames(operators, viewport, paintEvidence) {
+export function collectClosedFigureFrames(operators, viewport, paintEvidence, compositingProfile) {
+  const compositing = nativeCompositingPaintSpan(compositingProfile, operators, viewport)
+  if (compositingProfile !== undefined && !compositing) return []
   let transform = [1, 0, 0, 1, 0, 0],
     clip = [0, 0, viewport.width ?? Infinity, viewport.height ?? Infinity],
     pendingClip = false,
@@ -166,6 +170,7 @@ export function collectClosedFigureFrames(operators, viewport, paintEvidence) {
     strokeAlpha = 1,
     fillAlpha = 1
   const stack = [],
+    isolatedGroups = [],
     frames = [],
     sides = []
   const save = () =>
@@ -231,6 +236,7 @@ export function collectClosedFigureFrames(operators, viewport, paintEvidence) {
     }
   }
   for (const [i, op] of operators.fnArray.entries()) {
+    if (compositing && i >= compositing.begin && i <= compositing.end) continue
     frameOperationIndex = i
     // Optional native ownership evidence observes the same transform/clip
     // state as frame discovery. It does not change legacy frame selection.
@@ -279,6 +285,61 @@ export function collectClosedFigureFrames(operators, viewport, paintEvidence) {
         clip = intersectClip(rectangle(points))
       }
     }
+    // The symbol-axis observer separately closes every isolated group. Legacy
+    // frame callers neither request this state nor admit new operators.
+    if (paintEvidence?.isolatedGroups && op === OPS.beginGroup) {
+      const group = args?.[0],
+        matrix = Util.transform(viewport.transform, transform)
+      if (
+        pendingClip ||
+        isolatedGroups.length >= nativeRecoveryGroupDepth(paintEvidence) ||
+        !group ||
+        Object.keys(group).sort().join(',') !== 'bbox,isolated,knockout,matrix,smask' ||
+        group.matrix !== null ||
+        group.smask !== null ||
+        group.isolated !== true ||
+        group.knockout !== false ||
+        !Array.isArray(group.bbox) ||
+        group.bbox.length !== 4 ||
+        !group.bbox.every(Number.isFinite) ||
+        group.bbox[0] >= group.bbox[2] ||
+        group.bbox[1] >= group.bbox[3] ||
+        fillAlpha !== 1 ||
+        strokeAlpha !== 1 ||
+        !clip ||
+        !matrix.every(Number.isFinite)
+      ) {
+        paintEvidence.invalidIsolatedGroups = true
+        return []
+      }
+      const points = [
+        [group.bbox[0], group.bbox[1]],
+        [group.bbox[2], group.bbox[1]],
+        [group.bbox[2], group.bbox[3]],
+        [group.bbox[0], group.bbox[3]]
+      ]
+      for (const point of points) Util.applyTransform(point, matrix)
+      const rect = rectangle(points)
+      if (!rect) {
+        paintEvidence.invalidIsolatedGroups = true
+        return []
+      }
+      save()
+      clip = intersectClip(rect)
+      fillAlpha = strokeAlpha = 1
+      isolatedGroups.push({ begin: i, group })
+      paintEvidence.isolatedGroups.set(i, { begin: i, rect, clip: clip && [...clip] })
+      continue
+    } else if (paintEvidence?.isolatedGroups && op === OPS.endGroup) {
+      const previous = isolatedGroups.pop()
+      if (!previous || JSON.stringify(previous.group) !== JSON.stringify(args?.[0])) {
+        paintEvidence.invalidIsolatedGroups = true
+        return []
+      }
+      paintEvidence.isolatedGroups.get(previous.begin).end = i
+      restore()
+      continue
+    }
     if (op === OPS.save) save()
     else if (op === OPS.restore || op === OPS.paintFormXObjectEnd) restore()
     else if (op === OPS.transform) transform = Util.transform(transform, args)
@@ -315,7 +376,14 @@ export function collectClosedFigureFrames(operators, viewport, paintEvidence) {
     } else if (op === OPS.clip || op === OPS.eoClip) pendingClip = true
     else if (
       op === OPS.constructPath &&
-      [OPS.stroke, OPS.fill, OPS.fillStroke, OPS.eoFillStroke].includes(args[0]) &&
+      [
+        OPS.stroke,
+        OPS.fill,
+        OPS.fillStroke,
+        OPS.eoFillStroke,
+        OPS.closeFillStroke,
+        OPS.closeEOFillStroke
+      ].includes(args[0]) &&
       args[1]?.length === 1
     ) {
       const nativePath = args[1][0]
@@ -331,8 +399,12 @@ export function collectClosedFigureFrames(operators, viewport, paintEvidence) {
       if (args[0] !== OPS.fill && (!(strokeAlpha > 0) || !Number.isFinite(strokeAlpha))) continue
       // A fill-and-stroke operation really paints its closed perimeter. A
       // fill alone still requires the separate hollow-contour proof below.
+      // Closing paint variants use the same validators, which require an
+      // explicit closePath. The paint opcode alone does not prove a contour.
       if (
-        [OPS.fillStroke, OPS.eoFillStroke].includes(args[0]) &&
+        [OPS.fillStroke, OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke].includes(
+          args[0]
+        ) &&
         (!(lineWidth > 0) || !Number.isFinite(lineWidth))
       )
         continue
@@ -466,11 +538,10 @@ export function collectClosedFigureFrames(operators, viewport, paintEvidence) {
       // Rotate its exact commands to the corner-first form below; a trailing
       // move without a painted segment contributes no edge or frame evidence.
       if (
-        path.length === 47 &&
+        (path.length === 44 || (path.length === 47 && path[44] === 0)) &&
         path[0] === 0 &&
         path[3] === 1 &&
         path[43] === 4 &&
-        path[44] === 0 &&
         [6, 16, 26, 36].every((n) => path[n] === 2) &&
         [13, 23, 33].every((n) => path[n] === 1) &&
         path.every(Number.isFinite) &&

@@ -63,6 +63,11 @@ it('uses the packaging heap budget for Web builds in every workflow', () => {
   expect(scripts['build:web:compiled']).toBe(
     'npm run gen:web-api-map && node --max-old-space-size=8192 node_modules/vite/bin/vite.js build --config vite.web.config.ts'
   )
+  expect(
+    scripts['build:e2e']
+      .split(' && ')
+      .filter((command: string) => command === 'npm run build:web:compiled')
+  ).toHaveLength(1)
 })
 
 it('checks the reported Windows failures in the blocking PR core job', () => {
@@ -101,10 +106,7 @@ it('checks the reported Windows failures in the blocking PR core job', () => {
 })
 
 describe('trusted supplemental selection', () => {
-  it.each([
-    'packages/connector-builtins/src/genes-ontology.ts',
-    'src/main/locale/main-process-messages.ts'
-  ])(
+  it.each(['src/main/locale/main-process-messages.ts'])(
     'keeps portable and core journey coverage without unrelated supplemental groups: %s',
     (path) => {
       const plan = resolvePlan([path])
@@ -140,7 +142,11 @@ describe('trusted supplemental selection', () => {
       graph
     )
     expect(modules.mode).toBe('selective')
-    expect(modules.modules).toContain('settings_backend_resolution')
+    // Reviewed boundaries route consumers for capabilities only, not their test inventories.
+    expect(modules.modules).not.toContain('settings_backend_resolution')
+    expect(modules.reasonChains).toContain(
+      'settings_provider_accounts -> settings_backend_resolution -> capability routing only'
+    )
     // Even a candidate with no supplemental lanes must gain its consumers' mandatory coverage.
     const candidate = classifyChanges(
       changesFor(['packages/connector-builtins/src/genes-ontology.ts'])
@@ -151,7 +157,7 @@ describe('trusted supplemental selection', () => {
     expect(macosGroupsForPlan(plan)).toEqual(expect.arrayContaining(['regressions', 'delegation']))
   })
 
-  it('omits idle presentation jobs but retains runtime and delegation coverage for mixed ontology/Notebook changes', () => {
+  it('retains full validation for the expanded connector boundary mixed with Notebook changes', () => {
     const changes = changesFor([
       'packages/connector-builtins/src/genes-ontology.ts',
       'packages/connector-builtins/src/genes-ontology.test.ts',
@@ -159,17 +165,14 @@ describe('trusted supplemental selection', () => {
     ])
     const modules = createAffectedTestPlan(changes, graph)
     const plan = resolveAuthoritativePlan(classifyChanges(changes), modules)
-    expect(plan.mode).toBe('selective')
-    expect(modules.modules).toEqual(['connector_builtins', 'notebook_application'])
-    expect(modules.testFiles).toEqual(
-      expect.arrayContaining([
-        'src/main/connectors/registry.test.ts',
-        'src/main/connectors/service.test.ts',
-        'src/main/connectors/skill-doc.test.ts',
-        'src/main/notebook/local-rpc-server.mcpcall.test.ts'
-      ])
+    expect(modules.mode).toBe('full')
+    expect(modules.reasonChains).toEqual([
+      expect.stringContaining('Optional research providers expand the reviewed source boundary')
+    ])
+    expect(plan.mode).toBe('full')
+    expect(toGitHubOutputPlan(plan).macosGroups).toEqual(
+      expect.arrayContaining(['journeys', 'presentation', 'regressions', 'delegation'])
     )
-    expect(toGitHubOutputPlan(plan).macosGroups).toEqual(['journeys', 'regressions', 'delegation'])
   })
 
   it('runs the whole browser lane without forcing unrelated Vitest or Electron groups', () => {
@@ -186,7 +189,7 @@ describe('trusted supplemental selection', () => {
       'e2e/browser/settings-undo.spec.ts',
       'packages/connector-builtins/src/genes-ontology.ts'
     ])
-    expect(mixed.mode).toBe('selective')
+    expect(mixed.mode).toBe('full')
     expect(mixed.lanes).toContain('e2e_visual_macos')
     expect(mixed.bundles).toContain('unit')
     const native = resolvePlan([
@@ -196,6 +199,17 @@ describe('trusted supplemental selection', () => {
     expect(native.lanes).toEqual(
       expect.arrayContaining(['e2e_functional_windows', 'e2e_workspace_windows'])
     )
+  })
+
+  it('installs Chromium before every Mac group that launches a browser', () => {
+    const steps = scheduled.jobs.regression.steps
+    const install = steps.find(({ name }) => name === 'Install headless Chromium')!
+    expect(install.run).toBe('npx playwright install chromium --only-shell')
+    expect(install.if).toBe(
+      "${{ matrix.group == 'functional' || matrix.group == 'presentation' || matrix.group == 'presentation-screening' }}"
+    )
+    for (const id of ['functional', 'presentation', 'presentation_screening'])
+      expect(steps.indexOf(install)).toBeLessThan(steps.findIndex((step) => step.id === id))
   })
 
   it.skipIf(process.platform === 'win32')(
@@ -224,10 +238,26 @@ describe('trusted supplemental selection', () => {
     }
   )
 
+  it('routes the shared Electron harness to every desktop group and its declared readers', () => {
+    const changes = changesFor(['e2e/fixtures/electron-app.ts'])
+    const plan = resolvePlan(['e2e/fixtures/electron-app.ts'])
+    expect(plan.mode).toBe('selective')
+    expect(macosGroupsForPlan(plan)).toEqual([
+      'journeys',
+      'presentation',
+      'regressions',
+      'delegation'
+    ])
+    expect(createAffectedTestPlan(changes, graph).testFiles).toEqual([
+      'scripts/electron-app-fixture.test.ts',
+      'scripts/electron-fixture-teardown.test.ts'
+    ])
+  })
+
   it.each([
     'src/main/artifacts/unregistered-export.ts',
     'src/renderer/src/pages/settings/unregistered-page.tsx',
-    'e2e/fixtures/electron-app.ts',
+    'e2e/fixtures/new-unattributed-helper.ts',
     'e2e/new-unknown.spec.ts',
     'package.json',
     'e2e/playwright.browser.config.ts',
@@ -305,7 +335,7 @@ describe('independent source regression', () => {
     { group: 'functional', shard: 1 },
     { group: 'workspace', shard: 1 },
     { group: 'presentation', shard: 1 },
-    ...[1, 2, 3].map((shard) => ({ group: 'regressions', shard })),
+    ...[1, 2, 3, 4, 5, 6].map((shard) => ({ group: 'regressions', shard })),
     { group: 'capacity', shard: 1 },
     { group: 'delegation', shard: 1 }
   ]
@@ -332,8 +362,8 @@ describe('independent source regression', () => {
     }
   }
 
-  it('selects all eight jobs for full coverage even with a diagnostic shard input', () => {
-    for (const shard of ['all', '1', '2', '3'])
+  it('selects all eleven jobs for full coverage even with a diagnostic shard input', () => {
+    for (const shard of ['all', '1', '2', '3', '4', '5', '6'])
       expect(selectGroups('full', shard)).toEqual({ status: 0, matrix: { include: full } })
     expect(scheduled.jobs.regression.strategy?.matrix).toBe(
       '${{ fromJSON(needs.macos_setup.outputs.matrix) }}'
@@ -356,7 +386,7 @@ describe('independent source regression', () => {
       'presentation-screening'
     ])
       expect(selectGroups(group)).toEqual({ status: 0, matrix: { include: [{ group, shard: 1 }] } })
-    for (const shard of ['1', '2', '3'])
+    for (const shard of ['1', '2', '3', '4', '5', '6'])
       expect(selectGroups('regressions', shard)).toEqual({
         status: 0,
         matrix: { include: [{ group: 'regressions', shard: Number(shard) }] }
@@ -366,7 +396,7 @@ describe('independent source regression', () => {
     })
     for (const [mode, shard] of [
       ['invalid', 'all'],
-      ['full', '4'],
+      ['full', '7'],
       ['full', '$(exit 0)']
     ])
       expect(selectGroups(mode, shard).status).not.toBe(0)
@@ -392,7 +422,7 @@ describe('independent source regression', () => {
       'runtime-evidence',
       'static-impact'
     ])
-    expect(dispatch.inputs.shard.options).toEqual(['all', '1', '2', '3'])
+    expect(dispatch.inputs.shard.options).toEqual(['all', '1', '2', '3', '4', '5', '6'])
     expect(scheduled.permissions).toEqual({ actions: 'read', contents: 'read' })
     expect(scheduled.on).not.toHaveProperty('push')
     expect(scheduled.jobs).not.toHaveProperty('plan')
@@ -413,7 +443,7 @@ describe('independent source regression', () => {
     expect(consumer['runs-on']).toBe(setup['runs-on'])
     expect(setup.needs).toBeUndefined()
     expect(setup.steps.filter(({ run }) => run === 'npm run build:e2e')).toHaveLength(1)
-    expect(setup.steps.filter(({ run }) => run === 'npm run build:web')).toHaveLength(1)
+    expect(setup.steps.some(({ run }) => /npm run build:web\b/.test(run ?? ''))).toBe(false)
     expect(
       consumer.steps.some(({ run }) => run?.includes('npm-ci') || run?.includes('npm run build:'))
     ).toBe(false)
@@ -433,7 +463,7 @@ describe('independent source regression', () => {
   })
 
   it.skipIf(process.platform === 'win32')(
-    'preserves PR defaults and separates capacity from all three ordinary shards',
+    'preserves PR defaults and separates capacity from all six ordinary shards',
     () => {
       const run = (group: string, capacity: string, shard = ''): SpawnSyncReturns<string> =>
         spawnSync('bash', ['-e', '-c', 'npm() { printf "%s\\n" "$@"; };\n' + regression.run!], {
@@ -450,7 +480,7 @@ describe('independent source regression', () => {
       expect(ordinary.status).toBe(0)
       expect(ordinary.stdout).toContain('--grep-invert\n@capacity')
       expect(ordinary.stdout).toContain('--global-timeout=1200000')
-      for (const shard of ['1/3', '2/3', '3/3']) {
+      for (const shard of ['1/6', '2/6', '3/6', '4/6', '5/6', '6/6']) {
         const result = run('regressions', 'false', shard)
         expect(result.status).toBe(0)
         expect(result.stdout).toContain(`--shard=${shard}`)
@@ -474,7 +504,7 @@ describe('independent source regression', () => {
       expect(call.with).toEqual({
         group: '${{ matrix.group }}',
         'include-capacity': 'false',
-        shard: "${{ matrix.group == 'regressions' && format('{0}/3', matrix.shard) || '' }}"
+        shard: "${{ matrix.group == 'regressions' && format('{0}/6', matrix.shard) || '' }}"
       })
     }
   )
@@ -633,7 +663,15 @@ it('shares complete installed-consumer checks with queue/manual runs and reports
   expect(
     manual.jobs.isolation.steps.find((step) => step.uses === './.github/actions/verify-packages')
       ?.with
-  ).toEqual({ selection: '${{ inputs.packages }}' })
+  ).toEqual({ selection: '${{ inputs.packages }}', 'source-tests': '${{ inputs.source_tests }}' })
+  const action = load(readFileSync('.github/actions/verify-packages/action.yml', 'utf8')) as {
+    inputs: Record<string, { default: string }>
+  }
+  expect(action.inputs['source-tests'].default).toBe('true')
+  expect(
+    scheduled.jobs.packages.steps.find((step) => step.uses === './.github/actions/verify-packages')
+      ?.with?.['source-tests']
+  ).toBeUndefined()
 })
 
 it('runs complete portable discovery with no package exclusions and defers thresholds until all host and package reports', () => {
@@ -759,6 +797,15 @@ it('offers a focused scheduled-fixes dry-run on the real Mac job', () => {
     ({ name }) => name === 'Test scheduled regression fixes'
   )!
   expect(step.if).toContain("matrix.group == 'scheduled-fixes'")
+  expect(scheduled.on.workflow_dispatch).toHaveProperty(
+    'inputs.test_pattern',
+    expect.objectContaining({
+      type: 'string',
+      default: ''
+    })
+  )
+  expect(step.env?.TEST_PATTERN).toBe('${{ inputs.test_pattern }}')
+  expect(step.run).toContain('--grep "$TEST_PATTERN"')
   for (const file of [
     'session-turn-outcome',
     'auto-review-stop-resume',

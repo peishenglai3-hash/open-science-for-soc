@@ -37,7 +37,7 @@ test('routes a Settings UI fixed model through production Delegation and Usage',
       const snapshot = await window.api.settings.upsertProvider({
         type: 'custom',
         name: providerName,
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['chat-completions'],
         baseUrl: 'http://127.0.0.1:9/v1',
         model,
         key: 'subagent-e2e-key',
@@ -62,7 +62,7 @@ test('routes a Settings UI fixed model through production Delegation and Usage',
   await model.click()
   await page
     .getByRole('option', {
-      name: `${SUBAGENT_MODEL} · ${SUBAGENT_PROVIDER_NAME}`
+      name: `${SUBAGENT_MODEL} / ${SUBAGENT_PROVIDER_NAME}`
     })
     .click()
   await expect(model).toContainText(SUBAGENT_MODEL)
@@ -243,7 +243,7 @@ test('fails closed, restores the fixed model, and routes Specialist but not Acti
       const snapshot = await window.api.settings.upsertProvider({
         type: 'custom',
         name: providerName,
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['chat-completions'],
         baseUrl: 'http://127.0.0.1:9/v1',
         model,
         key: 'subagent-e2e-key',
@@ -279,7 +279,7 @@ test('fails closed, restores the fixed model, and routes Specialist but not Acti
     .click()
   await settings.getByRole('button', { name: 'Expand Subagent settings', exact: true }).click()
   await settings.getByRole('combobox', { name: 'Subagent model Model' }).click()
-  await page.getByRole('option', { name: `${SUBAGENT_MODEL} · ${SUBAGENT_PROVIDER_NAME}` }).click()
+  await page.getByRole('option', { name: `${SUBAGENT_MODEL} / ${SUBAGENT_PROVIDER_NAME}` }).click()
   await settings.getByRole('button', { name: 'Close settings' }).click()
   const recordsBeforeUnavailable = await page.evaluate(async () =>
     (await window.api.sessions.loadAll()).sessions.reduce(
@@ -326,7 +326,7 @@ test('fails closed, restores the fixed model, and routes Specialist but not Acti
         id,
         type: 'custom',
         name: providerName,
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['chat-completions'],
         baseUrl: 'http://127.0.0.1:9/v1',
         model,
         key: 'subagent-e2e-key',

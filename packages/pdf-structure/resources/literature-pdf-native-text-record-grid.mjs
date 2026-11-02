@@ -1,4 +1,8 @@
 /* eslint-disable @typescript-eslint/explicit-function-return-type */
+import {
+  refineNativeTableBoundaryInk,
+  recoverNativeClippedHeaderCrop
+} from './literature-pdf-native-table-boundary-ink.mjs'
 import { OPS } from 'pdfjs-dist/legacy/build/pdf.mjs'
 import { hasDisjointNativeTableSlots } from './literature-pdf-native-table-ambiguity.mjs'
 import { captionKind } from './literature-pdf-caption-group.mjs'
@@ -354,6 +358,38 @@ export function recoverNativeTextRecordGrid(table, items, captions, rules) {
     !hasUniqueRecordTokens(source, [header, ...records])
   )
     return
+  // Fused header packets do not prove that independently repeated body leaves
+  // disappear. Decline an override that erases a model boundary supported by
+  // every complete physical record; do not split the headings or invent owners.
+  if (model.length > cuts.length - 1) {
+    const modelCuts = model.slice(1).map((o, n) => crop[0] + (model[n].rect[2] + o.rect[0]) / 2),
+      edges = [crop[0], ...modelCuts, crop[2]]
+    if (
+      edges.every(Number.isFinite) &&
+      edges.slice(1).every((x, n) => x > edges[n]) &&
+      physical.every(
+        (row) =>
+          edges
+            .slice(1)
+            .every((x, n) => row.some((i) => i.rect[0] >= edges[n] && i.rect[2] <= x)) &&
+          row.every((i) => edges.slice(1).some((x, n) => i.rect[0] >= edges[n] && i.rect[2] <= x))
+      ) &&
+      modelCuts.some(
+        (cut) =>
+          !cuts
+            .slice(1, -1)
+            .some((own) =>
+              physical.every((row) =>
+                row.every(
+                  (i) =>
+                    i.rect[2] <= own === i.rect[2] <= cut && i.rect[0] >= own === i.rect[0] >= cut
+                )
+              )
+            )
+      )
+    )
+      return
+  }
   // Ruled prose faces may contain several physical lines of one record.
   // Parameter/value groups instead prove independent complete pairs on every
   // baseline, with at least two pairs in each native band and ink-free dividers.
@@ -748,6 +784,8 @@ export function proveNativeTableReadingOrder(table, wholeProof, items, rules, co
 }
 
 export function completeNativeTableVisualCrop(table, wholeProof, items, rules, context) {
+  const header = recoverNativeClippedHeaderCrop(table, context)
+  if (header) return { ...table, cropRect: header }
   const valid = (r) =>
     Array.isArray(r) && r.length === 4 && r.every(Number.isFinite) && r[2] > r[0] && r[3] > r[1]
   if (
@@ -769,6 +807,8 @@ export function completeNativeTableVisualCrop(table, wholeProof, items, rules, c
     typeof context.viewport?.convertToViewportPoint !== 'function'
   )
     return
+  const boundary = refineNativeTableBoundaryInk(table, rules, context)
+  if (boundary) return boundary
   const glyphTrim = trimNativeCaptionGlyphInk(table, context)
   if (glyphTrim) return glyphTrim
   const simple =

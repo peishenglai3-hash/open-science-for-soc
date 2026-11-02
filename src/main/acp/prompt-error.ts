@@ -1,9 +1,8 @@
+import { classifyFailure } from '../../shared/failure/classify'
 import {
-  isClaudeApiConnectionFailure,
-  isClaudeApiResponseInterruption,
   PROVIDER_CONNECTION_FAILED_PREFIX,
   PROVIDER_RESOURCE_NOT_FOUND_PREFIX
-} from '../../shared/run-error-classification'
+} from '../../shared/failure/messages'
 
 // Turns an agent prompt failure into user-visible text. Agents (opencode) relay an upstream provider
 // HTTP error wrapped as a JSON-RPC failure like
@@ -20,7 +19,7 @@ export type PromptErrorContext = {
 }
 
 // The innermost provider detail pulled from a wrapped error message.
-type UpstreamDetail = { text: string; type?: string }
+type UpstreamDetail = { text: string; type?: string; status?: number }
 
 // The "resource not found" family. The agent renders the provider's HTTP error with an English status
 // label (`Not Found:`) and the provider's structured error type is an ASCII slug (`resource_not_found`),
@@ -39,7 +38,7 @@ const rawErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error)
 
 // The JSON-RPC code the agent attached, when present. -32002 is the ACP "resource not found" protocol
-// code (a missing session), which must not be confused with an upstream provider not-found.
+// code (for example a missing file or session), not an upstream provider HTTP status.
 const errorCode = (error: unknown): number | undefined => {
   const code = (error as { code?: unknown } | null)?.code
 
@@ -105,7 +104,7 @@ const extractUpstreamDetail = (message: string): UpstreamDetail | undefined => {
 
   try {
     const parsed = JSON.parse(jsonText) as {
-      error?: { message?: unknown; type?: unknown }
+      error?: { message?: unknown; type?: unknown; status?: unknown }
       message?: unknown
     }
     const err = parsed.error
@@ -116,7 +115,18 @@ const extractUpstreamDetail = (message: string): UpstreamDetail | undefined => {
 
     if (!text) return undefined
 
-    return { text, type: typeof err?.type === 'string' ? err.type : undefined }
+    return {
+      text,
+      type: typeof err?.type === 'string' ? err.type : undefined,
+      status:
+        err?.type === 'upstream_error' &&
+        typeof err.status === 'number' &&
+        Number.isInteger(err.status) &&
+        err.status >= 400 &&
+        err.status <= 599
+          ? err.status
+          : undefined
+    }
   } catch {
     return undefined
   }
@@ -155,8 +165,10 @@ const isClaudeProviderApiError = (error: unknown): boolean =>
   error.name === 'RequestError' &&
   errorCode(error) === -32603 &&
   (CLAUDE_PROVIDER_CLIENT_ERROR_PATTERN.test(error.message) ||
-    isClaudeApiConnectionFailure(error.message) ||
-    isClaudeApiResponseInterruption(error.message))
+    classifyFailure({ origin: 'agent-runtime', text: error.message }).reason ===
+      'service/connection-failed' ||
+    classifyFailure({ origin: 'agent-runtime', text: error.message }).reason ===
+      'service/response-interrupted')
 
 const connectionFailureDetail = (message: string): string | undefined =>
   message.match(/\(([A-Za-z][A-Za-z0-9_-]{0,63})\)\s*$/)?.[1]
@@ -164,10 +176,14 @@ const connectionFailureDetail = (message: string): string | undefined =>
 // Produces the session-visible error text for a failed prompt: actionable guidance for recognized
 // provider configuration/connectivity failures, else the original message untouched.
 export const describePromptError = (error: unknown, ctx: PromptErrorContext = {}): string => {
+  if (isAgentAuthenticationFailure(error)) return 'Authentication required'
   const raw = rawErrorMessage(error)
   const detail = extractUpstreamDetail(raw)
 
-  if (isClaudeProviderApiError(error) && isClaudeApiConnectionFailure(raw)) {
+  if (
+    isClaudeProviderApiError(error) &&
+    classifyFailure({ origin: 'agent-runtime', text: raw }).reason === 'service/connection-failed'
+  ) {
     const modelPart = ctx.model ? ` for model "${ctx.model}"` : ''
     const connectionDetail = connectionFailureDetail(raw)
 
@@ -180,6 +196,48 @@ export const describePromptError = (error: unknown, ctx: PromptErrorContext = {}
   const modelPart = ctx.model ? ` for model "${ctx.model}"` : ''
 
   return `${PROVIDER_RESOURCE_NOT_FOUND_PREFIX}${modelPart}. The model name or endpoint is likely incorrect — check it in Settings → Model. Provider response: ${providerText}`
+}
+
+// Only interpret protocol/provider authentication signals at the ACP boundary. A 403, a tool's
+// business response, or an OAuth client-registration error cannot be repaired by account sign-in.
+export const isAgentAuthenticationFailure = (error: unknown): boolean => {
+  if (!(error instanceof Error) || error.name !== 'RequestError') return false
+  if (errorCode(error) === -32000)
+    return (
+      error.message === 'Authentication required' ||
+      error.message.startsWith('Authentication required: ')
+    )
+  if (errorCode(error) !== -32603) return false
+  const data = (error as Error & { data?: Record<string, unknown> }).data
+  if (data?.error === 'invalid_client' || data?.errorKind === 'invalid_client') return false
+  if (
+    isClaudeProviderApiError(error) &&
+    /^\s*Internal error:\s*API Error:\s*401\b/i.test(error.message)
+  )
+    return true
+  if (!data || typeof data !== 'object') return false
+  // The pinned Codex adapter keeps configured accounts on the internal-error path, even when
+  // their credentials are rejected. Match its structured authentication test rather than prose.
+  const codexErrorInfo = data.codexErrorInfo
+  if (codexErrorInfo === 'unauthorized') return true
+  if (codexErrorInfo !== null && typeof codexErrorInfo === 'object') {
+    const detail = Object.values(codexErrorInfo)[0]
+    if (detail !== null && typeof detail === 'object' && detail.httpStatusCode === 401) return true
+  }
+  if (data.details === 'workspace routing discovery unauthorized (401)') return true
+  return isApiError(error) && (data.statusCode === 401 || data.status === 401)
+}
+
+export const withAgentAuthenticationRecovery = async <T>(
+  operation: () => Promise<T>
+): Promise<T> => {
+  try {
+    return await operation()
+  } catch (error) {
+    if (isAgentAuthenticationFailure(error))
+      throw new Error('Authentication required', { cause: error })
+    throw error
+  }
 }
 
 // The agent's structured tag for a failure it relayed from the upstream model provider (as opposed to
@@ -201,20 +259,9 @@ const isProviderErrorKind = (error: unknown): boolean => {
   }
 }
 
-// Whether a failed prompt originates from the model provider (an upstream LLM/HTTP failure the agent
-// relayed) rather than from the app's own ACP layer. Provider failures are the user's/provider's to
-// resolve (wrong key, rate limit, quota, model id, a provider 5xx), so the renderer does NOT offer a
-// "Report error → GitHub issue" affordance for them — only genuinely unexpected ACP-layer exceptions
-// are worth a bug report. Determined structurally, from the signals the agent attaches, so it needs no
-// broad human-message pattern matching:
-//   - the agent tagged the failure as an upstream `APIError` (covers auth/rate/quota/5xx/etc.), or
-//   - the agent tagged `data.errorKind: 'provider-error'` (the bridges' machine-readable marker), or
-//   - Codex attached its explicit serverOverloaded detail to an ACP internal error, or
-//   - Claude Code emitted its fixed ACP internal wrapper with an explicit provider 4xx status or
-//     a recognized transport failure, or
-//   - it is a provider "resource not found" (wrong model id / endpoint), which requires the same
-//     upstream signal (see isProviderNotFound) and is never a bare ACP protocol not-found.
-export const isProviderPromptError = (error: unknown): boolean => {
+// Collect upstream ownership from framework wire markers.
+const hasProviderOrigin = (error: unknown): boolean => {
+  if (isAgentAuthenticationFailure(error)) return true
   if (isApiError(error)) return true
   if (isProviderErrorKind(error)) return true
   if (isClaudeProviderApiError(error)) return true
@@ -240,7 +287,11 @@ export const isOpenCodeSessionServiceFailure = (error: unknown): boolean => {
   if (typeof data !== 'object' || data === null || Array.isArray(data)) return false
 
   const detail = data as { service?: unknown; errorName?: unknown }
-  return detail.service === 'session' && detail.errorName !== 'ContextOverflowError'
+  return (
+    detail.service === 'session' &&
+    detail.errorName !== 'ContextOverflowError' &&
+    detail.errorName !== 'APIError'
+  )
 }
 
 // OpenCode's native summary can fail before producing provider error text. Use its typed tag.
@@ -251,4 +302,85 @@ export const isOpenCodeContextOverflow = (error: unknown): boolean => {
     data?.service === 'session' &&
     data.errorName === 'ContextOverflowError'
   )
+}
+
+// Normalize framework-specific wire fields once; classification never needs to inspect an Error.
+export const collectPromptFailureFacts = (
+  error: unknown,
+  context: PromptErrorContext = {}
+): import('../../shared/failure/contract').FailureFacts => {
+  const record = (value: unknown): Record<string, unknown> =>
+    value !== null && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {}
+  const top = record(error)
+  const data = record(top.data)
+  const codex = record(data.codexErrorInfo)
+  const detail = record(Object.values(codex)[0])
+  const text = rawErrorMessage(error)
+  const upstream = extractUpstreamDetail(text)
+  const explicitStatus = [
+    data.statusCode,
+    data.status,
+    detail.httpStatusCode,
+    top.status,
+    top.statusCode
+  ].find(
+    (value): value is number =>
+      typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599
+  )
+  const apiWrapper =
+    error instanceof Error && error.name === 'RequestError' && errorCode(error) === -32603
+      ? text.match(/^\s*internal error:\s*api error:\s*([45]\d{2})\b/i)
+      : undefined
+  const transportStatus = explicitStatus ?? (apiWrapper ? Number(apiWrapper[1]) : undefined)
+  const codexKind =
+    typeof data.codexErrorInfo === 'string' ? data.codexErrorInfo : Object.keys(codex)[0]
+  const codexProvider =
+    errorCode(error) === -32603 &&
+    [
+      'serverOverloaded',
+      'usageLimitExceeded',
+      'unauthorized',
+      'httpConnectionFailed',
+      'responseStreamConnectionFailed',
+      'responseStreamDisconnected',
+      'responseTooManyFailedAttempts',
+      'contextWindowExceeded'
+    ].includes(codexKind ?? '')
+  const origin = isOpenCodeSessionServiceFailure(error)
+    ? 'session'
+    : hasProviderOrigin(error) || apiWrapper || codexProvider
+      ? 'provider'
+      : 'agent-runtime'
+  // Our compatibility bridge deliberately transports deterministic upstream failures as HTTP 400.
+  // Only its typed envelope, inside a confirmed provider failure, can restore the original status.
+  const status =
+    origin === 'provider' && transportStatus === 400 && upstream?.status !== undefined
+      ? upstream.status
+      : transportStatus
+  const code =
+    origin === 'agent-runtime' && top.code === -32002
+      ? top.code
+      : isOpenCodeContextOverflow(error) || codexKind === 'contextWindowExceeded'
+        ? 'ContextOverflowError'
+        : isAgentAuthenticationFailure(error)
+          ? 'authentication_error'
+          : codexKind === 'usageLimitExceeded'
+            ? 'quota_exceeded'
+            : data.codexErrorInfo === 'serverOverloaded'
+              ? 'overloaded_error'
+              : (upstream?.type ??
+                (data.errorKind !== 'unknown' ? data.errorKind : undefined) ??
+                codexKind ??
+                top.code)
+  return {
+    origin,
+    ...(status === undefined ? {} : { status }),
+    ...(typeof code === 'string' || typeof code === 'number' ? { code } : {}),
+    ...(typeof data.provider === 'string' ? { provider: data.provider } : {}),
+    ...(context.model ? { model: context.model } : {}),
+    ...(typeof data.requestId === 'string' ? { requestId: data.requestId } : {}),
+    text
+  }
 }

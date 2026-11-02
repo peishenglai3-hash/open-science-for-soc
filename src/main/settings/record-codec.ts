@@ -1,13 +1,17 @@
+import {
+  decodeStoredModelProtocol,
+  encodeStoredModelProtocol
+} from '../../shared/model-protocol-storage'
 import { normalizeLoopbackOAuthRedirectUri } from '@aipoch/connector-mcp-client/oauth-redirect'
 import { createLogger } from '@aipoch/diagnostics/node'
 import { isCustomConnectorName, toCustomConnectorName } from '../../shared/custom-connector'
 import type { PackageMirror } from '../../shared/mirror'
-import type { ChatApiEndpoint } from '../../shared/model-preference-contract'
-import { isOfficialVendorId } from '../../shared/provider-registry'
+import { type ModelProtocol, isOfficialVendorId } from '@aipoch/providers'
 import {
   isCustomReasoningEffortTransport,
   isReasoningEffortPresetSetting
 } from '../../shared/reasoning-effort'
+
 import type {
   ClaudeInfo,
   ProviderType,
@@ -137,16 +141,9 @@ const sanitizeValidationFailure = (value: unknown): ProviderValidationFailure | 
 const sanitizeValidationTarget = (value: unknown): ProviderValidationTarget | undefined => {
   if (!isRecord(value)) return undefined
   const model = asString(value.model)
-  const endpoint = asString(value.endpoint)
-  if (!model && endpoint !== 'anthropic' && endpoint !== 'openai' && endpoint !== 'responses') {
-    return undefined
-  }
-  return {
-    ...(model ? { model } : {}),
-    ...(endpoint === 'anthropic' || endpoint === 'openai' || endpoint === 'responses'
-      ? { endpoint }
-      : {})
-  }
+  const endpoint = decodeStoredModelProtocol(value.endpoint)
+  if (!model && !endpoint) return undefined
+  return { ...(model ? { model } : {}), ...(endpoint ? { endpoint } : {}) }
 }
 
 // Rebuild one provider from known fields and durable credential references only.
@@ -224,19 +221,16 @@ export const sanitizeProvider = (value: unknown): StoredProvider | undefined => 
 
   // Migrate the removed scalar apiType to the explicit endpoint array.
   const rawEndpoints = Array.isArray(value.apiEndpoints) ? value.apiEndpoints : []
-  const knownEndpoints = rawEndpoints.filter(
-    (entry): entry is ChatApiEndpoint =>
-      entry === 'anthropic' || entry === 'openai' || entry === 'responses'
-  )
-  const legacyApiType = asString(value.apiType)
-  const apiEndpoints: ChatApiEndpoint[] =
+  const knownEndpoints = rawEndpoints
+    .map(decodeStoredModelProtocol)
+    .filter((entry): entry is ModelProtocol => entry !== undefined)
+  const legacyApiType = decodeStoredModelProtocol(value.apiType)
+  const apiEndpoints: ModelProtocol[] =
     knownEndpoints.length > 0
       ? [...new Set(knownEndpoints)]
-      : legacyApiType === 'both'
-        ? ['anthropic', 'openai']
-        : legacyApiType === 'anthropic' ||
-            legacyApiType === 'openai' ||
-            legacyApiType === 'responses'
+      : value.apiType === 'both'
+        ? ['messages', 'chat-completions']
+        : legacyApiType
           ? [legacyApiType]
           : []
 
@@ -392,6 +386,8 @@ export const sanitizeConnectors = (value: unknown): StoredConnectors | undefined
   }
   const contactEmail = asString(value.contactEmail)
   const ncbiApiKeyRef = asString(value.ncbiApiKeyRef)
+  const semanticScholarApiKeyRef = asString(value.semanticScholarApiKeyRef)
+  if (semanticScholarApiKeyRef) connectors.semanticScholarApiKeyRef = semanticScholarApiKeyRef
   const openAlexApiKeyRef = asString(value.openAlexApiKeyRef)
   if (contactEmail) connectors.contactEmail = contactEmail
   if (ncbiApiKeyRef) connectors.ncbiApiKeyRef = ncbiApiKeyRef
@@ -400,6 +396,8 @@ export const sanitizeConnectors = (value: unknown): StoredConnectors | undefined
   if (blockedToolIds.length) connectors.blockedToolIds = blockedToolIds
   const askToolIds = asStringArray(value.askToolIds)
   if (askToolIds.length) connectors.askToolIds = askToolIds
+  const enabledConnectorIds = asStringArray(value.enabledConnectorIds)
+  if (enabledConnectorIds.length) connectors.enabledConnectorIds = [...new Set(enabledConnectorIds)]
   const disabledConnectorIds = asStringArray(value.disabledConnectorIds)
   if (disabledConnectorIds.length) {
     connectors.disabledConnectorIds = [...new Set(disabledConnectorIds)]
@@ -434,4 +432,36 @@ export const sanitizePackageMirror = (value: unknown): PackageMirror | undefined
   if (cranMirror) result.cranMirror = cranMirror
   if (caBundle) result.caBundle = caBundle
   return Object.keys(result).length > 0 ? result : undefined
+}
+
+/** Encode protocol-bearing fields without rewriting other provider data. */
+export const encodeProviderProtocolsForStorage = (value: unknown): unknown => {
+  if (!isRecord(value)) return value
+  const endpoint = (raw: unknown): unknown => {
+    const protocol = decodeStoredModelProtocol(raw)
+    return protocol ? encodeStoredModelProtocol(protocol) : raw
+  }
+  const target = (raw: unknown): unknown =>
+    isRecord(raw) && Object.hasOwn(raw, 'endpoint')
+      ? { ...raw, endpoint: endpoint(raw.endpoint) }
+      : raw
+  const failure = value.lastValidationFailure
+  return {
+    ...value,
+    ...(Array.isArray(value.apiEndpoints)
+      ? { apiEndpoints: value.apiEndpoints.map(endpoint) }
+      : {}),
+    ...(Object.hasOwn(value, 'lastValidatedTarget')
+      ? { lastValidatedTarget: target(value.lastValidatedTarget) }
+      : {}),
+    ...(isRecord(failure)
+      ? {
+          lastValidationFailure: {
+            ...failure,
+            ...(Object.hasOwn(failure, 'target') ? { target: target(failure.target) } : {}),
+            ...(Array.isArray(failure.targets) ? { targets: failure.targets.map(target) } : {})
+          }
+        }
+      : {})
+  }
 }

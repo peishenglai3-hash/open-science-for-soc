@@ -7,13 +7,18 @@ import { join } from 'node:path'
 import { PassThrough, Readable, Writable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { claudeCodeFramework, type ResolvedAgentBackend } from '../agent-framework'
+import {
+  claudeCodeFramework,
+  opencodeFramework,
+  type ResolvedAgentBackend
+} from '../agent-framework'
 import {
   AcpAgentConnectionAdapter,
   type AcpAgentConnectionCandidate,
   type AcpAgentConnectionHooks
 } from './agent-connection-adapter'
 import { AcpBackendGenerationOwner } from './backend-generation-owner'
+import { acquireRuntimeDirectorySync } from '../runtime-ownership'
 import {
   AcpConnectionResourceOwner,
   type AcpConnectionResourceAttempt
@@ -25,7 +30,12 @@ const terminateProcessTree = vi.hoisted(() =>
     return { reaped: true }
   })
 )
-vi.mock('../process-tree', () => ({ terminateProcessTree }))
+const startService = vi.hoisted(() => vi.fn())
+vi.mock('./opencode-service', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./opencode-service')>()),
+  startOpenCodeService: startService
+}))
+vi.mock('../process-tree', () => ({ terminateProcessTree, onProcessTreeReaped: vi.fn() }))
 
 afterEach(() => {
   vi.clearAllMocks()
@@ -123,6 +133,328 @@ const openCandidate = async (
 }
 
 describe('AcpAgentConnectionAdapter', () => {
+  it('classifies OpenCode 1.x replay before SDK observers receive summary chunks', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-compaction-'))
+    const process = new FakeAgentProcess()
+    const connectionHooks = hooks()
+    vi.mocked(connectionHooks.filesystem.resolveSessionCwd).mockImplementation(() => {
+      throw new Error('Session has not been attached during load')
+    })
+    const owner = new AcpConnectionResourceOwner()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        Response.json({
+          info: { id: 'summary', sessionID: 's', role: 'assistant', summary: true, finish: 'stop' }
+        })
+      )
+    )
+    try {
+      const candidate = await openCandidate(
+        process,
+        {
+          framework: opencodeFramework,
+          executablePath: '',
+          env: { XDG_DATA_HOME: root },
+          opencodeMajorVersion: 1,
+          opencodeUsageApi: { baseUrl: 'http://localhost:1234', authorization: 'Basic test' }
+        },
+        connectionHooks
+      )
+      const ready = await owner.connect(async (attempt) => {
+        candidate.transferTo(attempt)
+        return attempt.publish({ close: false, delete: false, resume: false, steering: false })
+      })
+      const request = ready.connection.agent.request(acp.methods.agent.session.load, {
+        sessionId: 's',
+        cwd: root,
+        mcpServers: []
+      })
+      const outgoing = await new Promise<Buffer>((resolve) => process.stdin.once('data', resolve))
+      const { id } = JSON.parse(outgoing.toString())
+      process.stdout.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 's',
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              messageId: 'summary',
+              content: { type: 'text', text: 'INTERNAL_PATH_AND_INSTRUCTIONS' }
+            }
+          }
+        }) + '\n'
+      )
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result: {} }) + '\n')
+      await request
+      expect(connectionHooks.observeSessionUpdate).toHaveBeenCalledOnce()
+      expect(connectionHooks.observeSessionUpdate).toHaveBeenCalledWith({
+        sessionId: 's',
+        update: {
+          sessionUpdate: 'session_info_update',
+          _meta: {
+            'opencode/compaction': {
+              messageId: 'summary',
+              reason: 'auto',
+              status: 'completed'
+            }
+          }
+        }
+      })
+      expect(
+        JSON.stringify(vi.mocked(connectionHooks.observeSessionUpdate).mock.calls)
+      ).not.toContain('INTERNAL_PATH_AND_INSTRUCTIONS')
+    } finally {
+      await owner.teardown(owner.epoch)
+      vi.unstubAllGlobals()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('releases a late store lease without spawning when its Attempt is closing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-adapter-closing-'))
+    const spawn = vi.fn()
+    const prepareBackend = vi.fn()
+    try {
+      await expect(
+        new AcpAgentConnectionAdapter().open(
+          {
+            epoch: 1,
+            resolveBackend: async () => ({
+              framework: { ...opencodeFramework, spawn },
+              executablePath: '/opencode',
+              env: { XDG_DATA_HOME: root },
+              opencodeMajorVersion: 2
+            }),
+            prepareBackend,
+            isCurrent: () => true,
+            isShuttingDown: () => false,
+            registerOpenCodeStoreRelease: () => {
+              throw new Error('Delegated Attempt cleanup has started.')
+            }
+          },
+          hooks()
+        )
+      ).rejects.toThrow('cleanup has started')
+      expect(startService).not.toHaveBeenCalled()
+      expect(spawn).not.toHaveBeenCalled()
+      expect(prepareBackend).not.toHaveBeenCalled()
+      const lock = acquireRuntimeDirectorySync(join(root, 'opencode'))
+      lock.release()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['preparation', 'spawn'] as const)(
+    'does not publish when the companion exits during %s',
+    async (phase) => {
+      const root = await mkdtemp(join(tmpdir(), 'opencode-adapter-exit-'))
+      let exitService!: () => void
+      const release = vi.fn(async () => ({ reaped: true }))
+      startService.mockImplementationOnce(async (_backend, onExit) => {
+        exitService = onExit
+        return {
+          api: { baseUrl: 'http://127.0.0.1:4242', authorization: 'Basic test', version: 2 },
+          release
+        }
+      })
+      const child = new FakeAgentProcess()
+      const connectionHooks = hooks()
+      const spawn = vi.fn(() => {
+        if (phase === 'spawn') queueMicrotask(() => exitService())
+        return asAgentProcess(child)
+      })
+      const backendOwner = new AcpBackendGenerationOwner(opencodeFramework)
+      let candidate: AcpAgentConnectionCandidate | undefined
+      const pending = new AcpAgentConnectionAdapter()
+        .open(
+          {
+            epoch: 1,
+            resolveBackend: async () => ({
+              framework: { ...opencodeFramework, spawn },
+              executablePath: '/opencode',
+              env: { XDG_DATA_HOME: root },
+              opencodeMajorVersion: 2
+            }),
+            prepareBackend: (backend) => {
+              if (phase === 'preparation') exitService()
+              return backendOwner.prepare({ epoch: 1, assertCurrent: vi.fn() }, backend)
+            },
+            isCurrent: () => true,
+            isShuttingDown: () => false
+          },
+          connectionHooks
+        )
+        .then((value) => {
+          candidate = value
+          return value
+        })
+      try {
+        await expect(pending).rejects.toThrow('OpenCode HTTP service exited')
+        expect(connectionHooks.onBackendPublished).not.toHaveBeenCalled()
+        expect(release).toHaveBeenCalledOnce()
+        if (phase === 'spawn') expect(child.killed).toBe(true)
+        else expect(spawn).not.toHaveBeenCalled()
+        const lock = acquireRuntimeDirectorySync(join(root, 'opencode'))
+        lock.release()
+      } finally {
+        await candidate?.dispose()
+        await rm(root, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it.each(['shutdown', 'supersession'] as const)(
+    'reaps a late companion before releasing storage after %s during startup',
+    async (interruption) => {
+      const root = await mkdtemp(join(tmpdir(), 'opencode-adapter-pending-'))
+      const starting = Promise.withResolvers<void>()
+      const ready = Promise.withResolvers<void>()
+      const releasing = Promise.withResolvers<void>()
+      const reaped = Promise.withResolvers<{ reaped: boolean }>()
+      const release = vi.fn(() => {
+        releasing.resolve()
+        return reaped.promise
+      })
+      startService.mockImplementationOnce(async () => {
+        starting.resolve()
+        await ready.promise
+        return {
+          api: { baseUrl: 'http://127.0.0.1:4242', authorization: 'Basic ephemeral', version: 2 },
+          release
+        }
+      })
+      let interrupted = false
+      const connectionHooks = hooks()
+      const spawnAgent = vi.fn(() => asAgentProcess(new FakeAgentProcess()))
+      const prepareBackend = vi.fn()
+      const pending = new AcpAgentConnectionAdapter().open(
+        {
+          epoch: 1,
+          resolveBackend: async () => ({
+            framework: opencodeFramework,
+            executablePath: '/opencode',
+            env: { XDG_DATA_HOME: root },
+            opencodeMajorVersion: 2
+          }),
+          prepareBackend,
+          isCurrent: () => !(interrupted && interruption === 'supersession'),
+          isShuttingDown: () => interrupted && interruption === 'shutdown',
+          spawnAgent
+        },
+        connectionHooks
+      )
+      const rejection = expect(pending).rejects.toThrow(
+        interruption === 'shutdown' ? 'shutting down' : 'superseded during preparation'
+      )
+      try {
+        await starting.promise
+        interrupted = true
+        ready.resolve()
+        await releasing.promise
+        expect(spawnAgent).not.toHaveBeenCalled()
+        expect(prepareBackend).not.toHaveBeenCalled()
+        expect(connectionHooks.onBackendPublished).not.toHaveBeenCalled()
+        expect(() => acquireRuntimeDirectorySync(join(root, 'opencode'))).toThrow('already using')
+        reaped.resolve({ reaped: true })
+        await rejection
+        expect(release).toHaveBeenCalledOnce()
+        const lock = acquireRuntimeDirectorySync(join(root, 'opencode'))
+        lock.release()
+      } finally {
+        ready.resolve()
+        reaped.resolve({ reaped: true })
+        await pending.catch(() => undefined)
+        await rm(root, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it('publishes the companion API, transfers ownership once, and rejects a later downgrade before spawning', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-adapter-'))
+    const release = vi.fn(async () => ({ reaped: true }))
+    const api = {
+      baseUrl: 'http://127.0.0.1:4242',
+      authorization: 'Basic ephemeral',
+      version: 2 as const
+    }
+    startService.mockResolvedValueOnce({ api, release })
+    const backend: ResolvedAgentBackend = {
+      framework: opencodeFramework,
+      executablePath: '/opencode',
+      env: { XDG_DATA_HOME: root },
+      opencodeMajorVersion: 2
+    }
+    const connectionHooks = hooks()
+    const owner = new AcpConnectionResourceOwner()
+    try {
+      const candidate = await openCandidate(new FakeAgentProcess(), backend, connectionHooks)
+      expect(startService).toHaveBeenCalledOnce()
+      expect(connectionHooks.onBackendPublished).toHaveBeenCalledWith(
+        expect.objectContaining({ framework: opencodeFramework })
+      )
+      expect(
+        JSON.stringify(vi.mocked(connectionHooks.onBackendPublished).mock.calls)
+      ).not.toContain(api.authorization)
+      await owner.connect(async (attempt) => {
+        candidate.transferTo(attempt)
+        return attempt.publish({ close: false, delete: false, resume: false, steering: false })
+      })
+      await candidate.dispose()
+      expect(release).not.toHaveBeenCalled()
+      await owner.teardown(owner.epoch)
+      expect(release).toHaveBeenCalledOnce()
+      const downgradedHooks = hooks()
+      await expect(
+        openCandidate(
+          new FakeAgentProcess(),
+          { ...backend, opencodeMajorVersion: 1 },
+          downgradedHooks
+        )
+      ).rejects.toThrow('Downgrading is not supported')
+      expect(downgradedHooks.onProcessSpawned).not.toHaveBeenCalled()
+    } finally {
+      await owner.teardown(owner.epoch)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('terminates the associated ACP process when its companion exits', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-adapter-'))
+    const child = new FakeAgentProcess()
+    const connectionHooks = hooks()
+    const release = vi.fn(async () => ({ reaped: true }))
+    let exit!: () => void
+    startService.mockImplementationOnce(async (_backend, callback) => {
+      exit = callback
+      return {
+        api: { baseUrl: 'http://127.0.0.1:4242', authorization: 'Basic ephemeral', version: 2 },
+        release
+      }
+    })
+    const candidate = await openCandidate(
+      child,
+      {
+        framework: opencodeFramework,
+        executablePath: '/opencode',
+        env: { XDG_DATA_HOME: root },
+        opencodeMajorVersion: 2
+      },
+      connectionHooks
+    )
+    try {
+      exit()
+      expect(child.killed).toBe(true)
+      expect(connectionHooks.onProcessError).toHaveBeenCalledOnce()
+    } finally {
+      await candidate.dispose()
+      await rm(root, { recursive: true, force: true })
+    }
+    expect(release).toHaveBeenCalledOnce()
+  })
+
   it('preserves stderr separators and decodes UTF-8 split across byte chunks', async () => {
     const process = new FakeAgentProcess()
     const connectionHooks = hooks()
@@ -199,13 +531,13 @@ describe('AcpAgentConnectionAdapter', () => {
       framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
       executablePath: '/bin/agent',
       env: {},
-      responsesBridgeLease: {
+      responsesTransportLease: {
         selectSkills: vi.fn(async () => []),
         registerReviewerSession: vi.fn(),
         unregisterReviewerSession: vi.fn(() => false),
         release: releaseBridge
       },
-      anthropicBridgeLease: {
+      messagesBridgeLease: {
         setTarget: vi.fn(() => true),
         release: releaseAnthropic
       },
@@ -257,13 +589,13 @@ describe('AcpAgentConnectionAdapter', () => {
         framework: claudeCodeFramework,
         executablePath: '',
         env: {},
-        responsesBridgeLease: {
+        responsesTransportLease: {
           selectSkills: vi.fn(async () => []),
           registerReviewerSession: vi.fn(),
           unregisterReviewerSession: vi.fn(() => false),
           release: releaseBridge
         },
-        anthropicBridgeLease: {
+        messagesBridgeLease: {
           setTarget: vi.fn(() => true),
           release: releaseAnthropic
         },

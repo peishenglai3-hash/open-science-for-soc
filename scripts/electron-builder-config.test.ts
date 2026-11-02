@@ -1,12 +1,19 @@
-import { readFileSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { createRequire } from 'node:module'
 import type { Stats } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import { copyFiles, FileMatcher } from 'app-builder-lib/out/fileMatcher'
 import { load } from 'js-yaml'
 import { describe, expect, it } from 'vitest'
+import {
+  assertElectronHostDependencies,
+  backendOnlyElectronDependencies,
+  electronHostDependencyGuard
+} from './electron-host-dependencies.mjs'
 
 import {
   WSL2_BASH_PREVIEW_MANIFEST,
@@ -36,6 +43,122 @@ describe('macOS native privacy purpose descriptions', () => {
 })
 
 describe('electron-builder local evidence exclusion', () => {
+  it('excludes backend feature copies from Electron while retaining the staged backend', () => {
+    const config = load(readFileSync('electron-builder.yml', 'utf8')) as { files: string[] }
+    const root = process.cwd()
+    const filter = new FileMatcher(root, root, (value) => value, [
+      '**/*',
+      ...config.files
+    ]).createFilter()
+    for (const name of backendOnlyElectronDependencies) {
+      for (const file of ['', '/package.json', '/dist/index.js', '/node_modules/child/index.js'])
+        expect(
+          filter(join(root, 'node_modules', name + file), {
+            isDirectory: () => file === ''
+          } as Stats)
+        ).toBe(false)
+    }
+    for (const name of [
+      '@aipoch/diagnostics',
+      '@aipoch/providers',
+      '@aipoch/connector-core',
+      '@aipoch/connector-mcp-client',
+      '@aipoch/process-tree-native',
+      '@aipoch/safe-file-publisher-native',
+      '@aipoch/credential-identity-probe-native',
+      'electron-updater',
+      'ws',
+      'zod'
+    ])
+      expect(
+        filter(join(root, 'node_modules', name, 'package.json'), {
+          isDirectory: () => false
+        } as Stats)
+      ).toBe(true)
+  })
+
+  it('rejects direct and transitive desktop consumers of excluded feature packages', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'electron-host-boundary-'))
+    const put = async (name: string, manifest: object): Promise<void> => {
+      const directory = join(root, 'node_modules', name)
+      await mkdir(directory, { recursive: true })
+      await writeFile(join(directory, 'package.json'), JSON.stringify({ name, ...manifest }))
+    }
+    try {
+      for (const name of backendOnlyElectronDependencies)
+        expect(() => assertElectronHostDependencies([`${name}/subpath`], root)).toThrow(name)
+      await put('@fixture/desktop', {
+        dependencies: { bridge: '1' },
+        devDependencies: { 'styled-exceljs': '1' }
+      })
+      await put('bridge', {
+        dependencies: { '@fixture/desktop': '1' },
+        optionalDependencies: { 'missing-platform-binding': '1' }
+      })
+      expect(() =>
+        assertElectronHostDependencies(
+          ['node:fs', 'path', 'electron', './chunk.js', '@fixture/desktop/subpath'],
+          root
+        )
+      ).not.toThrow()
+      for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
+        await put('bridge', { [field]: { 'styled-exceljs': '1' } })
+        expect(() => assertElectronHostDependencies(['@fixture/desktop'], root)).toThrow(
+          '@fixture/desktop -> bridge -> styled-exceljs'
+        )
+      }
+      const guard = electronHostDependencyGuard(root)
+      expect(() =>
+        guard.generateBundle.call({
+          getModuleIds: () => ['bundled-feature', 'styled-exceljs'].values(),
+          getModuleInfo: (id: string) => ({ isExternal: id === 'styled-exceljs' })
+        })
+      ).toThrow('styled-exceljs')
+      expect(() =>
+        guard.generateBundle.call({
+          getModuleIds: () => ['styled-exceljs'].values(),
+          getModuleInfo: () => ({ isExternal: false })
+        })
+      ).not.toThrow()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('runs desktop staging with an explicit target after building its current checkout', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'desktop-hook-'))
+    try {
+      await mkdir(join(root, 'scripts'))
+      for (const name of ['native-components', 'build-backend', 'stage-backend'])
+        await writeFile(
+          join(root, 'scripts', `${name}.mjs`),
+          `import { appendFileSync } from 'node:fs'; appendFileSync('calls.jsonl', JSON.stringify({name:${JSON.stringify(name)},args:process.argv.slice(2)})+'\\n')`
+        )
+      await writeFile(
+        join(root, 'scripts/stage-node-runtime.mjs'),
+        `export async function stageNodeRuntime() {}`
+      )
+      const require = createRequire(import.meta.url)
+      await require('../build/stage-desktop-runtime.cjs')({
+        electronPlatformName: process.platform,
+        arch: require('builder-util').Arch[process.arch],
+        packager: { projectDir: root }
+      })
+      expect(
+        (await readFile(join(root, 'calls.jsonl'), 'utf8'))
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line))
+      ).toEqual([
+        { name: 'native-components', args: [] },
+        { name: 'build-backend', args: ['--desktop'] },
+        { name: 'stage-backend', args: ['--desktop'] }
+      ])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('keeps repository tooling and prior CLI artifacts out while retaining runtime resources', async () => {
     const config = load(readFileSync('electron-builder.yml', 'utf8')) as { files: string[] }
     const root = await mkdtemp(join(tmpdir(), 'desktop-cli-artifacts-'))
@@ -43,6 +166,8 @@ describe('electron-builder local evidence exclusion', () => {
     const destination = join(root, 'packaged')
     const applicationFiles = [
       'out/main/index.js',
+      'out/main/index.js.map',
+      'out/preload/index.js',
       'out/renderer/index.html',
       'resources/notebook/python_loop.py',
       'resources/skills/skill-creator/scripts/utils.js',
@@ -52,7 +177,13 @@ describe('electron-builder local evidence exclusion', () => {
     const cliArtifacts = [
       'out/cli-artifacts/open-science-0.37.0-win32-x64.zip',
       'out/cli-artifacts/win32-x64.json',
-      'out/cli-artifacts/.archive-fixture/backend/index.cjs'
+      'out/cli-artifacts/.archive-fixture/backend/index.cjs',
+      'out/desktop-backend/out/backend/index.cjs',
+      'out/desktop-backend-build/index.cjs',
+      'out/size-dmg-baseline/Open-Science.app/Contents/Resources/app.asar',
+      'out/cli-size-candidate/node-runtime/node',
+      'out/future-staging-name/payload.bin',
+      'out/translation-bundle/worker.cjs'
     ]
     const developmentFiles = [
       'scripts/stage-backend.mjs',
@@ -99,10 +230,13 @@ describe('electron-builder local evidence exclusion', () => {
     ]
     try {
       for (const file of files) {
-        const path = join(root, 'out/standalone', file)
+        const path = join(root, 'out/desktop-backend', file)
         await mkdir(join(path, '..'), { recursive: true })
         await writeFile(path, file)
       }
+      // A prior npm release may coexist; desktop packaging must never pick its stale payload.
+      await mkdir(join(root, 'out/standalone/out/backend'), { recursive: true })
+      await writeFile(join(root, 'out/standalone/out/backend/index.cjs'), 'stale standalone')
       const matchers = config.extraResources
         .filter((entry) => entry.to === 'backend' || entry.to.startsWith('backend/'))
         .map(
@@ -122,14 +256,113 @@ describe('electron-builder local evidence exclusion', () => {
     }
   })
 
+  it('copies bundled npm and its nested dependencies through the real builder filter', async () => {
+    const config = load(readFileSync('electron-builder.yml', 'utf8')) as {
+      extraResources: Array<{ from: string; to: string; filter?: string[] }>
+    }
+    const root = await mkdtemp(join(tmpdir(), 'desktop-npm-package-'))
+    const files = [
+      'node',
+      'version.json',
+      'npm',
+      'node_modules/npm/bin/npx-cli.js',
+      'node_modules/npm/node_modules/package/lib/index.js',
+      'node_modules/npm/LICENSE'
+    ]
+    try {
+      for (const file of files) {
+        const path = join(root, 'out/node-runtime/darwin-arm64', file)
+        await mkdir(dirname(path), { recursive: true })
+        await writeFile(path, file)
+      }
+      await copyFiles(
+        config.extraResources
+          .filter((entry) => entry.to.startsWith('node-runtime'))
+          .map(
+            (entry) =>
+              new FileMatcher(
+                join(root, entry.from.replace('${platform}', 'darwin').replace('${arch}', 'arm64')),
+                join(root, 'resources', entry.to),
+                (value) => value,
+                entry.filter
+              )
+          )
+      )
+      for (const file of files)
+        expect(await readFile(join(root, 'resources/node-runtime', file), 'utf8')).toBe(file)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('loads the installed providers protocol through the desktop filter without host tokenizer dependencies', async () => {
+    const config = load(readFileSync('electron-builder.yml', 'utf8')) as { files: string[] }
+    const root = await mkdtemp(join(tmpdir(), 'desktop-providers-'))
+    const source = join(root, 'source')
+    const destination = join(root, 'packaged')
+    const require = createRequire(import.meta.url)
+    const collected = new Set<string>()
+    // Mirror dependency collection from package manifests, without naming provider internals.
+    const collect = async (name: string, resolveFrom: NodeJS.Require): Promise<void> => {
+      if (collected.has(name)) return
+      collected.add(name)
+      let packageRoot = dirname(resolveFrom.resolve(name))
+      while (
+        !existsSync(join(packageRoot, 'package.json')) ||
+        JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')).name !== name
+      ) {
+        const parent = dirname(packageRoot)
+        if (parent === packageRoot) throw new Error(`Missing package root: ${name}`)
+        packageRoot = parent
+      }
+      await cp(packageRoot, join(source, 'node_modules', name), {
+        recursive: true,
+        filter: (path) =>
+          path === packageRoot ||
+          !path
+            .slice(packageRoot.length + 1)
+            .split(/[\\/]/)
+            .includes('node_modules')
+      })
+      const manifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'))
+      for (const dependency of Object.keys(manifest.dependencies ?? {}))
+        await collect(dependency, createRequire(join(packageRoot, 'package.json')))
+    }
+    try {
+      await collect('@aipoch/providers', require)
+      const filter = new FileMatcher(source, destination, (value) => value, [
+        '**/*',
+        ...config.files
+      ]).createFilter()
+      await mkdir(join(destination, 'node_modules'), { recursive: true })
+      for (const name of collected) {
+        await cp(join(source, 'node_modules', name), join(destination, 'node_modules', name), {
+          recursive: true,
+          filter: (path) => filter(path, statSync(path))
+        })
+      }
+      const result = execFileSync(
+        process.execPath,
+        [
+          '-e',
+          `
+        const protocol = require('@aipoch/providers/protocol')
+        if (!(protocol.countMessagesInputTokens({messages:[{role:'user',content:'hello'}]}) > 0))
+          throw new Error('Installed provider token count failed')
+        console.log('ok')
+      `
+        ],
+        { cwd: destination, env: { ...process.env, NODE_PATH: '' }, encoding: 'utf8' }
+      )
+      expect(result.trim()).toBe('ok')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('declares the native PDF worker imports as production dependencies', () => {
     const manifest = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8'))
-    for (const dependency of [
-      'fontkit',
-      '@embedpdf/pdfium',
-      'pdf-lib',
-      '@huggingface/transformers'
-    ])
+    for (const dependency of ['fontkit', '@embedpdf/pdfium', 'pdf-lib'])
       expect(manifest.dependencies[dependency]).toEqual(expect.stringMatching(/\S/))
   })
 
@@ -169,10 +402,12 @@ describe('electron-builder local evidence exclusion', () => {
     for (const file of [
       'out/main/index.js',
       'out/renderer/index.html',
-      'resources/pdf-translation-local/worker.mjs',
       'resources/notebook/python_loop.py',
       'node_modules/@aipoch/credential-identity-probe-native/build/Release/credential_secret',
       'node_modules/@aipoch/diagnostics/dist/node.js',
+      'node_modules/@aipoch/providers/dist/providers.js',
+      'node_modules/@aipoch/providers/dist/protocol.js',
+      'node_modules/@aipoch/providers/dist/client.js',
       'node_modules/i18next/index.js',
       'node_modules/electron-updater/out/main.js',
       'package.json',
@@ -188,8 +423,8 @@ describe('electron-builder local evidence exclusion', () => {
       'node_modules/.prisma',
       'node_modules/prisma',
       'node_modules/typescript',
-      'node_modules/tiktoken',
       'node_modules/js-tiktoken',
+      'node_modules/tiktoken',
       'node_modules/web-tree-sitter',
       'node_modules/openchemlib',
       'node_modules/citeme-engine-wasm',
@@ -268,9 +503,8 @@ describe('electron-builder native image processing', () => {
       from: 'packages/notebook-network-sandbox/vendor/wsl2/manifest.json',
       to: 'notebook-network-sandbox/wsl2/manifest.json'
     })
-    expect(config.mac?.extraResources).toHaveLength(1)
+    expect(config.mac?.extraResources).toBeUndefined()
     expect(config.linux?.extraResources).toEqual([
-      { from: 'resources/bin/linux/${arch}/micromamba', to: 'micromamba' },
       { from: 'build/deb-cli-launcher', to: 'open-science-cli' }
     ])
   })
@@ -415,7 +649,6 @@ describe('electron-builder Windows targets', () => {
     expect(cleanup).toContain("$installationId = '0f3cd2a44c3d4e4e9f1e2a5b'")
     expect(cleanup.indexOf('$ownershipRoot =')).toBeLessThan(cleanup.indexOf('$HostPath ='))
     expect(cleanup).toContain('-Verb RunAs')
-    expect(include).toContain('taskkill /F /IM "notebook-appcontainer-host.exe"')
   })
 
   it('does not claim a Windows publisher while packages remain unsigned', () => {

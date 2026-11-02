@@ -25,7 +25,8 @@ import {
   normalizeSessionFile,
   type PersistedChatSession,
   type PersistedToolActivity,
-  type SessionPdfContext
+  type SessionPdfContext,
+  type SessionRuntimeContext
 } from '../../../shared/session-persistence'
 import type { UploadedAttachment } from '../../../shared/uploads'
 import type { ActivePlanProjection } from '../../../shared/session-plan/contract'
@@ -390,6 +391,116 @@ describe('session store', () => {
     )
 
     expect(merged.runtimeContext).toEqual({ version: 1, revision: 2 })
+  })
+
+  it.each([
+    {
+      currentRevision: 1,
+      incomingRevision: 2,
+      currentPending: false,
+      incomingPending: true,
+      expected: true
+    },
+    {
+      currentRevision: 1,
+      incomingRevision: 2,
+      currentPending: true,
+      incomingPending: false,
+      expected: false
+    },
+    {
+      currentRevision: 2,
+      incomingRevision: 1,
+      currentPending: true,
+      incomingPending: false,
+      expected: true
+    },
+    {
+      currentRevision: 2,
+      incomingRevision: 1,
+      currentPending: false,
+      incomingPending: true,
+      expected: false
+    },
+    {
+      currentRevision: 2,
+      incomingRevision: 2,
+      currentPending: true,
+      incomingPending: false,
+      expected: true
+    }
+  ])('merges network approval authority by runtime revision: %j', (scenario) => {
+    const approval = {
+      version: 1,
+      kind: 'sandbox-network',
+      state: 'pending',
+      requestId: 'approval-fixture',
+      sessionId: 'session-fixture',
+      executionId: 'execution-fixture',
+      commandFingerprint: 'a'.repeat(64),
+      hostname: 'service.example.test',
+      port: 443,
+      runtime: 'bash',
+      originatingPromptMessageId: 'prompt-fixture',
+      agentFrameId: 'frame-fixture',
+      messageBranchId: 'branch-fixture',
+      createdAt: 1
+    } satisfies NonNullable<SessionRuntimeContext['networkApprovals']>[number]
+    const merged = mergePersistedRuntimeIdentityProjection(
+      {
+        runtimeContext: {
+          version: 1,
+          revision: scenario.currentRevision,
+          ...(scenario.currentPending ? { networkApprovals: [approval] } : {})
+        }
+      },
+      {
+        runtimeContext: {
+          version: 1,
+          revision: scenario.incomingRevision,
+          ...(scenario.incomingPending ? { networkApprovals: [approval] } : {})
+        }
+      },
+      { incomingOwnsFrameConflicts: true }
+    )
+    expect(merged.runtimeContext?.networkApprovals).toEqual(
+      scenario.expected ? [approval] : undefined
+    )
+    if (scenario.expected) expect(merged.runtimeContext?.networkApprovals?.[0]).not.toBe(approval)
+  })
+
+  it('preserves network approval authority when a delegated snapshot owns only delegated work', () => {
+    const approval = {
+      version: 1,
+      kind: 'sandbox-network',
+      state: 'pending',
+      requestId: 'approval-fixture',
+      sessionId: 'session-fixture',
+      executionId: 'execution-fixture',
+      commandFingerprint: 'a'.repeat(64),
+      hostname: 'service.example.test',
+      port: 443,
+      runtime: 'bash',
+      originatingPromptMessageId: 'prompt-fixture',
+      agentFrameId: 'frame-fixture',
+      messageBranchId: 'branch-fixture',
+      createdAt: 1
+    } satisfies NonNullable<SessionRuntimeContext['networkApprovals']>[number]
+    const merged = mergePersistedRuntimeIdentityProjection(
+      { runtimeContext: { version: 1, revision: 1, networkApprovals: [approval] } },
+      {
+        runtimeContext: {
+          version: 1,
+          revision: 2,
+          delegatedWork: { records: [] },
+          networkApprovals: [{ ...approval, requestId: 'unrelated-fixture' }]
+        }
+      },
+      { incomingOwnsFrameConflicts: true, incomingOwnsRuntimeContext: false }
+    )
+    expect(merged.runtimeContext?.networkApprovals).toEqual([approval])
+    expect(merged.runtimeContext?.networkApprovals?.[0]).not.toBe(approval)
+    expect(merged.runtimeContext?.delegatedWork?.records).toEqual([])
   })
 
   it('starts empty so New can stay outside store state', () => {
@@ -4925,7 +5036,7 @@ describe('session store', () => {
     })
   })
 
-  it('derives errorReportable from the message when no explicit flag is passed', () => {
+  it('classifies operation failures when no classification is supplied', () => {
     useSessionStore.getState().appendUserMessage({
       sessionId: 'transport-session-1',
       content: 'Read the files'
@@ -4933,13 +5044,13 @@ describe('session store', () => {
 
     // An opaque/internal failure with no crafted-message match stays reportable.
     useSessionStore.getState().failRun('transport-session-1', 'Agent session could not be created.')
-    expect(useSessionStore.getState().sessions[0].errorReportable).toBe(true)
+    expect(useSessionStore.getState().sessions[0].failure?.category).toBe('internal')
 
     // An app-crafted reminder is recognized by its exact text and is not reportable.
     useSessionStore
       .getState()
       .failRun('transport-session-1', 'Session workspace is missing; start a new conversation.')
-    expect(useSessionStore.getState().sessions[0].errorReportable).toBe(false)
+    expect(useSessionStore.getState().sessions[0].failure?.category).toBe('environment')
 
     // Claude Code's unreachable-API wrapper is recognized without an explicit flag (createSession /
     // persisted pre-flag sessions).
@@ -4949,7 +5060,7 @@ describe('session store', () => {
         'transport-session-1',
         'Internal error: API Error: Unable to connect to API (ConnectionRefused)'
       )
-    expect(useSessionStore.getState().sessions[0].errorReportable).toBe(false)
+    expect(useSessionStore.getState().sessions[0].failure?.category).toBe('service')
   })
 
   it('honors an explicit reportable flag (the runtime tags a model-provider failure)', () => {
@@ -4961,9 +5072,9 @@ describe('session store', () => {
     // A model-provider failure: opaque text that WOULD derive reportable=true, but the ACP layer
     // structurally tagged it non-reportable, and the explicit flag wins.
     useSessionStore.getState().failRun('transport-session-1', 'Invalid API key', {
-      reportable: false
+      failure: { category: 'service' as const, diagnostics: {} }
     })
-    expect(useSessionStore.getState().sessions[0].errorReportable).toBe(false)
+    expect(useSessionStore.getState().sessions[0].failure?.category).toBe('service')
   })
 
   it('clears errorReportable when a new run starts, so a later error cannot inherit it', () => {
@@ -4973,21 +5084,21 @@ describe('session store', () => {
     })
     // A model-provider failure hides the report button.
     useSessionStore.getState().failRun('transport-session-1', 'Invalid API key', {
-      reportable: false
+      failure: { category: 'service' as const, diagnostics: {} }
     })
-    expect(useSessionStore.getState().sessions[0].errorReportable).toBe(false)
+    expect(useSessionStore.getState().sessions[0].failure?.category).toBe('service')
 
     // A new turn clears the prior error + flag.
     useSessionStore.getState().appendUserMessage({
       sessionId: 'transport-session-1',
       content: 'second turn'
     })
-    expect(useSessionStore.getState().sessions[0].errorReportable).toBeUndefined()
+    expect(useSessionStore.getState().sessions[0].failure).toBeUndefined()
 
     // A later ACP-layer failure with no explicit flag derives reportable=true — it never inherits the
     // earlier provider error's false.
     useSessionStore.getState().failRun('transport-session-1', 'Agent cancellation failed')
-    expect(useSessionStore.getState().sessions[0].errorReportable).toBe(true)
+    expect(useSessionStore.getState().sessions[0].failure?.category).toBe('internal')
   })
 
   it('records an artifact finalization error as reportable (an app-layer failure)', () => {
@@ -4997,13 +5108,13 @@ describe('session store', () => {
     })
     // Simulate a prior provider error's flag lingering, then an artifact error overwriting it.
     useSessionStore.getState().failRun('transport-session-1', 'Invalid API key', {
-      reportable: false
+      failure: { category: 'service' as const, diagnostics: {} }
     })
     useSessionStore.getState().recordArtifactError('transport-session-1', 'disk full')
 
     const session = useSessionStore.getState().sessions[0]
     expect(session.error).toContain('disk full')
-    expect(session.errorReportable).toBe(true)
+    expect(session.failure?.category).toBe('internal')
   })
 
   it('keeps artifact finalization errors visible when the run later stops', () => {
@@ -5402,7 +5513,7 @@ describe('session store', () => {
     })
     expect(session.activePlanProjection).toBeUndefined()
     expect(session.error).toBeUndefined()
-    expect(session.errorReportable).toBeUndefined()
+    expect(session.failure).toBeUndefined()
     expect(session.messages[1]).toMatchObject({ status: 'error', failedAt: expect.any(Number) })
     expect(session.activities?.[0]).toMatchObject({ status: 'failed' })
   })
@@ -7500,20 +7611,16 @@ describe('session store public contract', () => {
       'src/renderer/src/components/NotificationBell.tsx',
       'src/renderer/src/components/NotificationLiveToast.tsx',
       'src/renderer/src/components/SessionPackageOperation.tsx',
+      'src/renderer/src/components/desktop-runtime-recovery.tsx',
       'src/renderer/src/components/global-search/GlobalSearchDialog.tsx',
-      'src/renderer/src/components/job-binding-utils.ts',
-      'src/renderer/src/components/notification-inbox-presentation.ts',
       'src/renderer/src/hooks/useApplicationEventBindings.ts',
       'src/renderer/src/hooks/useLifecycleSync.ts',
-      'src/renderer/src/hooks/useSessionPendingInteractions.ts',
       'src/renderer/src/hooks/useUnreadTaskViewSync.ts',
-      'src/renderer/src/lib/acp/history-preamble.ts',
       'src/renderer/src/lib/acp/runtime-event-presentation.ts',
       'src/renderer/src/lib/acp/useWorkspaceAgentRuntime.ts',
       'src/renderer/src/lib/acp/useWorkspaceElicitation.ts',
       'src/renderer/src/lib/acp/workspace-elicitation-runtime.ts',
       'src/renderer/src/lib/acp/workspace-events.ts',
-      'src/renderer/src/lib/acp/workspace-permission-response-attempt-owner.ts',
       'src/renderer/src/lib/acp/workspace-prompt-preparation.ts',
       'src/renderer/src/lib/acp/workspace-runtime-command-owner.ts',
       'src/renderer/src/lib/acp/workspace-runtime-event-owner.ts',
@@ -7529,100 +7636,45 @@ describe('session store public contract', () => {
       'src/renderer/src/lib/deep-link.ts',
       'src/renderer/src/lib/preview-persistence/preview-persistence.ts',
       'src/renderer/src/lib/replay/timeline.ts',
-      'src/renderer/src/lib/session-package-export.ts',
+      'src/renderer/src/lib/session-fork.ts',
       'src/renderer/src/lib/session-persistence/session-persistence.ts',
       'src/renderer/src/pages/home/HomePage.tsx',
-      'src/renderer/src/pages/home/use-recent-sessions.ts',
       'src/renderer/src/pages/settings/ArchivedPanel.tsx',
       'src/renderer/src/pages/settings/SettingsPage.tsx',
       'src/renderer/src/pages/workspace/ArtifactProvenancePanel.tsx',
-      'src/renderer/src/pages/workspace/ContextWindowDialog.tsx',
-      'src/renderer/src/pages/workspace/ConversationExportDialog.tsx',
       'src/renderer/src/pages/workspace/ConversationPanel.tsx',
-      'src/renderer/src/pages/workspace/DeleteSessionDialog.tsx',
-      'src/renderer/src/pages/workspace/DownloadSessionArtifactsDialog.tsx',
-      'src/renderer/src/pages/workspace/EditSessionDialog.tsx',
       'src/renderer/src/pages/workspace/NotebookPreview.tsx',
       'src/renderer/src/pages/workspace/PreviewFileSurface.tsx',
       'src/renderer/src/pages/workspace/ProjectComputeInbox.tsx',
       'src/renderer/src/pages/workspace/SessionDiscussionDialog.tsx',
       'src/renderer/src/pages/workspace/SessionDiscussionSource.tsx',
-      'src/renderer/src/pages/workspace/SessionInfoPopover.preview.tsx',
-      'src/renderer/src/pages/workspace/SessionInfoPopover.tsx',
-      'src/renderer/src/pages/workspace/SessionNotebookDialog.tsx',
       'src/renderer/src/pages/workspace/SessionReplayPreview.tsx',
-      'src/renderer/src/pages/workspace/SessionReproducibilityDialog.tsx',
       'src/renderer/src/pages/workspace/SideChatWorkbench.tsx',
       'src/renderer/src/pages/workspace/SubagentReleaseSurfaces.tsx',
-      'src/renderer/src/pages/workspace/WorkspaceActivityIcon.tsx',
       'src/renderer/src/pages/workspace/WorkspaceAgentLoadingRow.tsx',
-      'src/renderer/src/pages/workspace/WorkspaceArtifactVisibility.tsx',
-      'src/renderer/src/pages/workspace/WorkspaceContextCompactionActivityRow.tsx',
-      'src/renderer/src/pages/workspace/WorkspaceElicitationCard.tsx',
-      'src/renderer/src/pages/workspace/WorkspaceManagePackagesActivityRow.tsx',
       'src/renderer/src/pages/workspace/WorkspaceMessageItem.tsx',
       'src/renderer/src/pages/workspace/WorkspaceMessageScroller.tsx',
       'src/renderer/src/pages/workspace/WorkspacePage.tsx',
-      'src/renderer/src/pages/workspace/WorkspacePlanActivityRecord.tsx',
-      'src/renderer/src/pages/workspace/WorkspaceSidebar.tsx',
       'src/renderer/src/pages/workspace/WorkspaceSidebarContainer.tsx',
-      'src/renderer/src/pages/workspace/WorkspaceSkillActivityRow.tsx',
-      'src/renderer/src/pages/workspace/WorkspaceSkillLoadRow.tsx',
-      'src/renderer/src/pages/workspace/WorkspaceToolActivityRow.tsx',
-      'src/renderer/src/pages/workspace/WorkspaceToolActivityRowButton.tsx',
-      'src/renderer/src/pages/workspace/WorkspaceToolDetailsRow.tsx',
-      'src/renderer/src/pages/workspace/WorkspaceWebSearchActivityRow.tsx',
-      'src/renderer/src/pages/workspace/agent-loading-message.ts',
-      'src/renderer/src/pages/workspace/artifact-preview-utils.ts',
-      'src/renderer/src/pages/workspace/artifact-preview.tsx',
       'src/renderer/src/pages/workspace/composer/SessionMentionPopup.tsx',
-      'src/renderer/src/pages/workspace/composer/composer-history.ts',
-      'src/renderer/src/pages/workspace/context-window-trend.ts',
-      'src/renderer/src/pages/workspace/generate-plan-activity-projection.ts',
-      'src/renderer/src/pages/workspace/preview-file-item.ts',
       'src/renderer/src/pages/workspace/previews/LibraryChatButton.tsx',
       'src/renderer/src/pages/workspace/previews/PreviewToolContent.tsx',
       'src/renderer/src/pages/workspace/previews/renderers/PdfPreview.tsx',
       'src/renderer/src/pages/workspace/previews/renderers/PlanJsonPreview.tsx',
       'src/renderer/src/pages/workspace/project-file-mention.ts',
       'src/renderer/src/pages/workspace/project-files-query-model.ts',
-      'src/renderer/src/pages/workspace/replay/ReplayToolRecord.tsx',
-      'src/renderer/src/pages/workspace/session-action-menu.ts',
-      'src/renderer/src/pages/workspace/session-message-artifact-reference.ts',
-      'src/renderer/src/pages/workspace/session-notebook-projection.ts',
-      'src/renderer/src/pages/workspace/session-plan/UnavailablePlanNotice.tsx',
-      'src/renderer/src/pages/workspace/session-plan/active-branch-plan.ts',
-      'src/renderer/src/pages/workspace/session-plan/plan-file-projection.ts',
       'src/renderer/src/pages/workspace/session-plan/respond-to-session-plan.ts',
-      'src/renderer/src/pages/workspace/session-wait-reason.ts',
-      'src/renderer/src/pages/workspace/side-chat-availability.ts',
-      'src/renderer/src/pages/workspace/tool-execution-phase.ts',
       'src/renderer/src/pages/workspace/use-pdf-context-action.ts',
       'src/renderer/src/pages/workspace/use-project-file-mention-availability.ts',
       'src/renderer/src/pages/workspace/use-side-chat-controller.ts',
       'src/renderer/src/pages/workspace/use-workspace-branch-switch-guard.ts',
       'src/renderer/src/pages/workspace/useManagedVersionWorkflow.ts',
-      'src/renderer/src/pages/workspace/visible-project-sessions.ts',
-      'src/renderer/src/pages/workspace/workspace-agent-control-availability.ts',
       'src/renderer/src/pages/workspace/workspace-compute-host-access-controller.ts',
-      'src/renderer/src/pages/workspace/workspace-conversation-controller.ts',
-      'src/renderer/src/pages/workspace/workspace-conversation-items.ts',
-      'src/renderer/src/pages/workspace/workspace-conversation-timeline.ts',
-      'src/renderer/src/pages/workspace/workspace-message-queue-admission.ts',
       'src/renderer/src/pages/workspace/workspace-message-queue-controller.ts',
-      'src/renderer/src/pages/workspace/workspace-message-queue-owner.ts',
-      'src/renderer/src/pages/workspace/workspace-run-marks.ts',
       'src/renderer/src/pages/workspace/workspace-session-agent-configuration-controller.ts',
       'src/renderer/src/pages/workspace/workspace-session-controller.ts',
-      'src/renderer/src/pages/workspace/workspace-session-delegation-control-owner.ts',
       'src/renderer/src/pages/workspace/workspace-session-details-controller.ts',
       'src/renderer/src/pages/workspace/workspace-session-discussion.ts',
-      'src/renderer/src/pages/workspace/workspace-session-recovery.ts',
-      'src/renderer/src/pages/workspace/workspace-skill-load.ts',
-      'src/renderer/src/pages/workspace/workspace-tool-activity-details.ts',
-      'src/renderer/src/pages/workspace/workspace-tool-activity-groups.ts',
-      'src/renderer/src/pages/workspace/workspace-tool-activity-style.ts',
-      'src/renderer/src/pages/workspace/workspace-web-search-details.ts',
       'src/renderer/src/stores/archive-undo-store.ts',
       'src/renderer/src/stores/navigation-store.ts',
       'src/renderer/src/stores/preview-workbench-store.ts'
@@ -7888,7 +7940,7 @@ describe('branchInNewSession', () => {
               ...session,
               status: 'error',
               error: 'old failure',
-              errorReportable: false,
+              failure: { category: 'service' as const, diagnostics: {} },
               interrupted: true,
               agentStatus: 'stale status',
               branchContextResetRequired: true,
@@ -8521,6 +8573,20 @@ describe('truncateSessionFromMessage', () => {
     activeQuestionIndex: 0,
     values: { question_0_custom: 'Unsubmitted text' }
   }
+
+  it('keeps a structured skip when switching away from an unfinished choice', () => {
+    seedEditableElicitation()
+    useSessionStore.getState().setElicitationEditDraft('session-1', 'choice-1', 'request-1', {
+      ...editSnapshot,
+      values: { question_0: { status: 'skipped' } }
+    })
+    expect(
+      useSessionStore.getState().sessions[0].elicitationEditDrafts?.['choice-1'].values
+    ).toEqual({
+      question_0: { status: 'skipped' },
+      question_0_custom: undefined
+    })
+  })
 
   it('keeps bounded elicitation edits in memory across save acknowledgements', () => {
     seedEditableElicitation()
@@ -9274,7 +9340,7 @@ describe('truncateSessionFromMessage', () => {
       status: 'error',
       activeRun: undefined,
       awaitingFirstAgentOutput: undefined,
-      errorReportable: true,
+      failure: { category: 'internal' as const, diagnostics: {} },
       conversationGraphSyncBlocked: true
     })
     expect(settled.error).toContain('Conversation history could not be finalized')
@@ -9309,7 +9375,7 @@ describe('truncateSessionFromMessage', () => {
     expect(settled).toMatchObject({
       status: 'error',
       activeRun: undefined,
-      errorReportable: true,
+      failure: { category: 'internal' as const, diagnostics: {} },
       conversationGraphSyncBlocked: true
     })
     expect(settled.error).toContain('Provider failed')

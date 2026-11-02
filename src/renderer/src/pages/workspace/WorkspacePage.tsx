@@ -1,3 +1,4 @@
+import { useDesktopRuntimeRecoveryStore } from '@/stores/desktop-runtime-recovery-store'
 import {
   LibraryReferenceActionsContext,
   LibraryPreviewNavigationContext
@@ -41,6 +42,8 @@ import {
   createProjectComputePreviewItem,
   createProjectFilesPreviewItem,
   createProjectLibraryPreviewItem,
+  createProjectMarketplacePreviewItem,
+  PROJECT_MARKETPLACE_PREVIEW_ID,
   PROJECT_COMPUTE_PREVIEW_ID,
   PROJECT_FILES_PREVIEW_ID,
   PROJECT_LIBRARY_PREVIEW_ID,
@@ -49,11 +52,10 @@ import {
 import {
   projectSessionActionability,
   resolveRootPermissionPending,
-  sessionAwaitsHistoryReplay,
-  toPersistedSession,
-  useSessionStore,
-  type ChatSession
-} from '@/stores/session-store'
+  sessionAwaitsHistoryReplay
+} from '@/stores/session-actionability'
+import { toPersistedSession, useSessionStore } from '@/stores/session-store'
+import type { ChatSession } from '@/stores/session-store-contract'
 import { useSpecialistStore } from '@/stores/specialist-store'
 import {
   selectProjectSessionReviewLoadError,
@@ -102,6 +104,7 @@ import { getVisiblePermissionRequests } from './session-permissions'
 import { WorkspaceSidebarContainer } from './WorkspaceSidebarContainer'
 import { WorkspacePanelLayout } from './workspace-panel-layout'
 import { useWorkspaceComposerController } from './workspace-composer-controller'
+import { useAgentAuthenticationRecovery } from './use-agent-authentication-recovery'
 import { useWorkspaceConversationController } from './workspace-conversation-controller'
 import { useWorkspaceSessionController } from './workspace-session-controller'
 import { useWorkspaceBranchSwitchGuard } from './use-workspace-branch-switch-guard'
@@ -515,6 +518,18 @@ const WorkspacePage = ({
     !activeSession?.packageOrigin &&
     !activeSessionHasSendPreparation &&
     activeSession?.status !== 'waiting-plan-approval'
+  const recoveryPhase = useDesktopRuntimeRecoveryStore((state) => state.phase)
+  const [hadPersistenceReady, setHadPersistenceReady] = useState(isSessionPersistenceReady)
+  if (isSessionPersistenceReady && !hadPersistenceReady) setHadPersistenceReady(true)
+  // The local draft is already scoped and persisted independently of the service. Keep its editor
+  // focusable while reconnecting; submission, attachments and session mutations keep their gates.
+  const canEditLocalDraft =
+    canEditDraft ||
+    (hadPersistenceReady &&
+      recoveryPhase !== 'connected' &&
+      !activeSession?.packageOrigin &&
+      !activeSessionHasSendPreparation &&
+      activeSession?.status !== 'waiting-plan-approval')
   const composerHistoryPolicy = useMemo(
     () => ({
       catalogSkillIds,
@@ -679,6 +694,27 @@ const WorkspacePage = ({
     return reviews.some((review) => review.lifecycle === 'running')
   })
   const isReviewBusy = isReviewing || isManualReviewRequestPending
+  const authenticationOperationError = useWorkspaceOperationErrors((state) =>
+    activeSession ? (state.errors[activeSession.id] ?? null) : actionError
+  )
+  const authenticationOperationErrorValidations = useWorkspaceOperationErrors((state) =>
+    activeSession ? state.providerValidations[activeSession.id] : undefined
+  )
+  const authenticationOperationTarget = useWorkspaceOperationErrors((state) =>
+    activeSession ? state.providerTargets[activeSession.id] : undefined
+  )
+  const authenticationRecovery = useAgentAuthenticationRecovery(
+    activeSession,
+    currentDraftKey,
+    activeAgentConfiguration,
+    attachmentError,
+    authenticationOperationError,
+    {
+      composer: composer.view.errorProviderValidations,
+      action: authenticationOperationErrorValidations,
+      actionTarget: authenticationOperationTarget
+    }
+  )
   const conversation = useWorkspaceConversationController({
     activeSession,
     projectId: scopedProjectId,
@@ -692,7 +728,7 @@ const WorkspacePage = ({
     agentConfigurationReady: !agentConfigurationUnavailable,
     permissionProfile: activePermissionProfile,
     isReviewing: isReviewBusy,
-    isTurnAdmissionBlocked: isReviewHistoryUnavailable,
+    isTurnAdmissionBlocked: isReviewHistoryUnavailable || authenticationRecovery.required,
     promptInFlightSessionIds,
     sendPreparationInFlightSessionIds,
     saveAsSkillInFlightSessionIds,
@@ -1486,6 +1522,12 @@ const WorkspacePage = ({
     if (!isSessionPersistenceReady) return
     usePreviewWorkbenchStore.getState().upsertAndActivateItem(createProjectComputePreviewItem())
   }
+
+  const openMarketplacePreview = (): boolean => {
+    if (!isSessionPersistenceReady) return false
+    usePreviewWorkbenchStore.getState().upsertAndActivateItem(createProjectMarketplacePreviewItem())
+    return usePreviewWorkbenchStore.getState().activeItemId === PROJECT_MARKETPLACE_PREVIEW_ID
+  }
   const canOpenProjectCompute =
     typeof window.api.notebook?.getProjectActivity === 'function' &&
     typeof window.api.notebook?.onChanged === 'function' &&
@@ -1565,6 +1607,8 @@ const WorkspacePage = ({
                 onOpenFiles={openFilesPreview}
                 isLibraryOpen={activePreviewItemId === PROJECT_LIBRARY_PREVIEW_ID}
                 onOpenLiterature={openLibraryPreview}
+                isMarketplaceOpen={activePreviewItemId === PROJECT_MARKETPLACE_PREVIEW_ID}
+                onOpenMarketplace={isSessionPersistenceReady ? openMarketplacePreview : undefined}
                 isComputeOpen={
                   canOpenProjectCompute && activePreviewItemId === PROJECT_COMPUTE_PREVIEW_ID
                 }
@@ -1633,6 +1677,14 @@ const WorkspacePage = ({
                 onOpenLiterature={() => {
                   if (openLibraryPreview()) close()
                 }}
+                isMarketplaceOpen={activePreviewItemId === PROJECT_MARKETPLACE_PREVIEW_ID}
+                onOpenMarketplace={
+                  isSessionPersistenceReady
+                    ? () => {
+                        if (openMarketplacePreview()) close()
+                      }
+                    : undefined
+                }
                 isComputeOpen={
                   canOpenProjectCompute && activePreviewItemId === PROJECT_COMPUTE_PREVIEW_ID
                 }
@@ -1745,10 +1797,13 @@ const WorkspacePage = ({
                   activeSession,
                   composerFocusKey: currentDraftKey,
                   canEditDraft,
+                  canEditLocalDraft,
+                  sendPreparing: activeSessionHasSendPreparation,
                   persistenceBlocked: persistenceBlockedSessionIds.includes(
                     activeSession?.id ?? ''
                   ),
                   actionError: visibleActionError,
+                  authenticationRecovery,
                   sideChatDisabledReason,
                   sessionImport: {
                     projectId: scopedProjectId,
@@ -1845,6 +1900,7 @@ const WorkspacePage = ({
                   }
                 }}
                 sessionTools={{
+                  newConversation: openNewConversation,
                   menuBindings: createSessionActionBindings({
                     canMutateConversations: isSessionPersistenceReady,
                     canDeleteConversations: false,

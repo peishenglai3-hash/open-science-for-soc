@@ -188,7 +188,7 @@ const NetworkPanel = ({
     ? t('Could not load local network details.')
     : [typeLabel ?? null, networkInfo?.ipAddress ?? null]
         .filter((part) => part !== null)
-        .join(' · ') || undefined
+        .join(' / ') || undefined
 
   const networkLabel = t('Package registry connectivity')
 
@@ -322,7 +322,7 @@ const NetworkPanel = ({
                   })}
                 </p>
                 <p className="text-xs text-muted-foreground">
-                  {t('Trusted private services')} ·{' '}
+                  {t('Trusted private services')}{' '}
                   {notebookNetwork.trustedPrivateDestinations?.length ?? 0}
                 </p>
               </div>
@@ -400,6 +400,7 @@ const NetworkPanel = ({
                 <Input
                   id="mirror-conda-channel"
                   aria-label={t('Conda channel mirror')}
+                  disabled={isSaving}
                   value={draft.condaChannel ?? ''}
                   placeholder={t('https://mirrors.example.com/conda-forge/')}
                   onChange={(event) =>
@@ -415,6 +416,7 @@ const NetworkPanel = ({
                 <Input
                   id="mirror-pypi-index"
                   aria-label={t('Python package index (pip)')}
+                  disabled={isSaving}
                   value={draft.pypiIndex ?? ''}
                   placeholder={t('https://mirrors.example.com/pypi/simple')}
                   onChange={(event) =>
@@ -431,6 +433,7 @@ const NetworkPanel = ({
                 <Input
                   id="mirror-ca-bundle"
                   aria-label={t('CA bundle path')}
+                  disabled={isSaving}
                   value={draft.caBundle ?? ''}
                   placeholder={t('/path/to/corp-ca-bundle.pem')}
                   onChange={(event) =>

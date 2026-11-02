@@ -16,18 +16,20 @@ function PopoverContent({
   sideOffset = 4,
   ref,
   onInteractOutside,
+  container,
   ...props
-}: React.ComponentProps<typeof PopoverPrimitive.Content>): React.JSX.Element {
+}: React.ComponentProps<typeof PopoverPrimitive.Content> &
+  Pick<React.ComponentProps<typeof PopoverPrimitive.Portal>, 'container'>): React.JSX.Element {
   const layer = useOverlayLayer()
   const { setContentRef, onInteractOutside: guardChildDismissal } = useChildLayerDismissalGuard(ref)
 
   return (
-    <PopoverPrimitive.Portal>
+    <PopoverPrimitive.Portal container={container}>
       <PopoverPrimitive.Content
         ref={setContentRef}
         sideOffset={sideOffset}
         className={cn(
-          'z-50 rounded-md bg-text-000 p-2 text-xs text-bg-000 shadow-md outline-none',
+          'z-50 rounded-md border border-border bg-popover p-2 text-xs text-popover-foreground shadow-menu outline-none',
           className
         )}
         {...props}

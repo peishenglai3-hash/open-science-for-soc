@@ -71,21 +71,26 @@ it.each([
   'result <- purrr::map_dbl(1:3, round)',
   'library(ggplot2)\np <- scale_y_continuous(labels=function(x) sprintf("%.1f%%", x))'
 ])('analyzes R function composition: %s', async (script) => {
-  expect((await project([script])).stalenessByRunId['run-0']).toEqual({ state: 'clear' })
+  const unprovedMath = script === rCallbackPlot || script.includes('round')
+  expect((await project([script])).stalenessByRunId['run-0']).toMatchObject(
+    unprovedMath
+      ? { state: 'unknown', reasons: expect.arrayContaining(['opaque-call']) }
+      : { state: 'clear' }
+  )
   expect(await analyzeNotebookSourceFileAccess('r', script)).toMatchObject({
-    readState: 'complete',
-    writeState: 'complete',
-    externalState: 'complete'
+    readState: unprovedMath ? 'partial' : 'complete',
+    writeState: unprovedMath ? 'partial' : 'complete',
+    externalState: unprovedMath ? 'partial' : 'complete'
   })
 })
 
 it.each([
-  'lapply(1:3, function(x) round(x * factor))',
+  'lapply(1:3, function(x) x * factor)',
   'lapply(1:3, formatter)',
   'formatter(1:3)',
-  'purrr::map_dbl(1:3, ~ round(.x * factor))'
+  'purrr::map_dbl(1:3, ~ .x * factor)'
 ])('tracks closure dependencies at invocation: %s', async (call) => {
-  const scripts = ['factor <- 2\nformatter <- function(x) round(x * factor)', `result <- ${call}`]
+  const scripts = ['factor <- 2\nformatter <- function(x) x * factor', `result <- ${call}`]
   const before = await project(scripts)
   expect(before.stalenessByRunId['run-1']).toEqual({ state: 'clear' })
   expect(before.dependenciesByRunId?.['run-1']).toContain('run-0')
@@ -139,7 +144,6 @@ it('preserves possible reference sharing through a function return', async () =>
 
 it.each([
   'dplyr::mutate(df, dplyr::across(x:y, ~ round(.x * factor)))',
-  'df |> dplyr::summarise(dplyr::across(x:y, list(avg = mean, spread = sd)))',
   'df |> dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ .x / factor))',
   'df |> dplyr::filter(dplyr::if_any(x:y, ~ .x > factor))',
   'df |> dplyr::filter(dplyr::if_all(x:y, function(x) x > factor))',
@@ -157,11 +161,30 @@ it.each([
   'dplyr::group_modify(df, function(.x, .y) data.frame(total=sum(.x$x)))'
 ])('shares closure analysis with data-mask calls: %s', async (call) => {
   const script = `df <- data.frame(x=1:3, y=4:6); factor <- 2; columns <- c("x", "y"); formatter <- function(x) round(x * factor); result <- ${call}`
-  expect((await project([script])).stalenessByRunId['run-0']).toEqual({ state: 'clear' })
+  // Callback argument classes are unproven for mean and Math dispatch.
+  const unprovedMath = call.includes('round') || call.includes('formatter')
+  expect((await project([script])).stalenessByRunId['run-0']).toMatchObject({
+    state: call.includes('mean') || unprovedMath ? 'unknown' : 'clear'
+  })
   expect(await analyzeNotebookSourceFileAccess('r', script)).toMatchObject({
-    readState: 'complete',
-    writeState: 'complete',
-    externalState: 'complete'
+    readState:
+      call.includes('mean') || call.includes('sum') || unprovedMath ? 'partial' : 'complete',
+    writeState:
+      call.includes('mean') || call.includes('sum') || unprovedMath ? 'partial' : 'complete',
+    externalState:
+      call.includes('mean') || call.includes('sum') || unprovedMath ? 'partial' : 'complete'
+  })
+})
+
+it('keeps sd callbacks partial without per-column primitive evidence', async () => {
+  // Data-frame ownership alone does not certify callback argument classes.
+  // sd can dispatch an as.double method with file effects.
+  const script =
+    'df <- data.frame(x=1:3, y=4:6); result <- df |> dplyr::summarise(dplyr::across(x:y, list(avg = mean, spread = sd)))'
+  expect((await project([script])).stalenessByRunId['run-0']).toMatchObject({ state: 'unknown' })
+  expect(await analyzeNotebookSourceFileAccess('r', script)).toMatchObject({
+    readState: 'partial',
+    writeState: 'partial'
   })
 })
 

@@ -1,4 +1,7 @@
-import { createLogger, errorLogFields } from '@aipoch/diagnostics/node'
+import type { PdfAnnotationAgentTools } from '../pdf-annotations/agent-tools'
+import type { SandboxNetworkApprovalOwner } from './sandbox-network-approval-owner'
+import { AuthorizedDirectoryNotices } from '../local-fs/authorized-directories'
+import { createLogger, diagnosticErrorFields, errorLogFields } from '@aipoch/diagnostics/node'
 import { LiteratureCitationFormatter } from '@aipoch/literature-citations'
 import { LiteratureLatexBundle } from '@aipoch/literature-citations/documents'
 import { LiteratureReferenceResolver } from '@aipoch/literature-discovery'
@@ -14,6 +17,7 @@ import { homedir } from 'node:os'
 import { basename, extname, join } from 'node:path'
 import type { AcpRuntimeEvent, AcpStateUpdate } from '../../shared/acp'
 import type { AcpPermissionRequest } from '../../shared/acp-permission-contract'
+import { SPECIALIST_CAPABILITY_READ_FAILED_MESSAGE } from '../../shared/failure/messages'
 import { DEFAULT_ARTIFACT_PROJECT_ID, type ArtifactFile } from '../../shared/artifacts'
 import { resolveActiveConversationMessages } from '../../shared/conversation-graph'
 import {
@@ -154,7 +158,8 @@ type AcpRuntimeCompositionOptions = AcpRuntimeArtifacts & {
   // The SQLite-backed granted-roots store ("Grant folder access"); the linked-folder file-reference
   // resolver reads it fresh per resolution. Absent only in tests — linked-folder references then
   // fail closed (no root resolves).
-  grantedRootsRepository?: Pick<GrantedLocalRootsRepository, 'list'>
+  grantedRootsRepository?: Pick<GrantedLocalRootsRepository, 'list'> &
+    Partial<Pick<GrantedLocalRootsRepository, 'authorizedSnapshot'>>
   permissionGrantRegistry?: PermissionGrantRegistry
   permissionGrantContext?: Readonly<{ projectId: string; sessionId: string }>
   initializationBarrier?: Promise<unknown>
@@ -183,6 +188,7 @@ type AcpRuntimeCompositionOptions = AcpRuntimeArtifacts & {
   beforeSessionDelete?: (sessionId: string) => Promise<void>
   afterSessionDelete?: (sessionId: string, retained: boolean) => void
   specialistService?: SpecialistService
+  sandboxNetworkApprovalOwner?: SandboxNetworkApprovalOwner
   sessionPersistenceCoordinator?: SessionRuntimeContextCommands &
     SessionMutation &
     SessionCatalog &
@@ -197,6 +203,7 @@ type AcpRuntimeCompositionOptions = AcpRuntimeArtifacts & {
     messageId: string
   }) => Promise<ArtifactFile[]>
   literatureReader?: Pick<LiteratureDocumentReader, 'readCurrent' | 'searchAttachment'>
+  pdfAnnotationAgent?: PdfAnnotationAgentTools
   pdfElementReader?: PdfElementTools
   literatureAttachments?: Pick<LiteratureAttachmentAuthority, 'resolveVersion'>
   literatureCatalog?: Pick<LiteratureCatalog, 'getMany' | 'searchForAgent' | 'transact'>
@@ -216,6 +223,8 @@ type AcpRuntimeCompositionOptions = AcpRuntimeArtifacts & {
   delegatedRuntimeHome?: string
   delegatedArtifactCurrentRunFile?: string
   spawnAgent?: () => ChildProcessWithoutNullStreams
+  spawnProcess?: AcpRuntimeOptions['spawnProcess']
+  registerOpenCodeStoreRelease?: AcpRuntimeOptions['registerOpenCodeStoreRelease']
   hasPendingCredentialRequest?: AcpRuntimeOptions['hasPendingCredentialRequest']
   sideChatRelays?: AcpRuntimeOptions['sideChatRelays']
   imageInputCompatibility?: AcpRuntimeOptions['imageInputCompatibility']
@@ -284,9 +293,11 @@ const createAcpRuntime = ({
   afterSessionDelete,
   specialistService,
   sessionPersistenceCoordinator,
+  sandboxNetworkApprovalOwner,
   finalizeRuntimeArtifacts,
   literatureReader,
   pdfElementReader,
+  pdfAnnotationAgent,
   literatureAttachments,
   literatureCatalog,
   literaturePdfAcquisition,
@@ -298,6 +309,8 @@ const createAcpRuntime = ({
   delegatedRuntimeHome,
   delegatedArtifactCurrentRunFile,
   spawnAgent,
+  spawnProcess,
+  registerOpenCodeStoreRelease,
   sideChatRelays,
   hasPendingCredentialRequest,
   imageInputCompatibility,
@@ -477,6 +490,8 @@ const createAcpRuntime = ({
               )
             : settingsService.resolveAgentBackend(await selection!, context)),
         ...(spawnAgent ? { spawnAgent } : {}),
+        ...(spawnProcess ? { spawnProcess } : {}),
+        ...(registerOpenCodeStoreRelease ? { registerOpenCodeStoreRelease } : {}),
         mcpHttpHost: new AgentMcpHttpHost(),
         wslSetupSessions,
         ...(literatureReader && literatureAttachments && sessionPersistenceCoordinator
@@ -499,7 +514,8 @@ const createAcpRuntime = ({
                 resolveAttachmentVersion: (versionId) =>
                   literatureAttachments.resolveVersion(versionId),
                 readDocument: (request) => literatureReader.readCurrent(request),
-                ...(pdfElementReader ? { elements: pdfElementReader } : {})
+                ...(pdfElementReader ? { elements: pdfElementReader } : {}),
+                ...(pdfAnnotationAgent ? { annotations: pdfAnnotationAgent } : {})
               }
             }
           : {}),
@@ -743,10 +759,10 @@ const createAcpRuntime = ({
             const names = new Set(await settingsService.skillNudgeNamesForIds(ids))
             return preparedSkills.catalog.filter((entry) => names.has(entry.name))
           },
-          catalogForCodexHome: async (codexHome) =>
-            preparedSkills?.catalog ?? settingsService.codexSkillCatalog(codexHome),
-          catalogForCodeBuddyRoot: async (root) =>
-            preparedSkills?.catalog ?? settingsService.codeBuddySkillCatalog(root)
+          catalogForCodexHome: async (codexHome, allowedNames) =>
+            preparedSkills?.catalog ?? settingsService.codexSkillCatalog(codexHome, allowedNames),
+          catalogForCodeBuddyRoot: async (root, allowedNames) =>
+            preparedSkills?.catalog ?? settingsService.codeBuddySkillCatalog(root, allowedNames)
         },
         ...(!delegatedNotebookConnection || delegatedArtifactCurrentRunFile
           ? {
@@ -760,8 +776,8 @@ const createAcpRuntime = ({
                 provenance: provenanceRepository,
                 managedFileVersions,
                 getRpcConnection: () => notebookRpcServer.ensureStarted(),
-                issueRpcCapability: (binding) =>
-                  notebookRpcServer.issueArtifactRunCapability(binding),
+                issueRpcCapability: (binding, isOwnerActive) =>
+                  notebookRpcServer.issueArtifactRunCapability(binding, undefined, isOwnerActive),
                 revokeRpcCapability: (token) =>
                   notebookRpcServer.revokeArtifactRunCapability(token),
                 ...(delegatedArtifactCurrentRunFile
@@ -771,6 +787,9 @@ const createAcpRuntime = ({
             }
           : {}),
         ...(delegatedNotebookConnection ? {} : { uploads: { repository: uploadRepository } }),
+        authorizedDirectories: grantedRootsRepository?.authorizedSnapshot
+          ? new AuthorizedDirectoryNotices(() => grantedRootsRepository.authorizedSnapshot!())
+          : undefined,
         grantedRoots: grantedRootsRepository
           ? {
               list: () => grantedRootsRepository.list(),
@@ -851,6 +870,9 @@ const createAcpRuntime = ({
         ...(!delegatedNotebookConnection && sessionPersistenceCoordinator
           ? {
               permissionWait: {
+                networkApprovalOwner: sandboxNetworkApprovalOwner,
+                allowNetworkDomain:
+                  settingsService.allowNotebookNetworkDomain?.bind(settingsService),
                 sessions: sessionPersistenceCoordinator,
                 onSessionUpdated: (session) => {
                   try {
@@ -964,11 +986,29 @@ const createAcpRuntime = ({
               let profile
               try {
                 profile = await specialistService.resolveRunnableById(specialistId)
-              } catch {
-                // Profile not found or corrupt
+              } catch (error) {
+                log.warn('bound specialist profile resolution failed', {
+                  operation: 'specialist-resolution',
+                  phase: 'profile',
+                  resolver: 'identity',
+                  specialistId,
+                  frameworkId,
+                  reason: 'profile-read-failed',
+                  ...diagnosticErrorFields(error)
+                })
                 return undefined
               }
-              if (!profile.enabled) return undefined
+              if (!profile.enabled) {
+                log.warn('bound specialist profile resolution failed', {
+                  operation: 'specialist-resolution',
+                  phase: 'profile',
+                  resolver: 'identity',
+                  specialistId,
+                  frameworkId,
+                  reason: 'disabled'
+                })
+                return undefined
+              }
               const append = buildSpecialistIdentityAppend(profile)
               const prefix = buildSpecialistIdentityPrefix(profile)
               if (frameworkId === 'claude-code') return { append, prefix: '' }
@@ -976,17 +1016,45 @@ const createAcpRuntime = ({
             }
           : undefined,
         resolveSpecialistSkills: specialistService
-          ? async (specialistId) => {
+          ? async (specialistId, context) => {
+              let profile
               try {
-                const profile = await specialistService.resolveRunnableById(specialistId)
-                if (!profile.enabled) {
-                  return { kind: 'unavailable', reason: 'The bound specialist is disabled.' }
-                }
+                profile = await specialistService.resolveRunnableById(specialistId)
+              } catch (error) {
+                log.warn('bound specialist profile resolution failed', {
+                  sessionId: context?.sessionId,
+                  frameworkId: context?.frameworkId,
+                  modelRoute: context?.modelRoute,
+                  operation: 'specialist-resolution',
+                  phase: 'profile',
+                  resolver: 'skills',
+                  specialistId,
+                  reason: 'profile-read-failed',
+                  ...diagnosticErrorFields(error)
+                })
+                return { kind: 'unavailable', reason: 'The bound specialist is unavailable.' }
+              }
+              if (!profile.enabled) {
+                log.warn('bound specialist profile resolution failed', {
+                  sessionId: context?.sessionId,
+                  frameworkId: context?.frameworkId,
+                  modelRoute: context?.modelRoute,
+                  operation: 'specialist-resolution',
+                  phase: 'profile',
+                  resolver: 'skills',
+                  specialistId,
+                  reason: 'disabled'
+                })
+                return { kind: 'unavailable', reason: 'The bound specialist is disabled.' }
+              }
+              let stage = 'skills'
+              try {
                 const effective = resolveEffectiveSpecialistSkills(
                   profile,
                   await settingsService.listSpecialistSkillCatalog()
                 )
                 if (effective.kind === 'specialist') {
+                  stage = 'connectors'
                   const [provisioned, connectors] = await Promise.all([
                     settingsService.provisionedConnectorSkillNames(),
                     settingsService.getConnectors()
@@ -1018,8 +1086,18 @@ const createAcpRuntime = ({
                   }
                 }
                 return effective
-              } catch {
-                return { kind: 'unavailable', reason: 'The bound specialist is unavailable.' }
+              } catch (error) {
+                log.warn('bound specialist capability resolution failed', {
+                  sessionId: context?.sessionId,
+                  frameworkId: context?.frameworkId,
+                  modelRoute: context?.modelRoute,
+                  operation: 'specialist-resolution',
+                  specialistId,
+                  phase: stage,
+                  reason: 'capability-read-failed',
+                  ...diagnosticErrorFields(error)
+                })
+                return { kind: 'unavailable', reason: SPECIALIST_CAPABILITY_READ_FAILED_MESSAGE }
               }
             }
           : undefined,

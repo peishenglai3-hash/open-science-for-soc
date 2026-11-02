@@ -5,6 +5,46 @@ import { SessionPackageOperation } from './operation'
 afterEach(() => vi.useRealTimers())
 
 const session = { projectId: 'project', sessionId: 'session' }
+
+it('throttles byte-only receipt events to 150 ms while publishing task boundaries immediately', () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(1000)
+  const changed = vi.fn()
+  const owner = new SessionPackageOperation(changed)
+  const transfer = {
+    id: 'one',
+    filename: 'one.science',
+    state: 'receiving' as const,
+    completedBytes: 0,
+    totalBytes: 100
+  }
+  owner.setBrowserTransfers([transfer])
+  expect(changed).toHaveBeenCalledTimes(1)
+  owner.setBrowserTransfers([{ ...transfer, completedBytes: 10 }])
+  owner.setBrowserTransfers([{ ...transfer, completedBytes: 20 }])
+  expect(owner.snapshot?.browserTransfers?.[0].completedBytes).toBe(20)
+  expect(changed).toHaveBeenCalledTimes(1)
+  vi.advanceTimersByTime(150)
+  owner.setBrowserTransfers([{ ...transfer, completedBytes: 30 }])
+  expect(changed).toHaveBeenCalledTimes(2)
+  owner.setBrowserTransfers([
+    { ...transfer, completedBytes: 30 },
+    { ...transfer, id: 'two' }
+  ])
+  expect(changed).toHaveBeenCalledTimes(3)
+  owner.setBrowserTransfers([
+    { ...transfer, completedBytes: 30, state: 'cancelled' },
+    { ...transfer, id: 'two' }
+  ])
+  expect(changed).toHaveBeenCalledTimes(4)
+  owner.setBrowserTransfers([
+    { ...transfer, completedBytes: 30, state: 'cancelled' },
+    { ...transfer, id: 'two', completedBytes: 100 }
+  ])
+  expect(changed).toHaveBeenCalledTimes(5)
+  owner.setBrowserTransfers([])
+  expect(changed).toHaveBeenCalledTimes(6)
+})
 const file = {
   storageKey: 'artifacts/p/s/file',
   filename: 'result.csv',
@@ -81,12 +121,19 @@ describe('SessionPackageOperation', () => {
     const completion = deferred()
     const run = owner.run('import', undefined, () => completion.promise)
     const id = owner.snapshot!.id
-    expect(owner.transferBytesPerSecond).toBe(16 * 1024 ** 2)
+    expect(owner.transferBytesPerSecond).toBe(1024 ** 3)
     owner.respond({ action: 'set-speed', operationId: id, bytesPerSecond: 4 * 1024 ** 2 })
     expect(owner.transferBytesPerSecond).toBe(4 * 1024 ** 2)
     expect(owner.snapshot).toMatchObject({ id, state: 'running' })
     expect(() =>
       owner.respond({ action: 'set-speed', operationId: id, bytesPerSecond: 0 })
+    ).toThrow('Invalid')
+    for (const rate of [512 * 1024 ** 2, 1024 ** 3]) {
+      owner.respond({ action: 'set-speed', operationId: id, bytesPerSecond: rate })
+      expect(owner.transferBytesPerSecond).toBe(rate)
+    }
+    expect(() =>
+      owner.respond({ action: 'set-speed', operationId: id, bytesPerSecond: 1024 ** 3 + 1 })
     ).toThrow('Invalid')
     completion.resolve()
     await run
@@ -95,16 +142,16 @@ describe('SessionPackageOperation', () => {
     ).toThrow('no longer active')
   })
 
-  it('adapts the default budget to sustained disk throughput and can return to Auto', async () => {
+  it('starts at the full default budget without mistaking processing pauses for slow storage', async () => {
     vi.useFakeTimers()
     const owner = new SessionPackageOperation()
     const completion = deferred()
     const run = owner.run('import', undefined, () => completion.promise)
-    expect(owner.transferBytesPerSecond).toBe(16 * 1024 ** 2)
+    expect(owner.transferBytesPerSecond).toBe(1024 ** 3)
 
     await vi.advanceTimersByTimeAsync(2_000)
     owner.reportIo(16 * 1024 ** 2)
-    expect(owner.transferBytesPerSecond).toBe(32 * 1024 ** 2)
+    expect(owner.transferBytesPerSecond).toBe(1024 ** 3)
 
     owner.respond({
       action: 'set-speed',
@@ -113,7 +160,7 @@ describe('SessionPackageOperation', () => {
     })
     expect(owner.transferBytesPerSecond).toBe(64 * 1024 ** 2)
     owner.respond({ action: 'set-speed', operationId: owner.snapshot!.id, bytesPerSecond: null })
-    expect(owner.transferBytesPerSecond).toBe(16 * 1024 ** 2)
+    expect(owner.transferBytesPerSecond).toBe(1024 ** 3)
 
     completion.resolve()
     await run
@@ -258,4 +305,102 @@ describe('SessionPackageOperation', () => {
       result: { imported: session }
     })
   })
+})
+
+it('publishes browser transfers without claiming an import or replacing an active export', async () => {
+  const owner = new SessionPackageOperation()
+  const transfers = [
+    {
+      id: 'browser-1',
+      filename: 'study.science',
+      state: 'waiting' as const,
+      completedBytes: 0,
+      totalBytes: 5
+    }
+  ]
+  owner.setBrowserTransfers(transfers)
+  expect(sessionPackageCommandContracts.operation.result.parse(owner.snapshot)).toMatchObject({
+    browserReceiptOnly: true,
+    browserTransfers: transfers,
+    state: 'running'
+  })
+  expect(owner.active).toBe(false)
+  const completion = deferred()
+  const exporting = owner.run('export', session, () => completion.promise)
+  const id = owner.snapshot!.id
+  owner.setBrowserTransfers([{ ...transfers[0], state: 'receiving', completedBytes: 2 }])
+  expect(owner.snapshot).toMatchObject({
+    id,
+    kind: 'export',
+    browserTransfers: [{ completedBytes: 2 }]
+  })
+  completion.resolve()
+  await exporting
+})
+
+it('retains the failed import retry state when cancellation leaves publication recovery required', async () => {
+  const owner = new SessionPackageOperation()
+  const failure = new Error('Publication interrupted after commit')
+  const run = owner.run(
+    'import',
+    undefined,
+    async () => {
+      owner.cancel()
+      throw failure
+    },
+    { projectId: 'target' },
+    () => true
+  )
+  await expect(run).rejects.toBe(failure)
+  expect(owner.snapshot).toMatchObject({ state: 'failed', error: failure.message })
+  expect(owner.snapshot?.result?.recovery).toBeUndefined()
+  expect(owner.active).toBe(false)
+})
+
+it('keeps weighted import progress monotonic through stage changes and resets for a new operation', async () => {
+  const owner = new SessionPackageOperation()
+  await owner.run('import', undefined, async () => {
+    owner.report({
+      phase: 'validating',
+      importStage: 'prepare-preview',
+      completedBytes: 5,
+      totalBytes: 10
+    })
+    expect(owner.snapshot?.progress.overallPercent).toBe(21)
+    owner.report({ phase: 'validating', importStage: 'read-archive', stageProgress: 0.5 })
+    expect(owner.snapshot?.progress.overallPercent).toBe(21)
+    owner.report({ phase: 'importing' })
+    expect(owner.snapshot?.progress.overallPercent).toBe(21)
+    owner.report({ phase: 'importing', importStage: 'publish', stageProgress: 1 })
+    expect(owner.snapshot?.progress.overallPercent).toBe(99)
+  })
+  await owner.run('import', undefined, async () => {
+    owner.report({ phase: 'validating', importStage: 'read-archive', stageProgress: 0.5 })
+    expect(owner.snapshot?.progress.overallPercent).toBe(4)
+  })
+})
+
+it('publishes catalog download ownership from the first snapshot and hands off only when cleared', async () => {
+  const snapshots: import('../../shared/session-package').PackageOperationSnapshot[] = []
+  const owner = new SessionPackageOperation((snapshot) => snapshots.push(snapshot))
+  await owner.run(
+    'import',
+    undefined,
+    async () => {
+      expect(snapshots[0].useCaseDownload).toEqual({ slug: 'research', completedBytes: 0 })
+      owner.reportUseCaseDownload(0, 100)
+      owner.reportUseCaseDownload(35, 100)
+      expect(snapshots.at(-1)?.useCaseDownload?.completedBytes).toBe(35)
+      expect(owner.snapshot?.useCaseDownload).toEqual({
+        slug: 'research',
+        completedBytes: 35,
+        totalBytes: 100
+      })
+      owner.finishUseCaseDownload()
+      expect(owner.snapshot?.useCaseDownload).toBeUndefined()
+    },
+    {},
+    undefined,
+    'research'
+  )
 })

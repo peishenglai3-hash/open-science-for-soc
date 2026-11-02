@@ -11,6 +11,7 @@ import { createPackageTestPlan, validatePackageTestRegistry } from './package-te
 import {
   collectCodeGraphTests,
   createAffectedTestPlan,
+  createFullPlanFloor,
   createModuleTestPlan,
   executeModuleTestPlan,
   formatModuleTestPlan,
@@ -36,6 +37,18 @@ function captureNpmInvocation(): {
   return { spawn, invocation }
 }
 
+// Argument transport is independent of the repository's changing module-routing policy.
+const selectiveTransportPlan = (): ReturnType<typeof createModuleTestPlan> => ({
+  mode: 'selective',
+  modules: [],
+  testFiles: ['src/transport-fixture.test.ts'],
+  capabilityOverlays: [],
+  fallbackCapabilities: [],
+  graphStatus: 'not-requested',
+  graphReason: undefined,
+  reasonChains: []
+})
+
 const currentStatus = JSON.stringify({
   initialized: true,
   pendingChanges: { added: 0, modified: 0, removed: 0 },
@@ -57,7 +70,7 @@ describe('module test impact commands', () => {
       expect(plan.testFiles).toEqual(
         expect.arrayContaining([
           'packages/pdf-translation/test/writer.test.ts',
-          'src/main/settings/provider-text-generation.test.ts',
+          'src/main/literature/pdf-translation/api-target.test.ts',
           'packages/pdf-translation/test/reader/pdf-translation-extraction.test.ts',
           'packages/pdf-translation/test/recovery.test.ts',
           'test/pdf-translation-native-verification.test.ts'
@@ -77,7 +90,7 @@ describe('module test impact commands', () => {
     expect(mixed.testFiles).toEqual(expect.arrayContaining(sourcePlan.testFiles))
     const packageFixture = createAffectedTestPlan(
       [
-        { path: 'src/main/settings/provider-text-generation.ts', status: 'modified' },
+        { path: 'src/main/literature/pdf-translation/api-target.ts', status: 'modified' },
         { path: 'test/fixtures/pdf-translation/new-regression-case.jsonl', status: 'modified' }
       ],
       graph
@@ -150,6 +163,7 @@ describe('module test impact commands', () => {
           throw new Error('CodeGraph unavailable in CI')
         },
         spawn,
+        derivedConsumers: { schemaVersion: 1, modules: {} },
         environment: { npm_execpath: '/npm/bin/npm-cli.js' }
       }
       const args = ['affected', '--base', 'base', '--head', 'head']
@@ -168,6 +182,7 @@ describe('module test impact commands', () => {
     expect(
       executeModuleTestPlan(createModuleTestPlan('artifact_storage'), {
         spawn,
+        derivedConsumers: { schemaVersion: 1, modules: {} },
         environment: { npm_execpath: '/npm/bin/npm-cli.js' }
       })
     ).toBe(1)
@@ -183,10 +198,12 @@ describe('module test impact commands', () => {
       const { spawn, invocation } = captureNpmInvocation()
       const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
       const source = 'src/main/notebook/mcp-server.ts'
-      const plan = createAffectedTestPlan([{ path: source, status: 'modified' }], {
-        status: 'unavailable-manifest-only',
-        testFiles: []
-      })
+      const manifest = loadModuleImpactManifest()
+      const plan = createAffectedTestPlan(
+        [{ path: source, status: 'modified' }],
+        { status: 'unavailable-manifest-only', testFiles: [] },
+        manifest
+      )
       try {
         await runModuleTestCli(
           [
@@ -208,6 +225,8 @@ describe('module test impact commands', () => {
               throw new Error('CodeGraph unavailable in CI')
             },
             spawn,
+            manifest,
+            derivedConsumers: { schemaVersion: 1, modules: {} },
             environment: { npm_execpath: '/npm/bin/npm-cli.js' }
           }
         )
@@ -280,7 +299,7 @@ describe('module test impact commands', () => {
       [{ path: 'src/main/compute/dispatch-evidence.ts', status: 'added' }],
       { status: 'current', testFiles: [] }
     )
-    expect(affected.modules).toEqual(['compute_service', 'workspace_page'])
+    expect(affected.modules).toEqual(['compute_service'])
     expect(affected.testFiles).toEqual(
       expect.arrayContaining([
         'src/main/compute/compute-job-lifecycle.test.ts',
@@ -304,9 +323,7 @@ describe('module test impact commands', () => {
 
     expect(affected.mode).toBe('selective')
     expect(affected.modules).toEqual(
-      path.startsWith('packages/')
-        ? ['compute_package', 'compute_service', 'workspace_page']
-        : ['compute_service', 'workspace_page']
+      path.startsWith('packages/') ? ['compute_package', 'compute_service'] : ['compute_service']
     )
     if (path.startsWith('packages/'))
       expect(affected.testFiles).toEqual(
@@ -333,7 +350,34 @@ describe('module test impact commands', () => {
     )
   })
 
-  it('expands User Skill repository changes through Settings and cross-surface consumers', () => {
+  it.each([
+    ['upload_repository', 'src/main/uploads/pdf-ocr.ts'],
+    ['user_skills_repository', 'src/main/skills/catalog.ts'],
+    ['user_skills_repository', 'src/main/skills/user-skill-repository.ts'],
+    ['user_skills_repository', 'src/main/skills/source-repository.ts'],
+    ['settings_extension_presentation', 'src/renderer/src/pages/settings/SkillEditor.tsx'],
+    [
+      'settings_extension_presentation',
+      'src/renderer/src/pages/settings/SavedSkillRepositories.tsx'
+    ]
+  ])('retains full validation for %s changes in %s', (moduleId, path) => {
+    const manifest = loadModuleImpactManifest()
+    const reason = manifest.modules[moduleId].fullTestReason
+    expect(reason).toBeTruthy()
+    for (const plan of [
+      createModuleTestPlan(moduleId, manifest),
+      createAffectedTestPlan(
+        [{ path, status: 'modified' }],
+        { status: 'unavailable-manifest-only', testFiles: [] },
+        manifest
+      )
+    ]) {
+      expect(plan.mode).toBe('full')
+      expect(plan.reasonChains).toEqual([`${moduleId} -> ${reason} -> full`])
+    }
+  })
+
+  it('preserves User Skill evidence and expands package changes through cross-surface consumers', () => {
     const manifest = loadModuleImpactManifest()
     const packageTests = manifest.modules.skill_package.testFiles.owner
     expect(packageTests.length).toBeGreaterThan(0)
@@ -356,9 +400,7 @@ describe('module test impact commands', () => {
       ).toEqual([])
     }
     for (const path of [
-      'src/main/skills/catalog.ts',
       'src/main/skill-marketplace/service.ts',
-      'src/renderer/src/pages/settings/SkillEditor.tsx',
       'src/main/compute/skill-provisioning.ts'
     ]) {
       const hostPlan = createAffectedTestPlan([{ path, status: 'modified' }], {
@@ -371,8 +413,9 @@ describe('module test impact commands', () => {
         path
       ).toBe(false)
     }
-    const direct = createModuleTestPlan('user_skills_repository')
-    expect(direct.testFiles).toEqual(
+    // Full plans have no path filter; the explicit evidence must still be registered.
+    const registered = Object.values(manifest.modules.user_skills_repository.testFiles).flat()
+    expect(registered).toEqual(
       expect.arrayContaining([
         'src/main/skills/user-skill-repository.architecture.test.ts',
         'src/main/skills/host-skills-service.test.ts',
@@ -393,7 +436,6 @@ describe('module test impact commands', () => {
     for (const { path, status } of [
       { path: 'packages/skills/src/user-skill-catalog-observer.ts', status: 'modified' },
       { path: 'packages/skills/src/user-skill-compatibility-index.ts', status: 'added' },
-      { path: 'src/main/skills/user-skill-repository.ts', status: 'modified' },
       { path: 'packages/skills/src/user-skill-store.ts', status: 'modified' },
       { path: 'packages/skills/src/agent-home-skill-owner.ts', status: 'added' },
       { path: 'packages/skills/src/skill-bundle-import-owner.ts', status: 'modified' },
@@ -405,61 +447,52 @@ describe('module test impact commands', () => {
         status: 'current',
         testFiles: []
       })
-      const prefix = path.startsWith('packages/skills/') ? 'skill_package -> ' : ''
+      expect(affected.mode, path).toBe('selective')
+      const prefix = 'skill_package -> '
       expect([...affected.modules].sort()).toEqual([
-        ...(prefix ? ['settings_operations'] : []),
         'settings_service_facade',
-        ...(prefix ? ['skill_marketplace', 'skill_package'] : []),
-        'user_skills_repository',
-        'workspace_page',
-        'workspace_runtime'
+        'skill_marketplace',
+        'skill_package',
+        'user_skills_repository'
       ])
       expect(affected.reasonChains).toEqual(
         expect.arrayContaining([
           `${prefix}user_skills_repository -> settings_service_facade`,
-          `${prefix}user_skills_repository -> settings_service_facade -> workspace_runtime`,
-          `${prefix}user_skills_repository -> settings_service_facade -> workspace_runtime -> workspace_page`
+          `${prefix}user_skills_repository -> settings_service_facade -> workspace_runtime -> capability routing only`,
+          `${prefix}user_skills_repository -> settings_service_facade -> workspace_runtime -> workspace_page -> capability routing only`
         ])
       )
       expect(
         affected.testFiles.filter((file) => file.startsWith('packages/skills/')).sort()
-      ).toEqual(prefix ? [...packageTests].sort() : [])
-      if (prefix) {
-        expect(affected.reasonChains).toEqual(
-          expect.arrayContaining([
-            'skill_package -> skill_marketplace',
-            'skill_package -> skill_marketplace -> settings_operations'
-          ])
-        )
-        expect(affected.testFiles).toEqual(
-          expect.arrayContaining([
-            'src/main/skill-marketplace/installation.test.ts',
-            'src/main/skill-marketplace/service.test.ts',
-            'src/main/settings/workflows.test.ts'
-          ])
-        )
-      }
+      ).toEqual([...packageTests].sort())
+      expect(affected.reasonChains).toEqual(
+        expect.arrayContaining([
+          'skill_package -> skill_marketplace',
+          'skill_package -> skill_marketplace -> settings_operations -> capability routing only'
+        ])
+      )
+      expect(affected.testFiles).toEqual(
+        expect.arrayContaining([
+          'src/main/skill-marketplace/installation.test.ts',
+          'src/main/skill-marketplace/service.test.ts',
+          'src/main/settings/workflows.test.ts'
+        ])
+      )
       expect(affected.testFiles).not.toContain('packages/open-science/cli.test.ts')
       expect(affected.testFiles).not.toContain('packages/open-science/client.test.ts')
       expect(affected.testFiles).toEqual(
         expect.arrayContaining([
-          'src/main/acp/task-agent-port.test.ts',
-          'src/main/notebook/local-rpc-notebook-adapter.test.ts',
           'src/main/notebook/local-rpc-server.mcpcall.test.ts',
           'src/main/notebook/local-rpc-server.skill-import.test.ts',
           'src/main/notebook/local-rpc-server.skills.test.ts',
           'src/main/notebook/mcp-server.test.ts',
           'src/main/settings/ipc.test.ts',
           'src/main/web-service/http-server.test.ts',
-          'src/preload/electron-renderer-contract-adapter.test.ts',
           'src/preload/index.test.ts',
           'src/renderer/src/pages/settings/SkillsPanel.render.test.tsx',
           'src/renderer/src/stores/settings-skills-slice.test.ts',
           'src/renderer/src/stores/settings-store.test.ts',
-          'src/renderer/web/api-installer.test.ts',
-          'src/shared/renderer-surface-inventory.test.ts',
-          'src/shared/renderer-surface-matrix.test.ts',
-          'src/shared/web-rpc-contract.test.ts'
+          'src/renderer/web/api-installer.test.ts'
         ])
       )
     }
@@ -472,14 +505,11 @@ describe('module test impact commands', () => {
     )
 
     expect(plan.mode).toBe('selective')
-    expect(plan.modules).toEqual([
-      'artifact_provenance',
-      'artifact_storage',
-      'project_lifecycle',
-      'session_persistence'
-    ])
+    expect(plan.modules).toEqual(['artifact_storage'])
     expect(plan.testFiles).toContain('src/main/reviewer/ipc.test.ts')
-    expect(plan.reasonChains).toContain('artifact_storage -> artifact_provenance')
+    expect(plan.reasonChains).toContain(
+      'artifact_storage -> artifact_provenance -> capability routing only'
+    )
   })
 
   it.each(['src/main/reviewer/reviewer-session-driver.ts'])(
@@ -490,190 +520,123 @@ describe('module test impact commands', () => {
         testFiles: []
       })
 
-      expect([...plan.modules].sort()).toEqual([
-        'artifact_provenance',
-        'project_lifecycle',
-        'reviewer_orchestrator',
-        'session_persistence',
-        'session_replay',
-        'workspace_page',
-        'workspace_runtime'
-      ])
+      expect(plan.modules).toEqual(['reviewer_orchestrator'])
       expect(plan.reasonChains).toEqual(
         expect.arrayContaining([
-          'reviewer_orchestrator -> session_replay',
-          'reviewer_orchestrator -> workspace_runtime',
-          'reviewer_orchestrator -> workspace_page',
-          'reviewer_orchestrator -> artifact_provenance',
-          'reviewer_orchestrator -> artifact_provenance -> session_persistence'
+          'reviewer_orchestrator -> session_replay -> capability routing only',
+          'reviewer_orchestrator -> workspace_runtime -> capability routing only',
+          'reviewer_orchestrator -> workspace_page -> capability routing only',
+          'reviewer_orchestrator -> artifact_provenance -> capability routing only',
+          'reviewer_orchestrator -> artifact_provenance -> session_persistence -> capability routing only'
         ])
       )
       expect(plan.testFiles).toEqual(
         expect.arrayContaining([
-          'src/main/artifacts/provenance-repository.architecture.test.ts',
-          'src/main/session-persistence/coordinator.architecture.test.ts',
-          'src/renderer/src/lib/acp/useWorkspaceAgentRuntime.architecture.test.ts',
-          'src/renderer/src/pages/workspace/workspace-page.architecture.test.ts'
+          'src/main/reviewer/reviewer-orchestrator.architecture.test.ts',
+          'src/main/reviewer/orchestrator-drive.test.ts',
+          'src/main/reviewer/orchestrator.start-contract.test.ts',
+          'src/main/reviewer/lifecycle.test.ts'
         ])
       )
     }
   )
 
   it.each([
-    [
-      'src/main/settings/repository.ts',
-      [
-        'artifact_provenance',
-        'compute_service',
-        'project_lifecycle',
-        'reviewer_orchestrator',
-        'session_persistence',
-        'session_replay',
-        'settings_backend_resolution',
-        'settings_provider_accounts',
-        'settings_repository',
-        'settings_service_facade',
-        'workspace_page',
-        'workspace_runtime'
-      ]
-    ],
-    [
-      'src/main/settings/compute-grant-port.ts',
-      [
-        'artifact_provenance',
-        'compute_service',
-        'project_lifecycle',
-        'reviewer_orchestrator',
-        'session_persistence',
-        'session_replay',
-        'settings_backend_resolution',
-        'settings_provider_accounts',
-        'settings_repository',
-        'settings_service_facade',
-        'workspace_page',
-        'workspace_runtime'
-      ]
-    ],
-    [
-      'src/main/settings/provider-accounts.ts',
-      [
-        'artifact_provenance',
-        'project_lifecycle',
-        'reviewer_orchestrator',
-        'session_persistence',
-        'session_replay',
-        'settings_backend_resolution',
-        'settings_provider_accounts',
-        'settings_service_facade',
-        'workspace_page',
-        'workspace_runtime'
-      ]
-    ],
-    [
-      'src/main/settings/responses-bridge.ts',
-      [
-        'artifact_provenance',
-        'project_lifecycle',
-        'reviewer_orchestrator',
-        'session_persistence',
-        'session_replay',
-        'settings_backend_resolution',
-        'settings_service_facade',
-        'workspace_page',
-        'workspace_runtime'
-      ]
-    ],
-    [
-      'src/main/settings/responses-request-adapter.ts',
-      [
-        'artifact_provenance',
-        'project_lifecycle',
-        'reviewer_orchestrator',
-        'session_persistence',
-        'session_replay',
-        'settings_backend_resolution',
-        'settings_service_facade',
-        'workspace_page',
-        'workspace_runtime'
-      ]
-    ],
-    [
-      'src/main/settings/responses-response-adapter.ts',
-      [
-        'artifact_provenance',
-        'project_lifecycle',
-        'reviewer_orchestrator',
-        'session_persistence',
-        'session_replay',
-        'settings_backend_resolution',
-        'settings_service_facade',
-        'workspace_page',
-        'workspace_runtime'
-      ]
-    ],
-    [
-      'src/main/settings/responses-protocol-types.ts',
-      [
-        'artifact_provenance',
-        'project_lifecycle',
-        'reviewer_orchestrator',
-        'session_persistence',
-        'session_replay',
-        'settings_backend_resolution',
-        'settings_service_facade',
-        'workspace_page',
-        'workspace_runtime'
-      ]
-    ],
-    [
-      'src/main/settings/service.ts',
-      ['settings_service_facade', 'workspace_page', 'workspace_runtime']
-    ]
-  ])('expands Settings ownership through real consumers for %s', (path, expectedModules) => {
-    const plan = createAffectedTestPlan([{ path, status: 'modified' }], {
-      status: 'current',
-      testFiles: []
-    })
+    ['src/main/settings/repository.ts', ['settings_repository']],
+    ['src/main/settings/compute-grant-port.ts', ['settings_repository']],
+    ['src/main/settings/provider-accounts.ts', ['settings_provider_accounts']],
+    ['src/main/settings/responses-to-chat-completions-bridge.ts', ['settings_backend_resolution']],
+    ['packages/providers/src/responses/request.ts', ['providers_package']],
+    ['packages/providers/src/responses/response.ts', ['providers_package']],
+    ['packages/providers/src/responses/types.ts', ['providers_package']],
+    ['src/main/settings/service.ts', ['settings_service_facade']]
+  ])(
+    'selects Settings evidence while retaining platform routing for %s',
+    (path, expectedModules) => {
+      const plan = createAffectedTestPlan([{ path, status: 'modified' }], {
+        status: 'current',
+        testFiles: []
+      })
 
-    expect(plan.mode).toBe('selective')
-    expect([...plan.modules].sort()).toEqual(expectedModules)
-    const rootModule =
-      path === 'src/main/settings/repository.ts' ||
-      path === 'src/main/settings/compute-grant-port.ts'
-        ? 'settings_repository'
-        : path === 'src/main/settings/provider-accounts.ts'
-          ? 'settings_provider_accounts'
-          : path === 'src/main/settings/responses-bridge.ts' ||
-              path === 'src/main/settings/responses-protocol-types.ts' ||
-              path === 'src/main/settings/responses-request-adapter.ts' ||
-              path === 'src/main/settings/responses-response-adapter.ts'
-            ? 'settings_backend_resolution'
-            : 'settings_service_facade'
-    expect(plan.reasonChains).toEqual(
-      expect.arrayContaining(
-        rootModule === 'settings_service_facade'
-          ? [
-              'settings_service_facade -> workspace_runtime',
-              'settings_service_facade -> workspace_runtime -> workspace_page'
-            ]
-          : [
-              `${rootModule}${rootModule === 'settings_repository' ? ' -> settings_provider_accounts' : ''}${rootModule === 'settings_backend_resolution' ? '' : ' -> settings_backend_resolution'} -> reviewer_orchestrator`,
-              `${rootModule} -> settings_service_facade -> workspace_runtime`
-            ]
+      expect(plan.mode).toBe('selective')
+      expect([...plan.modules].sort()).toEqual(expectedModules)
+      const rootModule = path.startsWith('packages/providers/')
+        ? 'providers_package'
+        : path === 'src/main/settings/repository.ts' ||
+            path === 'src/main/settings/compute-grant-port.ts'
+          ? 'settings_repository'
+          : path === 'src/main/settings/provider-accounts.ts'
+            ? 'settings_provider_accounts'
+            : path === 'src/main/settings/responses-to-chat-completions-bridge.ts'
+              ? 'settings_backend_resolution'
+              : 'settings_service_facade'
+      expect(plan.reasonChains).toEqual(
+        expect.arrayContaining(
+          rootModule === 'settings_service_facade'
+            ? [
+                'settings_service_facade -> workspace_runtime -> capability routing only',
+                'settings_service_facade -> workspace_runtime -> workspace_page -> capability routing only'
+              ]
+            : [
+                `${rootModule}${rootModule === 'settings_repository' ? ' -> settings_provider_accounts' : ''}${rootModule === 'settings_backend_resolution' ? '' : ' -> settings_backend_resolution'} -> reviewer_orchestrator -> capability routing only`,
+                `${rootModule} -> settings_service_facade -> workspace_runtime -> capability routing only`
+              ]
+        )
       )
-    )
-    expect(plan.testFiles).toEqual(
-      expect.arrayContaining([
-        'src/shared/renderer-surface-inventory.test.ts',
-        'src/shared/renderer-surface-matrix.test.ts',
-        'src/shared/web-rpc-contract.test.ts',
-        'src/main/notebook/local-rpc-notebook-adapter.test.ts',
-        'src/main/notebook/local-rpc-server.mcpcall.test.ts',
-        'src/main/notebook/mcp-server.test.ts',
-        'src/main/web-service/http-server.test.ts'
-      ])
-    )
-  })
+      if (rootModule === 'settings_provider_accounts') {
+        expect(plan.testFiles).toEqual(
+          expect.arrayContaining([
+            'src/main/settings/provider-accounts.test.ts',
+            'src/main/settings/provider-runtime-projection.test.ts',
+            'src/main/settings/backend-resolver.test.ts',
+            'src/main/settings/service.providers.test.ts',
+            'src/main/settings/runtime-application-commands.test.ts',
+            'src/shared/renderer-contract-catalog.test.ts'
+          ])
+        )
+        expect(plan.capabilityOverlays).toEqual(
+          expect.arrayContaining(['windows_sensitive', 'settings_ipc', 'renderer_settings'])
+        )
+        expect(plan.fallbackCapabilities).toEqual(['main_runtime', 'renderer_view'])
+        return
+      }
+      const behaviorTests: Record<string, string[]> = {
+        settings_repository: [
+          'src/main/settings/repository.test.ts',
+          'src/main/settings/document-store.test.ts',
+          'src/main/settings/compute-grants.test.ts',
+          'src/shared/renderer-contract-catalog.test.ts'
+        ],
+        settings_backend_resolution: [
+          'src/main/settings/backend-route-planner.test.ts',
+          'src/main/settings/responses-to-chat-completions-bridge.test.ts',
+          'src/main/agent-framework/claude-code.test.ts',
+          'src/main/agent-framework/codex.test.ts',
+          'src/main/agent-framework/opencode.test.ts'
+        ],
+        providers_package: [
+          'packages/providers/src/responses/request.test.ts',
+          'packages/providers/src/responses/response.test.ts',
+          'packages/providers/src/responses/replay.test.ts',
+          'src/main/settings/responses-to-chat-completions-bridge.test.ts'
+        ],
+        settings_service_facade: [
+          'src/main/settings/service.providers.test.ts',
+          'src/main/settings/service.connectors.test.ts',
+          'src/main/settings/application-commands.test.ts',
+          'src/main/settings/runtime-application-commands.test.ts',
+          'src/main/settings/ipc.test.ts'
+        ]
+      }
+      expect(plan.testFiles).toEqual(expect.arrayContaining(behaviorTests[rootModule]))
+      expect(plan.capabilityOverlays).toEqual(expect.arrayContaining(['windows_sensitive']))
+      expect(plan.fallbackCapabilities).toEqual(
+        rootModule === 'providers_package'
+          ? ['main_runtime', 'renderer_view', 'shared_contract']
+          : ['main_runtime', 'renderer_view']
+      )
+    }
+  )
 
   it('fails closed for unknown and destructive changes', () => {
     expect(
@@ -753,7 +716,7 @@ describe('module test impact commands', () => {
   it.each(['win32', 'darwin', 'linux'])(
     'transports large selections without dropping filters or options on %s',
     (platform) => {
-      const plan = createModuleTestPlan('upload_repository')
+      const plan = selectiveTransportPlan()
       plan.testFiles = Array.from(
         { length: 2200 },
         (_, index) => `src/renderer/src/components/long-consumer-${index}.test.ts`
@@ -803,7 +766,7 @@ describe('module test impact commands', () => {
   )
 
   it.each(['return', 'throw'])('cleans temporary arguments when spawn errors %s', (failure) => {
-    const plan = createModuleTestPlan('upload_repository')
+    const plan = selectiveTransportPlan()
     plan.testFiles = ['x'.repeat(10000) + '.test.ts']
     let argumentFile = ''
     const error = new Error('spawn failed')
@@ -908,7 +871,7 @@ describe('module test impact commands', () => {
   it.each(['npm_execpath', 'NPM_EXECPATH', 'Npm_ExecPath'])(
     'launches npm through Node with the Windows environment key %s',
     (key) => {
-      const plan = createModuleTestPlan('upload_repository')
+      const plan = selectiveTransportPlan()
       const { spawn, invocation } = captureNpmInvocation()
       executeModuleTestPlan(plan, {
         platform: 'win32',
@@ -925,7 +888,7 @@ describe('module test impact commands', () => {
   )
 
   it('prints the exact file list before invoking portable npm test arguments', () => {
-    const plan = createModuleTestPlan('upload_repository')
+    const plan = selectiveTransportPlan()
     const { spawn, invocation } = captureNpmInvocation()
     const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
 
@@ -1022,6 +985,7 @@ describe('module test impact commands', () => {
             throw new Error('CodeGraph unavailable in CI')
           },
           spawn,
+          derivedConsumers: { schemaVersion: 1, modules: {} },
           environment: { npm_execpath: '/npm/bin/npm-cli.js' }
         }
       )
@@ -1029,6 +993,102 @@ describe('module test impact commands', () => {
       expect(invocation.mock.calls[0]?.[1]).not.toContain('--coverage.changed')
     } finally {
       write.mockRestore()
+    }
+  })
+
+  it('runs the full-plan floor selectively with coverage scoped to its own changes', async () => {
+    const owned = 'src/main/literature/mcp-server.ts'
+    const unowned = 'src/shared/new-unregistered-contract.ts'
+    const options = (spawn: NpmInvocation): Parameters<typeof runModuleTestCli>[1] => ({
+      execute: (command: string, args: string[]) => {
+        if (command === 'git' && args[0] === 'merge-base') return 'base\n'
+        if (command === 'git' && args[0] === 'diff')
+          return Buffer.from(`M\0${owned}\0A\0${unowned}\0M\0package.json\0`)
+        throw new Error('CodeGraph unavailable in CI')
+      },
+      spawn,
+      derivedConsumers: { schemaVersion: 1, modules: {} },
+      environment: { npm_execpath: '/npm/bin/npm-cli.js' }
+    })
+    const args = ['affected', '--base', 'base', '--head', 'head', '--coverage-changed', 'base']
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    try {
+      const { spawn, invocation } = captureNpmInvocation()
+      await expect(
+        runModuleTestCli([...args, '--require-selective'], options(spawn))
+      ).rejects.toThrow('Selective test plan required')
+      await runModuleTestCli([...args, '--require-selective', '--full-floor'], options(spawn))
+      const npm = invocation.mock.calls[0]?.[1]
+      expect(npm).toContain('src/main/acp/auto-operation-inventory.test.ts')
+      expect(npm).toContain(`--coverage.include=${owned}`)
+      expect(npm).not.toContain(`--coverage.include=${unowned}`)
+    } finally {
+      write.mockRestore()
+    }
+  })
+
+  it('never builds a full-plan floor from graph candidates of excluded changes', async () => {
+    const graphTest = 'src/main/graph-only-candidate.test.ts'
+    const options = (
+      diff: string,
+      spawn: NpmInvocation
+    ): Parameters<typeof runModuleTestCli>[1] => ({
+      execute: (command: string, args: string[]) => {
+        if (command === 'git' && args[0] === 'merge-base') return 'base\n'
+        if (command === 'git' && args[0] === 'diff') return Buffer.from(diff)
+        if (command === 'codegraph' && args[0] === 'status') return currentStatus
+        if (command === 'codegraph') return JSON.stringify({ affectedTests: [graphTest] })
+        throw new Error(`Unexpected command: ${command}`)
+      },
+      pathExists: () => true,
+      spawn,
+      derivedConsumers: { schemaVersion: 1, modules: {} },
+      environment: { npm_execpath: '/npm/bin/npm-cli.js' }
+    })
+    const args = ['affected', '--base', 'base', '--head', 'head', '--require-selective']
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    try {
+      const { spawn, invocation } = captureNpmInvocation()
+      // Only excluded paths changed: graph candidates alone must not create a floor.
+      await expect(
+        runModuleTestCli(
+          [...args, '--full-floor'],
+          options('M\0package.json\0A\0src/shared/new-unregistered-contract.ts\0', spawn)
+        )
+      ).rejects.toThrow('Selective test plan required')
+      expect(invocation).not.toHaveBeenCalled()
+      // An owned path keeps its declared floor without graph candidates from other paths.
+      await runModuleTestCli(
+        [...args, '--full-floor'],
+        options('M\0src/main/literature/mcp-server.ts\0M\0package.json\0', spawn)
+      )
+      const npm = invocation.mock.calls[0]?.[1]
+      expect(npm).toContain('src/main/acp/auto-operation-inventory.test.ts')
+      expect(npm).not.toContain(graphTest)
+    } finally {
+      write.mockRestore()
+    }
+  })
+
+  it('generates derived consumers from the requested head, not the dirty worktree', async () => {
+    const cwd = mkdtempSync(resolve(tmpdir(), 'module-head-snapshot-'))
+    try {
+      const git = (...args: string[]): string =>
+        execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
+      git('init', '-q')
+      mkdirSync(resolve(cwd, 'scripts/ci'), { recursive: true })
+      const edges = resolve(cwd, 'scripts/ci/module-runtime-consumers.json')
+      writeFileSync(edges, JSON.stringify({ 'missing.ts': ['consumer.ts'] }))
+      git('add', '.')
+      git('-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '-m', 'init')
+      const head = git('rev-parse', 'HEAD')
+      writeFileSync(edges, '{}')
+
+      await expect(
+        runModuleTestCli(['affected', '--base', head, '--head', head], { cwd })
+      ).rejects.toThrow('Invalid runtime consumer edge')
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
     }
   })
 
@@ -1050,9 +1110,11 @@ describe('module test impact commands', () => {
     const { spawn, invocation } = captureNpmInvocation()
     const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
     const environment = { npm_execpath: '/npm/bin/npm-cli.js' }
+    const manifest = loadModuleImpactManifest()
     const expectedPlan = createAffectedTestPlan(
       [{ path: 'src/main/artifacts/repository.ts', status: 'modified' }],
-      { status: 'current', testFiles: [] }
+      { status: 'current', testFiles: [] },
+      manifest
     )
 
     expect(
@@ -1060,6 +1122,8 @@ describe('module test impact commands', () => {
         ['affected', '--base', base, '--head', head, '--coverage-changed', coverageBase],
         {
           cwd: '/repo',
+          manifest,
+          derivedConsumers: { schemaVersion: 1, modules: {} },
           execute,
           spawn,
           environment,
@@ -1147,8 +1211,13 @@ describe('module test impact commands', () => {
     expect(packageJson.scripts['test:module:arguments']).toBe(
       'node scripts/ci/run-vitest-arguments.mjs'
     )
-    expect(packageJson.scripts['test:module']).toContain('module-test-impact.mjs module')
-    expect(packageJson.scripts['test:affected']).toContain('module-test-impact.mjs affected')
+    // Planning reads source snapshots; only the selected test execution prepares app outputs.
+    expect(packageJson.scripts['test:module']).toBe('node scripts/ci/module-test-impact.mjs module')
+    expect(packageJson.scripts['test:affected']).toBe(
+      'node scripts/ci/module-test-impact.mjs affected'
+    )
+    expect(packageJson.scripts['pretest:module']).toBeUndefined()
+    expect(packageJson.scripts['pretest:affected']).toBeUndefined()
   })
 })
 
@@ -1158,10 +1227,19 @@ it.each([
   'src/main/process-tree-windows.ts',
   'src/main/process-tree.windows.integration.test.ts'
 ])('selects process ownership and lifecycle tests with Windows coverage for %s', (path) => {
-  const plan = createAffectedTestPlan([{ path, status: 'added' }], {
-    status: 'unavailable-manifest-only',
-    testFiles: []
-  })
+  const manifest = loadModuleImpactManifest(resolve('scripts/ci/module-impact.json'))
+  const graph = { status: 'unavailable-manifest-only', testFiles: [] }
+  const changes = [{ path, status: 'added' }]
+  if (path.startsWith('src/main/delegation/')) {
+    const guarded = createAffectedTestPlan(changes, graph, manifest)
+    expect(guarded.mode).toBe('full')
+    expect(guarded.reasonChains.join('\n')).toContain(
+      manifest.modules.main_delegation.fullTestReason
+    )
+  }
+  // Test process routing separately while retaining the production full-validation guard above.
+  delete manifest.modules.main_delegation.fullTestReason
+  const plan = createAffectedTestPlan(changes, graph, manifest)
 
   expect(plan.mode).toBe('selective')
   expect(plan.modules).toContain(
@@ -1185,7 +1263,7 @@ it.each([
 it('uses only declared owner tests to recover colocated implementation ownership', () => {
   const manifest = loadModuleImpactManifest(resolve('scripts/ci/module-impact.json'))
   const graph = { status: 'unavailable-manifest-only', testFiles: [] }
-  const module = manifest.modules.connector_builtins
+  const module = manifest.modules.connector_core
   // Synthetic main-process path exercises owner inference independently of package routing.
   const source = 'src/main/connectors/descriptors/new-known-descriptor.ts'
   const test = source.replace('.ts', '.test.ts')
@@ -1196,7 +1274,7 @@ it('uses only declared owner tests to recover colocated implementation ownership
   module.testFiles.owner.push(test)
   const plan = createAffectedTestPlan(changes, graph, manifest)
   expect(plan.mode).toBe('selective')
-  expect(plan.modules).toContain('connector_builtins')
+  expect(plan.modules).toContain('connector_core')
   expect(plan.testFiles).toContain(test)
   expect(
     createAffectedTestPlan(
@@ -1208,10 +1286,7 @@ it('uses only declared owner tests to recover colocated implementation ownership
 })
 
 it.each([
-  [
-    'packages/connector-builtins/src/genomes-ensembl.ts',
-    'packages/connector-builtins/src/genomes.test.ts'
-  ],
+  ['packages/connector-core/src/engine.ts', 'packages/connector-core/src/engine.test.ts'],
   ['src/main/reviewer/correction.ts', 'src/main/reviewer/correction-owner.test.ts']
 ])('retains the direct owner/aggregate contract when %s changes', (path, testFile) => {
   const plan = createAffectedTestPlan([{ path, status: 'modified' }], {
@@ -1221,6 +1296,28 @@ it.each([
   expect(plan.mode).toBe('selective')
   expect(plan.testFiles).toContain(testFile)
 })
+
+it.each(['genomes-ensembl', 'rxnorm', 'dailymed', 'biosamples', 'wikipathways'])(
+  'keeps the expanded Connector owner on explicit full fallback for %s',
+  (provider) => {
+    const manifest = loadModuleImpactManifest(resolve('scripts/ci/module-impact.json'))
+    const plan = createAffectedTestPlan(
+      [{ path: `packages/connector-builtins/src/${provider}.ts`, status: 'modified' }],
+      { status: 'unavailable-manifest-only', testFiles: [] },
+      manifest
+    )
+    expect(plan.mode).toBe('full')
+    expect(plan.reasonChains).toEqual([
+      `connector_builtins -> ${manifest.modules.connector_builtins.fullTestReason} -> full`
+    ])
+    expect(manifest.modules.connector_builtins.testFiles.owner).toEqual(
+      expect.arrayContaining([
+        'packages/connector-builtins/src/genomes.test.ts',
+        'packages/connector-builtins/src/optional-research.test.ts'
+      ])
+    )
+  }
+)
 
 it.each([
   'src/main/session-diagnostics/notebook.ts',
@@ -1291,7 +1388,7 @@ describe('Notebook package module boundaries', () => {
         id
       ).toEqual([])
       if (!module.fullTestReason)
-        expect(packageTests(createModuleTestPlan(id, manifest).testFiles), id).toEqual([])
+        expect(packageTests(createModuleTestPlan(id).testFiles), id).toEqual([])
     }
   })
 
@@ -1318,10 +1415,9 @@ describe('Notebook package module boundaries', () => {
     }
     for (const path of [
       'src/main/notebook/runtime-service.ts',
-      'src/main/notebook/dependency-analysis-adapter.ts',
-      'src/main/notebook/scientific-output-analysis.ts'
+      'src/main/notebook/dependency-analysis-adapter.ts'
     ]) {
-      const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph, manifest)
+      const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
       expect(plan.mode).toBe('selective')
       expect(packageTests(plan.testFiles)).toEqual([])
       expect(plan.testFiles).toContain('src/main/notebook/code-risk-admission.test.ts')
@@ -1337,13 +1433,9 @@ describe('Notebook package module boundaries', () => {
       'src/main/notebook/dependency-analysis-adapter.ts',
       'src/main/notebook/dependency-analysis-adapter.test.ts'
     ],
-    [
-      'src/main/notebook/working-file-observer.ts',
-      'src/main/notebook/working-file-observer.test.ts'
-    ],
     ['src/main/storage/content-repository.ts', 'src/main/storage/content-repository.test.ts']
   ])('keeps host integrations without upstream package units for %s', (path, integration) => {
-    const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph, manifest)
+    const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
     expect(plan.mode).toBe('selective')
     expect(plan.testFiles).toContain(integration)
     expect(packageTests(plan.testFiles)).toEqual([])
@@ -1364,13 +1456,14 @@ describe('Notebook package module boundaries', () => {
   ])(
     'selects only downstream package suites and host integrations for %s',
     (id, path, selected) => {
-      const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph, manifest)
+      const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
       expect(plan.mode).toBe('selective')
       for (const candidate of packageModules) {
         const owned = manifest.modules[candidate].testFiles.owner
         if (candidate !== 'notebook_analysis') expect(owned.length).toBeGreaterThan(0)
-        if (selected.includes(candidate))
-          expect(plan.testFiles).toEqual(expect.arrayContaining(owned))
+        if (candidate === id) expect(plan.testFiles).toEqual(expect.arrayContaining(owned))
+        else if (selected.includes(candidate))
+          expect(plan.testFiles.some((test) => owned.includes(test))).toBe(true)
         else
           expect(
             plan.testFiles.filter((test) => owned.includes(test)),
@@ -1384,25 +1477,192 @@ describe('Notebook package module boundaries', () => {
 })
 
 it('separates analysis implementation consumers from broad shared contract consumers', () => {
-  const manifest = loadModuleImpactManifest()
   const graph = { status: 'unavailable-manifest-only', testFiles: [] }
   const implementation = createAffectedTestPlan(
     [{ path: 'packages/notebook-analysis/src/dependency-analysis-python.ts', status: 'modified' }],
-    graph,
-    manifest
+    graph
   )
   const contract = createAffectedTestPlan(
     [{ path: 'packages/notebook-analysis/src/contracts.ts', status: 'modified' }],
-    graph,
-    manifest
+    graph
   )
   expect(implementation.modules).toContain('notebook_analysis_engine')
   expect(implementation.modules).not.toContain('notebook_analysis')
   expect(implementation.modules).not.toContain('session_persistence')
-  expect(contract.modules).toEqual(
-    expect.arrayContaining(['notebook_analysis', 'notebook_analysis_engine', 'session_persistence'])
+  expect(contract.modules).toEqual(['notebook_analysis'])
+  expect(contract.testFiles).toEqual(
+    expect.arrayContaining([
+      'packages/notebook-analysis/src/dependency-analysis.contracts.test.ts',
+      'src/main/notebook/analysis-file-evidence.test.ts',
+      'src/main/notebook/serialized-file-provenance.test.ts'
+    ])
   )
-  expect(contract.testFiles).toEqual(expect.arrayContaining(implementation.testFiles))
   expect(implementation.testFiles).toContain('src/main/notebook/analysis-file-evidence.test.ts')
   expect(implementation.testFiles).toContain('src/main/notebook/serialized-file-provenance.test.ts')
+})
+
+it('separates reviewed dependency tests from inherited platform routing, including mixed edits', () => {
+  const boundary = {
+    ownerPaths: ['src/shared/fuzzy-match.ts'],
+    interfacePaths: ['src/shared/fuzzy-match.ts'],
+    consumerModules: ['host_command_runtime'],
+    testFiles: {
+      owner: [],
+      contract: ['src/shared/behavior.test.ts'],
+      consumer: ['src/shared/known.test.ts']
+    },
+    capabilityOverlays: ['notebook_network_sandbox'],
+    fallbackCapability: 'shared_contract'
+  }
+  const host = {
+    ownerPaths: ['src/main/host.ts'],
+    interfacePaths: ['src/main/host.ts'],
+    consumerModules: [],
+    testFiles: {
+      owner: ['src/main/host.test.ts'],
+      contract: [],
+      consumer: ['src/main/unrelated.test.ts']
+    },
+    capabilityOverlays: ['windows_sensitive', 'e2e_regressions'],
+    fallbackCapability: 'main_runtime'
+  }
+  const manifest = {
+    schemaVersion: 1,
+    modules: { shared_fuzzy_match: boundary, host_command_runtime: host }
+  }
+  const graph = { status: 'not-used', testFiles: ['src/shared/graph.test.ts'] }
+  const changes = [{ path: 'src/shared/fuzzy-match.ts', status: 'modified' }]
+  const plan = createAffectedTestPlan(changes, graph, manifest)
+  expect(plan.mode).toBe('selective')
+  expect(plan.modules).toEqual(['shared_fuzzy_match'])
+  expect(plan.testFiles).toEqual([
+    'src/shared/behavior.test.ts',
+    'src/shared/graph.test.ts',
+    'src/shared/known.test.ts'
+  ])
+  expect(plan.capabilityOverlays).toEqual([
+    'e2e_regressions',
+    'notebook_network_sandbox',
+    'windows_sensitive'
+  ])
+  expect(plan.fallbackCapabilities).toEqual(['main_runtime', 'shared_contract'])
+  expect(plan.reasonChains).toContain(
+    'shared_fuzzy_match -> host_command_runtime -> capability routing only'
+  )
+  const mixed = createAffectedTestPlan(
+    [...changes, { path: 'src/main/host.ts', status: 'modified' }],
+    graph,
+    manifest
+  )
+  expect(mixed.testFiles).toEqual(
+    expect.arrayContaining(host.testFiles.owner.concat(host.testFiles.consumer))
+  )
+  expect(mixed.modules).toEqual(['shared_fuzzy_match', 'host_command_runtime'])
+  expect(
+    createAffectedTestPlan(changes, graph, {
+      ...manifest,
+      modules: {
+        ...manifest.modules,
+        shared_fuzzy_match: { ...boundary, fullTestReason: 'Opaque runtime dependency' }
+      }
+    }).mode
+  ).toBe('full')
+})
+
+it('keeps literature command consumers covered by the explicit full fallback', () => {
+  const manifest = loadModuleImpactManifest()
+  const plan = createAffectedTestPlan(
+    [{ path: 'src/main/literature/command-owner.ts', status: 'modified' }],
+    { status: 'not-used', testFiles: [] },
+    manifest
+  )
+  expect(plan.mode).toBe('full')
+  expect(plan.reasonChains).toEqual([
+    `main_literature -> ${manifest.modules.main_literature.fullTestReason} -> full`
+  ])
+  expect(manifest.modules.main_literature.testFiles.consumer).toContain(
+    'src/renderer/src/pages/literature/detail/LiteratureFullTextLookup.render.test.tsx'
+  )
+})
+
+it('keeps declared contract tests as the deferred full-plan floor', () => {
+  const manifest = loadModuleImpactManifest()
+  const graph = { status: 'not-used', testFiles: [] }
+  const literature = { path: 'src/main/literature/mcp-server.ts', status: 'modified' }
+  // #3979: a full marker and a global input together removed the Auto inventory before merge.
+  const changes = [literature, { path: 'package.json', status: 'modified' }]
+  expect(createAffectedTestPlan(changes, graph, manifest).mode).toBe('full')
+  const floor = createFullPlanFloor(changes, manifest)
+  expect(floor?.mode).toBe('selective')
+  expect(floor?.modules).toContain('main_literature')
+  expect(floor?.testFiles).toContain('src/main/acp/auto-operation-inventory.test.ts')
+  expect(floor?.testFiles).toEqual(createFullPlanFloor([literature], manifest)?.testFiles)
+  const unownedPath = { path: 'src/shared/new-unregistered-contract.ts', status: 'added' }
+  expect(createFullPlanFloor([...changes, unownedPath], manifest)?.floorPaths).toEqual([
+    literature.path
+  ])
+  expect(floor?.reasonChains).toContain(
+    'full plan -> declared module test floor; complete portable suite deferred to scheduled acceptance'
+  )
+  for (const unowned of [
+    [{ path: 'package.json', status: 'modified' }],
+    [{ path: 'src/shared/new-unregistered-contract.ts', status: 'added' }],
+    ...['deleted', 'type-changed', 'unmerged', 'unknown'].map((status) => [
+      { path: literature.path, status }
+    ]),
+    // A rename whose source has no bounded selection cannot be covered from its destination.
+    [
+      {
+        path: 'src/renderer/src/lib/format-star-count.ts',
+        previousPath: 'src/shared/new-unregistered-contract.ts',
+        status: 'renamed'
+      }
+    ]
+  ]) {
+    expect(createFullPlanFloor(unowned, manifest)).toBeUndefined()
+  }
+})
+
+it('keeps both owners of a cross-module rename in the full-plan floor', () => {
+  const manifest = loadModuleImpactManifest()
+  const source = 'src/main/literature/mcp-server.ts'
+  const destination = 'src/renderer/src/lib/format-star-count.ts'
+  const rename = createFullPlanFloor(
+    [{ path: destination, previousPath: source, status: 'renamed' }],
+    manifest
+  )
+  expect(rename?.floorPaths).toEqual([source, destination])
+  for (const path of [source, destination]) {
+    expect(rename?.testFiles).toEqual(
+      expect.arrayContaining(
+        createFullPlanFloor([{ path, status: 'modified' }], manifest)?.testFiles ?? ['missing']
+      )
+    )
+  }
+  expect(rename?.testFiles).toContain('src/main/acp/auto-operation-inventory.test.ts')
+})
+
+it('keeps tag event consumers covered by the explicit full fallback', () => {
+  const manifest = loadModuleImpactManifest()
+  const reason = manifest.modules.main_tags.fullTestReason
+  expect(reason).toBeTruthy()
+  const plan = createAffectedTestPlan(
+    [{ path: 'src/main/tags/repository.ts', status: 'modified' }],
+    { status: 'not-used', testFiles: [] },
+    manifest
+  )
+  expect(plan.mode).toBe('full')
+  expect(plan.reasonChains).toEqual([`main_tags -> ${reason} -> full`])
+  expect(manifest.modules.main_tags.testFiles.consumer).toContain(
+    'src/renderer/src/pages/workspace/pdf-annotations/PdfAnnotationsProvider.test.tsx'
+  )
+})
+
+it('preserves the explicit command or event consumer for src/main/session-persistence/coordinator.ts', () => {
+  const plan = createAffectedTestPlan(
+    [{ path: 'src/main/session-persistence/coordinator.ts', status: 'modified' }],
+    { status: 'not-used', testFiles: [] }
+  )
+  expect(plan.mode).toBe('selective')
+  expect(plan.testFiles).toContain('src/renderer/src/hooks/useLifecycleSync.test.tsx')
 })

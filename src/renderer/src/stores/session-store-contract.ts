@@ -52,7 +52,7 @@ export type ChatArtifact = PersistedArtifact & { isPublished?: boolean }
 
 export type ElicitationEditDraft = {
   requestId: string
-  values: Record<string, ElicitationValue | undefined>
+  values: Record<string, ElicitationValue | { status: 'skipped' } | undefined>
   activeQuestionIndex: number
 }
 
@@ -67,6 +67,8 @@ export type ChatSession = Omit<
   elicitationEditDrafts?: Record<string, ElicitationEditDraft>
   activePlanProjection?: ActivePlanProjection
   planHistoryProjections?: ActivePlanProjection[]
+  // Renderer presentation only: this new conversation has not submitted its first prompt.
+  firstPromptDraft?: boolean
   isPending?: boolean
   // Renderer-only identity of the durable seed while the optimistic Session is being prepared.
   pendingBindingSessionId?: string

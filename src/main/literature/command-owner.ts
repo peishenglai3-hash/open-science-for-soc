@@ -1,8 +1,10 @@
 import type { LiteratureCitationFormatter } from '@aipoch/literature-citations'
-import type { LiteratureCitationStyleLibrary } from '@aipoch/literature-citations/styles'
 import type {
   LiteratureBatchJobs,
   LiteratureFullTextFinder,
+  LiteratureRelatedFinder,
+  LiteratureSupplementFinder,
+  LiteraturePublicationChecker,
   LiteratureMetadataEnricher,
   LiteratureReferenceResolver
 } from '@aipoch/literature-discovery'
@@ -15,26 +17,37 @@ import type { ContentRepository } from '../storage/content-repository'
 import { withDataRootWrite } from '../storage/migration-state'
 import type { LiteratureCommandOwner } from './application-commands'
 import type { LiteratureCatalog } from './catalog'
+import type { LiteratureCollector } from './collector'
+import type { LiteratureSupplementAttachments } from './supplement-attachments'
 import type { LiteratureCitationDocument } from './citation-document'
 import { withCitationStyleErrors } from './citation-errors'
 import type { JournalAttributes } from './journal-attributes'
 import type { LiteraturePdfImporter } from './pdf-importer'
 import { transactLiterature } from './transact'
+import { ApplicationCommandError } from '../../shared/application-command-contract'
+import {
+  ZOTERO_BATCH_POLICY_CONFLICT,
+  ZOTERO_FILL_TYPE_CONFLICT,
+  ZOTERO_COLLECTION_CONFLICT,
+  ZOTERO_PREVIEW_CHANGED,
+  ZOTERO_CONNECTION_FAILED,
+  ZOTERO_REQUEST_TIMED_OUT,
+  ZOTERO_LOCAL_API_DISABLED
+} from '../../shared/literature-collector'
 
 type LiteratureCommandServices = Readonly<{
   journalAttributes: Pick<JournalAttributes, 'run'>
   literatureBatchJobs: Pick<LiteratureBatchJobs, 'run'>
-  literatureCitationStyles: Pick<LiteratureCitationStyleLibrary, 'list' | 'import' | 'delete'>
   literatureCitationFormatter: Pick<
     LiteratureCitationFormatter,
-    | 'formatStyleExample'
-    | 'invalidateStyles'
-    | 'formatReferences'
-    | 'exportReferences'
-    | 'parseReferences'
+    'citationStyles' | 'formatReferences' | 'exportReferences' | 'parseReferences'
   >
   literatureReferenceResolver: Pick<LiteratureReferenceResolver, 'resolve'>
   literatureMetadataEnricher: Pick<LiteratureMetadataEnricher<LiteratureItemView>, 'complete'>
+  literatureRelatedFinder: Pick<LiteratureRelatedFinder, 'run'>
+  literatureSupplementFinder: Pick<LiteratureSupplementFinder, 'run'>
+  literaturePublicationChecker: Pick<LiteraturePublicationChecker, 'run'>
+  literatureSupplementAttachments: Pick<LiteratureSupplementAttachments, 'run' | 'progress'>
   literatureFullTextFinder: Pick<LiteratureFullTextFinder<LiteratureItemView>, 'run'>
   artifactProvenanceRepository: {
     getVersionLiterature(
@@ -59,6 +72,7 @@ type LiteratureCommandServices = Readonly<{
     | 'transact'
     | 'contentBlobIdsForItems'
   >
+  literatureCollector: Pick<LiteratureCollector, 'run'>
   literaturePdfImporter: Pick<LiteraturePdfImporter, 'import' | 'cancelImport' | 'addToLiterature'>
   contentRepository: Pick<ContentRepository, 'sweep'>
 }>
@@ -66,51 +80,60 @@ type LiteratureCommandServices = Readonly<{
 export const createLiteratureCommandOwner = ({
   journalAttributes,
   literatureBatchJobs,
-  literatureCitationStyles,
   literatureCitationFormatter,
   literatureReferenceResolver,
   literatureMetadataEnricher,
   literatureFullTextFinder,
+  literatureRelatedFinder,
+  literatureSupplementFinder,
+  literaturePublicationChecker,
+  literatureSupplementAttachments,
   artifactProvenanceRepository,
   managedFileVersionService,
   literatureCitationDocument,
   literatureCatalog,
   literaturePdfImporter,
+  literatureCollector,
   contentRepository
 }: LiteratureCommandServices): LiteratureCommandOwner => ({
+  collect: async (request, signal) => {
+    try {
+      return await literatureCollector.run(request, signal)
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        [
+          ZOTERO_BATCH_POLICY_CONFLICT,
+          ZOTERO_FILL_TYPE_CONFLICT,
+          ZOTERO_COLLECTION_CONFLICT,
+          ZOTERO_PREVIEW_CHANGED,
+          ZOTERO_CONNECTION_FAILED,
+          ZOTERO_REQUEST_TIMED_OUT,
+          ZOTERO_LOCAL_API_DISABLED
+        ].includes(error.message)
+      )
+        throw new ApplicationCommandError('command-failed', error.message)
+      throw error
+    }
+  },
   getCandidateStates: (request) => literatureCatalog.getCandidateStates(request),
   journals: (request) => journalAttributes.run(request),
   jobs: (request) => literatureBatchJobs.run(request),
   citationStyles: (request) =>
-    withCitationStyleErrors(async () => {
-      if (request.kind === 'preview') {
-        const [styles, preview] = await Promise.all([
-          literatureCitationStyles.list(),
-          literatureCitationFormatter.formatStyleExample(request.styleId)
-        ])
-        return { styles, preview: { styleId: request.styleId, ...preview } }
-      }
-      let changedStyleId: string | undefined
-      if (request.kind === 'import') {
-        changedStyleId = await literatureCitationStyles.import(request.content)
-        literatureCitationFormatter.invalidateStyles()
-      } else if (request.kind === 'delete') {
-        await literatureCitationStyles.delete(request.styleId)
-        changedStyleId = request.styleId
-        literatureCitationFormatter.invalidateStyles()
-      }
-      return {
-        styles: await literatureCitationStyles.list(),
-        ...(changedStyleId ? { changedStyleId } : {})
-      }
-    }),
+    withCitationStyleErrors(() => literatureCitationFormatter.citationStyles(request)),
   lookupMetadata: async (doi) => {
     const [resolved] = await literatureReferenceResolver.resolve([
-      doi.startsWith('pmid:') ? doi : 'doi:' + doi
+      doi.startsWith('pmid:') || doi.startsWith('arxiv:') ? doi : 'doi:' + doi
     ])
     return resolved.item
   },
   completeMetadata: (request) => literatureMetadataEnricher.complete(request),
+  supplementAttachmentProgress: (request) => literatureSupplementAttachments.progress(request),
+  supplementAttachment: (request, signal) =>
+    literatureSupplementAttachments.run(request, signal ?? new AbortController().signal),
+  related: (request, signal) => literatureRelatedFinder.run(request, signal),
+  supplements: (request, signal) => literatureSupplementFinder.run(request, signal),
+  publicationCheck: (request, signal) => literaturePublicationChecker.run(request, signal),
   fullText: (request) => literatureFullTextFinder.run(request),
   formatDocument: async (request) => {
     const literature = await artifactProvenanceRepository.getVersionLiterature({
@@ -210,18 +233,54 @@ export const createLiteratureCommandOwner = ({
     const { warnings, ...parsed } = await literatureCitationFormatter.parseReferences(
       request.content
     )
-    const entries = await literatureCatalog.inspectImportItems(
-      parsed.items,
-      parsed.errors,
-      warnings
+    const indexes = request.selectedItemIndexes
+    if (
+      indexes &&
+      (indexes.length === 0 ||
+        new Set(indexes).size !== indexes.length ||
+        indexes.some(
+          (index) => !Number.isInteger(index) || index < 0 || index >= parsed.items.length
+        ))
     )
+      throw new Error('Import selection is invalid. Preview the file again.')
+    // Preserve source order and recheck selected identities in the existing write transaction.
+    const selected = indexes ? new Set(indexes) : undefined
+    const items = selected ? parsed.items.filter((_, index) => selected.has(index)) : parsed.items
+    const sourceIndexes = parsed.items
+      .map((_, index) => index)
+      .filter((index) => !selected || selected.has(index))
+    const inspected = await literatureCatalog.inspectImportItems(
+      items,
+      parsed.errors,
+      sourceIndexes.map((index) => warnings?.[index] ?? [])
+    )
+    const entries = selected
+      ? inspected.map((entry) => ({
+          ...entry,
+          ...(entry.conflict
+            ? {
+                conflict: {
+                  ...entry.conflict,
+                  matches: entry.conflict.matches.map((match) =>
+                    typeof match.inputIndex === 'number'
+                      ? { ...match, inputIndex: sourceIndexes[match.inputIndex]! }
+                      : match
+                  )
+                }
+              }
+            : {}),
+          index: entry.item
+            ? sourceIndexes[entry.index]!
+            : parsed.items.length + entry.index - items.length
+        }))
+      : inspected
     if (request.mode === 'preview') return { ...parsed, entries }
-    if (parsed.items.length === 0) throw new Error('No valid references were found.')
+    if (items.length === 0) throw new Error('No valid references were found.')
     return {
       ...parsed,
       entries,
       imported: await literatureCatalog.importItems(
-        parsed.items,
+        items,
         request.collectionId,
         request.duplicatePolicy
       )

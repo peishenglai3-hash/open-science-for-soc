@@ -5,14 +5,13 @@ import {
 } from '@aipoch/journal-catalog/contracts'
 import {
   LITERATURE_CITATION_LOCALES,
-  LITERATURE_CSL_MAX_BYTES,
   LITERATURE_IMPORT_WARNINGS,
   LITERATURE_ITEM_TYPES,
   LITERATURE_RECORD_IMPORT_FORMATS,
   LITERATURE_RECORD_IMPORT_MAX_BYTES,
   LITERATURE_RECORD_IMPORT_MAX_RECORDS,
-  literatureCitationStylePreviewSchema,
-  literatureCitationStyleViewSchema,
+  literatureCitationStylesRequestSchema,
+  literatureCitationStylesResultSchema,
   literatureIdentifierInputSchema
 } from '@aipoch/literature-citations/contracts'
 import {
@@ -48,6 +47,12 @@ const LITERATURE_COLLECTION_DESCRIPTION_MAX_LENGTH = 1_000
 
 const LITERATURE_LIFECYCLE_STATES = ['active', 'deleted'] as const
 
+export const LITERATURE_READING_STATUSES = ['unread', 'reading', 'read'] as const
+
+export const literatureReadingStatusSchema = z.enum(LITERATURE_READING_STATUSES)
+
+export type LiteratureReadingStatus = z.infer<typeof literatureReadingStatusSchema>
+
 const LITERATURE_SORT_FIELDS = ['updated', 'created', 'title', 'year', 'rating'] as const
 
 const LITERATURE_SORT_DIRECTIONS = ['asc', 'desc'] as const
@@ -68,6 +73,7 @@ const literatureFilterSchema = z
     containerTitle: optionalTextSchema,
     itemTypes: z.array(z.enum(LITERATURE_ITEM_TYPES)).max(LITERATURE_ITEM_TYPES.length).optional(),
     hasFullText: z.boolean().optional(),
+    readingStatus: literatureReadingStatusSchema.optional(),
     collectionId: optionalTextSchema,
     projectId: optionalTextSchema,
     journalAttributes: z
@@ -165,6 +171,7 @@ const literatureItemViewSchema = z
     attachments: z.array(literatureAttachmentViewSchema),
     projectIds: z.array(nonEmptyTextSchema),
     collectionIds: z.array(nonEmptyTextSchema),
+    readingStatus: literatureReadingStatusSchema.optional(),
     metadataRevision: z.number().int().positive(),
     createdAt: z.number().int().nonnegative(),
     updatedAt: z.number().int().nonnegative(),
@@ -451,6 +458,13 @@ const literatureCatalogCommandSchema = z.discriminatedUnion('kind', [
     .strict(),
   z
     .object({
+      kind: z.literal('set-reading-status'),
+      itemIds: z.array(nonEmptyTextSchema).min(1).max(200),
+      readingStatus: literatureReadingStatusSchema
+    })
+    .strict(),
+  z
+    .object({
       kind: z.literal('set-item-lifecycle'),
       itemIds: z.array(nonEmptyTextSchema).min(1).max(200),
       state: z.enum(LITERATURE_LIFECYCLE_STATES)
@@ -509,6 +523,7 @@ const literatureCatalogReceiptSchema = z
       ])
       .optional(),
     count: z.number().int().positive().optional(),
+    itemIds: z.array(nonEmptyTextSchema).min(1).max(200).optional(),
     batch: z
       .object({
         eligible: z.number().int().nonnegative(),
@@ -572,26 +587,6 @@ const literatureFormatReferencesRequestSchema = z
   })
   .strict()
 
-const literatureCitationStylesRequestSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('list') }).strict(),
-  z
-    .object({ kind: z.literal('import'), content: z.string().min(1).max(LITERATURE_CSL_MAX_BYTES) })
-    .strict(),
-  z.object({ kind: z.literal('delete'), styleId: nonEmptyTextSchema }).strict(),
-  z.object({ kind: z.literal('preview'), styleId: nonEmptyTextSchema }).strict()
-])
-
-const literatureCitationStylesResultSchema = z
-  .object({
-    styles: z.array(literatureCitationStyleViewSchema),
-    changedStyleId: nonEmptyTextSchema.optional(),
-    preview: literatureCitationStylePreviewSchema
-      .extend({ styleId: nonEmptyTextSchema })
-      .strict()
-      .optional()
-  })
-  .strict()
-
 const literatureFormattedReferenceSchema = z
   .object({
     itemId: nonEmptyTextSchema,
@@ -650,17 +645,29 @@ const literatureFormatDocumentResultSchema = z.discriminatedUnion('mode', [
     .strict()
 ])
 
+// Indices in parsed items, not error rows; omission preserves whole-file imports.
+const literatureImportSelectionSchema = z
+  .array(z.number().int().nonnegative())
+  .min(1)
+  .max(LITERATURE_RECORD_IMPORT_MAX_RECORDS)
+  .refine(
+    (indexes) => new Set(indexes).size === indexes.length,
+    'Import selection contains duplicate indices.'
+  )
+
 const literatureRecordImportRequestSchema = z.discriminatedUnion('mode', [
   z
     .object({
       mode: z.literal('preview'),
-      content: z.string().min(1).max(LITERATURE_RECORD_IMPORT_MAX_BYTES)
+      content: z.string().min(1).max(LITERATURE_RECORD_IMPORT_MAX_BYTES),
+      selectedItemIndexes: literatureImportSelectionSchema.optional()
     })
     .strict(),
   z
     .object({
       mode: z.literal('commit'),
       content: z.string().min(1).max(LITERATURE_RECORD_IMPORT_MAX_BYTES),
+      selectedItemIndexes: literatureImportSelectionSchema.optional(),
       duplicatePolicy: literatureDuplicatePolicySchema.optional(),
       collectionId: nonEmptyTextSchema.optional()
     })

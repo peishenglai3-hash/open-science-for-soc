@@ -33,7 +33,7 @@ import {
 } from '../resource-budget'
 import { toErrorMessage } from '../error-message'
 import { createLogger, diagnosticErrorFields } from '@aipoch/diagnostics/node'
-import { extractPdfTextPages } from '../uploads/attachment-media'
+import { extractPdfTextPages } from '../uploads/pdf-text-extraction'
 import {
   readBoundedPptx,
   readBoundedSpreadsheet,
@@ -717,8 +717,8 @@ export class ReviewerHostServer {
             sizeBytes: managedLease!.size,
             sample,
             observation: {
-              device: 0,
-              inode: 0,
+              device: '0',
+              inode: '0',
               sizeBytes: managedLease!.size,
               modifiedAtMs: 0,
               changedAtMs: 0

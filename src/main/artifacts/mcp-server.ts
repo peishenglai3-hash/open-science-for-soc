@@ -119,7 +119,7 @@ const writeArtifactFileToolSchema = {
             .string()
             .min(1)
             .describe(
-              'Path to an ALREADY-SAVED file. A bare filename or relative path (e.g. "plot.png") resolves first against the notebook session data dir (the kernel cwd), then the session workspace — pass the same name you saved with. The session-relative `data/plot.png` form returned by Notebook `workingFiles[].relativePath` is also accepted. An absolute path also works. Do NOT rebuild a path from an env var; the kernel cwd already IS the data dir. The file must exist before you call this — the app copies it.'
+              'Path to an ALREADY-SAVED file. A bare filename or relative path (e.g. "plot.png") resolves first against the notebook session data dir (the kernel cwd), then the session workspace — pass the same name you saved with. The session-relative `data/plot.png` form returned by Notebook `workingFiles[].relativePath` is also accepted. An absolute path on this host also works for files in the current workspace/Notebook or a user-authorized folder (read-only access is sufficient). External files require an absolute path; use list_authorized_directories to discover granted folders. Do NOT rebuild a path from an env var; the kernel cwd already IS the data dir. The file must exist before you call this — the app copies it.'
             )
         })
       ])
@@ -145,7 +145,7 @@ const writeArtifactFileToolSchema = {
 const writeArtifactFileToolDefinition = {
   title: 'Write artifact file',
   description:
-    'Attach a file this turn generated as a downloadable artifact (chart, image, report, CSV, archive, …). For small generated text such as Markdown or plain text, pass inline content directly; do not use Notebook, REPL, shell, or workspace file tools merely to create an intermediate file. For binary or otherwise disk-generated output, the file must already exist before this call. Simplest use inside a notebook: save with a relative name (e.g. plt.savefig("plot.png") / R png("plot.png")) then call this with just `filename: "plot.png"` — the app resolves it against the notebook session data dir (the kernel cwd) and copies it. Literature formatting tools attach their prepared DOCX and LaTeX outputs themselves; do not write those files again. You may also pass an explicit `source`: {kind:"localPath", path} where path is a bare filename, a path relative to the notebook data dir or session workspace, the session-relative `data/plot.png` returned by Notebook `workingFiles`, or an absolute path to an already-saved file; or {kind:"inline", content} for small in-memory text. The app assigns session/message ownership; do not call this before the file is written.',
+    'Attach a generated file or import an existing file from a user-authorized folder as a downloadable artifact (chart, image, report, CSV, archive, …). For small generated text such as Markdown or plain text, pass inline content directly; do not use Notebook, REPL, shell, or workspace file tools merely to create an intermediate file. For binary or otherwise disk-generated output, the file must already exist before this call. Simplest use inside a notebook: save with a relative name (e.g. plt.savefig("plot.png") / R png("plot.png")) then call this with just `filename: "plot.png"` — the app resolves it against the notebook session data dir (the kernel cwd) and copies it. Literature formatting tools attach their prepared DOCX and LaTeX outputs themselves; do not write those files again. You may also pass an explicit `source`: {kind:"localPath", path} where path is a bare filename, a path relative to the notebook data dir or session workspace, the session-relative `data/plot.png` returned by Notebook `workingFiles`, or an absolute path on this host to an already-saved file in a user-authorized folder (read-only access suffices; use list_authorized_directories to discover grants); or {kind:"inline", content} for small in-memory text. The app assigns session/message ownership; do not call this before the file is written.',
   inputSchema: writeArtifactFileToolSchema
 }
 
@@ -249,6 +249,13 @@ const callArtifactRpc = async (
     'Artifact Provenance RPC'
   )
   const payload = (await response.json()) as ArtifactRpcResponse<ArtifactVersionFile>
+
+  if (response.status === 401) {
+    throw new Error(
+      'Artifact publication authorization has expired or is no longer active. Start a new conversation turn and retry publishing the existing file, preserving any producerRunId. Do not regenerate the file or drop provenance to retry. ' +
+        (payload.error ?? 'Artifact RPC authentication failed.')
+    )
+  }
 
   if (!response.ok || payload.error || !payload.result) {
     throw new Error(

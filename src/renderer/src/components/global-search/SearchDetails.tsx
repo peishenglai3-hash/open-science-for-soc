@@ -3,7 +3,7 @@ import { AgentMarkdown } from '@/components/streamdown/AgentMarkdown'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { formatDateTime, formatRelativeTime } from '@/lib/format-datetime'
-import { readLiteratureSelectionPage } from '@/pages/literature/literature-read-pages'
+import { readLiteratureSelectionPage } from '../../lib/literature-queries'
 import { ArtifactPreview } from '@/pages/workspace/artifact-preview'
 import { ExtensionPreservingFileName } from '@/pages/workspace/ExtensionPreservingFileName'
 import { FilePreviewDialog } from '@/pages/workspace/FilePreviewDialog'
@@ -12,7 +12,7 @@ import {
   useProjectFilePreviewReader,
   useProjectFilePreviews
 } from '@/pages/workspace/project-files-preview-owner'
-import type { PreviewFileItem } from '@/stores/preview-workbench-store'
+import type { PreviewFileItem } from '@/stores/preview-workbench-contract'
 import type { LiteratureItemView } from '@aipoch/literature-library/contracts'
 import { ArrowUpRight, File, LoaderCircle, MessageCircle } from 'lucide-react'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'

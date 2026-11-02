@@ -149,6 +149,8 @@ const SpecialistCapabilitiesSection = ({
   const connectorSearchRef = useRef<HTMLInputElement>(null)
   const [skillPopoverOpen, setSkillPopoverOpen] = useState(false)
   const [connectorPopoverOpen, setConnectorPopoverOpen] = useState(false)
+  // Keep these non-modal pickers inside the owning dialog's scroll-lock boundary.
+  const [popoverContainer, setPopoverContainer] = useState<HTMLElement | null>(null)
   useSettingsSearchShortcut(skillSearchRef, skillPopoverOpen && !isFullAccess)
   useSettingsSearchShortcut(connectorSearchRef, connectorPopoverOpen && !isFullAccess)
   const fullAccessRef = useRef<HTMLButtonElement>(null)
@@ -189,7 +191,7 @@ const SpecialistCapabilitiesSection = ({
         id:
           referencedIds.has(server.name) && !referencedIds.has(server.id) ? server.name : server.id,
         name: server.displayName,
-        description: server.description ? `${server.name} · ${server.description}` : server.name,
+        description: server.description ? `${server.name} / ${server.description}` : server.name,
         mainEnabled: server.enabled,
         available: server.availability === undefined,
         availability: server.availability
@@ -203,7 +205,7 @@ const SpecialistCapabilitiesSection = ({
         known.push({
           id,
           name: legacy.displayName,
-          description: legacy.description ? `${legacy.name} · ${legacy.description}` : legacy.name,
+          description: legacy.description ? `${legacy.name} / ${legacy.description}` : legacy.name,
           mainEnabled: legacy.enabled,
           available: legacy.availability === undefined,
           availability: legacy.availability
@@ -282,7 +284,7 @@ const SpecialistCapabilitiesSection = ({
       ...customServers.map((server) => ({
         id: server.id,
         name: server.displayName,
-        description: server.description ? `${server.name} · ${server.description}` : server.name,
+        description: server.description ? `${server.name} / ${server.description}` : server.name,
         mainEnabled: server.enabled,
         available: server.availability === undefined,
         availability: server.availability
@@ -463,7 +465,12 @@ const SpecialistCapabilitiesSection = ({
                   onOpenChange={(open) => {
                     setSkillPopoverOpen(open)
                     composingRef.current = false
-                    if (open) setSkillSearchQuery('')
+                    if (open) {
+                      setPopoverContainer(
+                        selectionRef.current?.closest<HTMLElement>('[role="dialog"]') ?? null
+                      )
+                      setSkillSearchQuery('')
+                    }
                   }}
                 >
                   <PopoverTrigger asChild>
@@ -476,6 +483,7 @@ const SpecialistCapabilitiesSection = ({
                     </button>
                   </PopoverTrigger>
                   <PopoverContent
+                    container={popoverContainer}
                     aria-label={t('＋ Add a skill')}
                     align="end"
                     className="flex max-h-[260px] w-[240px] flex-col overflow-y-auto rounded-lg border border-border bg-card p-0 text-foreground shadow-md"
@@ -552,7 +560,12 @@ const SpecialistCapabilitiesSection = ({
                   onOpenChange={(open) => {
                     setConnectorPopoverOpen(open)
                     composingRef.current = false
-                    if (open) setConnectorSearchQuery('')
+                    if (open) {
+                      setPopoverContainer(
+                        selectionRef.current?.closest<HTMLElement>('[role="dialog"]') ?? null
+                      )
+                      setConnectorSearchQuery('')
+                    }
                   }}
                 >
                   <PopoverTrigger asChild>
@@ -565,6 +578,7 @@ const SpecialistCapabilitiesSection = ({
                     </button>
                   </PopoverTrigger>
                   <PopoverContent
+                    container={popoverContainer}
                     aria-label={t('＋ Add a connector')}
                     align="end"
                     className="flex max-h-[260px] w-[240px] flex-col overflow-y-auto rounded-lg border border-border bg-card p-0 text-foreground shadow-md"
@@ -671,7 +685,7 @@ const SpecialistCapabilitiesSection = ({
                         </div>
                         {skill.missing ? (
                           <span className="shrink-0 text-[11px] text-muted-foreground">
-                            {t('Missing · unavailable')}
+                            {t('Missing: unavailable')}
                           </span>
                         ) : (
                           <>
@@ -682,7 +696,7 @@ const SpecialistCapabilitiesSection = ({
                             ) : null}
                             {!skill.mainEnabled ? (
                               <span className="shrink-0 text-[11px] text-muted-foreground">
-                                {t('Main disabled · available here')}
+                                {t('Main disabled: available here')}
                               </span>
                             ) : null}
                           </>
@@ -750,7 +764,7 @@ const SpecialistCapabilitiesSection = ({
                           </span>
                         ) : !connector.mainEnabled ? (
                           <span className="shrink-0 text-[11px] text-muted-foreground">
-                            {t('Main disabled · available here')}
+                            {t('Main disabled: available here')}
                           </span>
                         ) : null}
                         <SettingsIconAction

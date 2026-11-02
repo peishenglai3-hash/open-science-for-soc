@@ -1,4 +1,4 @@
-import type { ChatSession } from '@/stores/session-store'
+import type { ChatSession } from '@/stores/session-store-contract'
 import { resolvePreparationNoticeBaseline } from '../../../../shared/session-persistence'
 
 type SessionRecoveryPresentation = {
@@ -12,7 +12,7 @@ type SessionRecoveryPresentation = {
 const resolveSessionRecoveryPresentation = (
   session: ChatSession | undefined
 ): SessionRecoveryPresentation | undefined => {
-  if (!session) return undefined
+  if (!session || session.packageOrigin) return undefined
   const preparation = session.promptPreparation
   const preparationState =
     resolvePreparationNoticeBaseline(session)?.state ??

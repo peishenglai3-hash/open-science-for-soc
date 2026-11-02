@@ -1,3 +1,4 @@
+import type { ClassifiedFailure } from '../failure/contract'
 import { z } from 'zod'
 import {
   type RuntimeCodec,
@@ -58,6 +59,8 @@ export type SettleTaskSessionCompletionRequest = Readonly<{
   projectId: string
   sessionId: string
   promptMessageId: string
+  // Captured at admission; continuations can reuse the same prompt Message.
+  expectedRunStartedAt?: number
   taskRunCommitId: string
   messageId?: string
   artifacts: readonly PersistedArtifact[]
@@ -67,7 +70,7 @@ export type SettleTaskSessionCompletionRequest = Readonly<{
 export type FailTaskSessionRunRequest = SettleTaskSessionCompletionRequest &
   Readonly<{
     error: string
-    errorReportable?: false
+    failure?: ClassifiedFailure
     interruptionCause?: 'app-restart'
   }>
 
@@ -208,6 +211,35 @@ export const deleteSessionRequestSchema = z
   .object({ projectId: z.string().min(1), sessionId: z.string().min(1) })
   .strict()
 
+// This destructive command accepts identities, never a client-supplied filesystem path.
+const recoveryPathSegmentSchema = z
+  .string()
+  .min(1)
+  .refine(
+    (value) =>
+      !/[<>:"/\\|?*]/u.test(value) &&
+      !Array.from(value).some((character) => character.charCodeAt(0) < 32) &&
+      value !== '.' &&
+      value !== '..' &&
+      !/[. ]$/u.test(value)
+  )
+export const deleteSessionRecoveryFileRequestSchema = z
+  .object({
+    projectId: recoveryPathSegmentSchema,
+    fileName: recoveryPathSegmentSchema.refine(
+      (value) =>
+        value.endsWith('.json') &&
+        value.length > 5 &&
+        !value.includes('.invalid-') &&
+        !value.includes('.tmp')
+    )
+  })
+  .strict()
+export type DeleteSessionRecoveryFileRequest = z.infer<
+  typeof deleteSessionRecoveryFileRequestSchema
+>
+export const SESSION_RECOVERY_COMPUTE_JOBS_ERROR = 'Session recovery files still own compute jobs.'
+
 // Manual details edits mutate only authority-owned display fields server-side, so they carry no
 // whole-Session revision: concurrent unrelated writes advance that revision constantly and must
 // not fence the edit.
@@ -345,6 +377,10 @@ export const sessionApplicationCommandContracts = Object.freeze({
   delete: defineApplicationCommandContract(
     validationCodec(z.tuple([deleteSessionRequestSchema])),
     validationCodec(sessionDeletionResultSchema)
+  ),
+  deleteRecoveryFile: defineApplicationCommandContract(
+    validationCodec(z.tuple([deleteSessionRecoveryFileRequestSchema])),
+    validationCodec(z.void())
   ),
   saveManifest: defineApplicationCommandContract(
     validationCodec(z.tuple([saveSessionManifestRequestSchema])),

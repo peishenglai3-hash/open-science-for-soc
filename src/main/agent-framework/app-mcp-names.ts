@@ -30,6 +30,7 @@ const APP_MCP_SERVERS: readonly AppMcpServerDefinition[] = [
       'bash_execute',
       'request_network_access',
       'notebook_state',
+      'list_authorized_directories',
       'list_notebook_runtimes',
       'notebook_bind_runtime',
       'notebook_switch_runtime',
@@ -55,7 +56,14 @@ const APP_MCP_SERVERS: readonly AppMcpServerDefinition[] = [
   {
     canonicalName: 'open-science-literature',
     openCodeName: 'open_science_literature',
-    tools: ['read_document', 'list_pdf_elements', 'read_pdf_element']
+    tools: [
+      'read_document',
+      'list_pdf_elements',
+      'read_pdf_element',
+      'list_pdf_annotations',
+      'locate_pdf_annotation_target',
+      'create_pdf_annotation'
+    ]
   },
   {
     canonicalName: 'open-science-library',
@@ -117,6 +125,11 @@ const appMcpServerAliases = (name: string): readonly string[] => {
 const appMcpToolIdentities = (): readonly string[] =>
   APP_MCP_SERVERS.flatMap(({ canonicalName, tools, rememberedPermission }) =>
     rememberedPermission === false ? [] : tools.map((tool) => `${canonicalName}/${tool}`)
+  )
+
+const appMcpServerNames = (frameworkId: AgentFrameworkId): readonly string[] =>
+  APP_MCP_SERVERS.map(({ canonicalName }) =>
+    modelFacingAppMcpServerName(frameworkId, canonicalName)
   )
 
 const resolveCanonicalMcpToolIdentity = (
@@ -200,6 +213,7 @@ const renderAppMcpToolReferences = (frameworkId: AgentFrameworkId, text: string)
 }
 
 export {
+  appMcpServerNames,
   appMcpServerAliases,
   appMcpToolIdentities,
   canonicalAppMcpServerName,

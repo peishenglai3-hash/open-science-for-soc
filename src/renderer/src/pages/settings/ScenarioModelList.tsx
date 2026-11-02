@@ -11,12 +11,13 @@ import {
   configuredModelKey,
   type ConfiguredModelCatalogEntry
 } from '../../../../shared/configured-model-catalog'
-import type { ReasoningEffort } from '../../../../shared/model-preference-contract'
-import { resolveProviderReasoningEffortProfile } from '../../../../shared/provider-reasoning-effort'
+import { type ReasoningEffort } from '../../../../shared/model-preference-contract'
 import {
   resolveReasoningEffortControl,
   type ReasoningEffortProfile
 } from '../../../../shared/reasoning-effort'
+import { resolveProviderReasoningEffortProfile } from '../../../../shared/provider-reasoning-effort'
+
 import type { ProviderView } from '../../../../shared/settings'
 import { SettingsSection } from './SettingsLayout'
 import {
@@ -180,7 +181,7 @@ const ScenarioRowCluster = ({ summary }: { summary: ScenarioSummary }): React.JS
       return (
         <>
           <span className="truncate text-sm text-muted-foreground">
-            {summary.model} · {t('Unavailable')}
+            {summary.model} / {t('Unavailable')}
           </span>
           <FixedEffortBadge label={summary.effortLabel} />
           <ProviderTail

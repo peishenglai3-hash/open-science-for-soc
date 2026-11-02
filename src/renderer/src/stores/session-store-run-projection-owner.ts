@@ -1,3 +1,4 @@
+import type { ClassifiedFailure } from '../../../shared/failure/contract'
 import type { StoreApi } from 'zustand'
 import {
   projectConversationMessage,
@@ -140,7 +141,7 @@ export type SessionRunProjectionActions = {
     sessionId: string,
     error: string,
     opts?: {
-      reportable?: boolean
+      failure?: ClassifiedFailure
       promptMessageId?: string
       contextWindowSample?: RunTerminalContextWindowSample
     }
@@ -611,7 +612,12 @@ export const createSessionRunProjectionOwner = <
                   ? value.slice(0, MAX_ELICITATION_MESSAGE_CHARS)
                   : Array.isArray(value)
                     ? value.slice(0, MAX_ELICITATION_MULTI_SELECT_VALUES)
-                    : undefined
+                    : value &&
+                        typeof value === 'object' &&
+                        value.status === 'skipped' &&
+                        questions.some((question) => question.choiceField.id === field.id)
+                      ? { status: 'skipped' as const }
+                      : undefined
               ]
             })
           )
@@ -736,7 +742,7 @@ export const createSessionRunProjectionOwner = <
           interrupted: undefined,
           resumeRecovery: undefined,
           error: undefined,
-          errorReportable: undefined,
+          failure: undefined,
           pendingHistoryReplay: undefined,
           updatedAt: Date.now()
         }))
@@ -769,7 +775,7 @@ export const createSessionRunProjectionOwner = <
             projectFailedRun(
               session,
               message,
-              opts?.reportable,
+              opts?.failure,
               opts?.promptMessageId,
               opts?.contextWindowSample
             ),

@@ -1,10 +1,16 @@
 import { create } from 'zustand'
-import { PACKAGE_MAX_FILE_BYTES } from '../../../shared/session-package'
-import type { PackageOperationSnapshot } from '../../../shared/session-package'
+import { PACKAGE_MAX_FILE_BYTES, packageOperationActive } from '../../../shared/session-package'
+import type {
+  BrowserPackageTransfer,
+  PackageOperationSnapshot
+} from '../../../shared/session-package'
 
 export const usePackageOperationStore = create<{
   operation: PackageOperationSnapshot | null
+  browserReceipt?: BrowserPackageTransfer
   errorKind?: 'fork'
+  useCaseFailure?: string
+  useCaseSlug?: string
   importError?: string
   setImportError: (error: string | undefined) => void
   open: boolean
@@ -33,6 +39,24 @@ export const usePackageOperationStore = create<{
   receive: (operation) =>
     set((state) => {
       const same = operation?.id === state.operation?.id
+      const newReceipt = operation?.browserTransfers?.findLast(
+        (transfer) =>
+          !state.operation?.browserTransfers?.some((previous) => previous.id === transfer.id)
+      )
+      // Retain the latest receipt result across tombstone expiry, until another operation owns UI.
+      const finishedReceipt =
+        state.browserReceipt &&
+        !state.browserReceipt.cleanupPending &&
+        ['cancelled', 'failed'].includes(state.browserReceipt.state)
+          ? state.browserReceipt
+          : undefined
+      const browserReceipt = same
+        ? (newReceipt ??
+          operation?.browserTransfers?.find((t) => t.id === state.browserReceipt?.id) ??
+          finishedReceipt)
+        : operation?.browserReceiptOnly || !packageOperationActive(operation)
+          ? newReceipt
+          : undefined
       const retry =
         state.operation?.state === 'failed' &&
         operation?.kind === 'export' &&
@@ -48,7 +72,10 @@ export const usePackageOperationStore = create<{
         )
       return {
         operation,
-        dismissedId: same ? state.dismissedId : undefined,
+        // Download metadata disappears at handoff; retain its card owner for this operation only.
+        useCaseSlug: operation?.useCaseDownload?.slug ?? (same ? state.useCaseSlug : undefined),
+        browserReceipt,
+        dismissedId: same && !newReceipt ? state.dismissedId : undefined,
         excludedStorageKeys: operation?.files
           ? [
               ...new Set([
@@ -74,21 +101,31 @@ export const usePackageOperationStore = create<{
               ? 'custom'
               : preset,
         threshold: same || retry ? state.threshold : '256',
-        open:
-          same && state.dismissedId === operation?.id
-            ? false
-            : (same && operation?.presentationRevision !== state.operation?.presentationRevision) ||
-                operation?.state === 'awaiting-selection' ||
-                (!same && operation?.state === 'running')
+        open: operation?.useCaseDownload
+          ? same && state.open
+          : state.operation?.useCaseDownload &&
+              !operation?.useCaseDownload &&
+              operation?.state === 'running'
+            ? true
+            : newReceipt
               ? true
-              : state.open
+              : same && state.dismissedId === operation?.id
+                ? false
+                : (same &&
+                      operation?.presentationRevision !== state.operation?.presentationRevision) ||
+                    (operation?.state === 'awaiting-selection' &&
+                      (!same ||
+                        state.operation?.state !== 'awaiting-selection' ||
+                        operation.progress.phase !== state.operation.progress.phase)) ||
+                    (!same && operation?.state === 'running')
+                  ? true
+                  : state.open
       }
     }),
   setOpen: (open) => set({ open })
 }))
 
-export const packageOperationActive = (operation: PackageOperationSnapshot | null): boolean =>
-  operation !== null && ['running', 'awaiting-selection', 'cancelling'].includes(operation.state)
+export { packageOperationActive } from '../../../shared/session-package'
 
 export const sessionExportLocked = (
   operation: PackageOperationSnapshot | null,

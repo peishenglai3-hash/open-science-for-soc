@@ -227,21 +227,12 @@ it('PDF workflow sources contain no application source taxonomy or database adap
 
 it('local module and affected plans obey the same downstream package direction as Ubuntu', async () => {
   const { createModuleTestPlan, createAffectedTestPlan } = await import('./module-test-impact.mjs')
-  for (const id of [
-    'main_pdf_translation',
-    'workspace_previews',
-    'main_literature',
-    'page_literature'
-  ])
-    expect(
-      createModuleTestPlan(id).testFiles.filter((path) => path.startsWith('packages/'))
-    ).toEqual([])
-  for (const path of [
-    'src/main/literature/pdf-translation/index.ts',
-    'src/renderer/src/pages/workspace/previews/renderers/PdfPreview.tsx',
-    'src/main/literature/command-owner.ts',
-    'src/main/literature/journal-attributes.ts'
-  ]) {
+  for (const id of ['main_pdf_translation']) {
+    const plan = createModuleTestPlan(id)
+    expect(plan.mode).toBe('selective')
+    expect(plan.testFiles.filter((path) => path.startsWith('packages/'))).toEqual([])
+  }
+  for (const path of ['src/main/literature/pdf-translation/index.ts']) {
     const plan = createAffectedTestPlan([{ path, status: 'modified' }], {
       status: 'unavailable',
       testFiles: ['packages/pdf-translation/test/checkpoints.test.ts']
@@ -253,6 +244,53 @@ it('local module and affected plans obey the same downstream package direction a
   const plan = createModuleTestPlan('package_pdf_translation')
   expect(plan.testFiles.some((path) => path.startsWith('packages/pdf-translation/'))).toBe(true)
   expect(plan.testFiles.some((path) => path.startsWith('packages/pdf-structure/'))).toBe(false)
+})
+
+it.each([
+  ['workspace_previews', 'src/renderer/src/pages/workspace/previews/renderers/PdfPreview.tsx'],
+  ['main_literature', 'src/main/literature/command-owner.ts'],
+  ['page_literature', 'src/renderer/src/pages/literature/detail/LiteratureSupplementLookup.tsx'],
+  // Expanded gallery/import boundaries retain unfiltered execution until re-reviewed.
+  ['page_home', 'src/renderer/src/pages/home/UseCaseCarousel.tsx'],
+  ['page_home', 'src/renderer/src/pages/home/UseCaseCover.tsx'],
+  ['main_session_package', 'src/main/session-package/transfer.ts'],
+  ['main_session_package', 'src/main/session-package/use-case-catalog.ts'],
+  ['main_session_package', 'src/main/session-package/use-case-download.ts'],
+  ['package_literature_discovery', 'packages/literature-discovery/src/supplements.ts'],
+  ['notebook_execution', 'src/main/notebook/windows-runtime-manager.ts'],
+  ['notebook_execution', 'src/main/notebook/scientific-output-analysis.ts'],
+  ['notebook_execution', 'src/main/notebook/working-file-observer.ts']
+])('runs unfiltered tests for reclassified %s and affected path %s', async (id, path) => {
+  const { createModuleTestPlan, createAffectedTestPlan, executeModuleTestPlan } =
+    await import('./module-test-impact.mjs')
+  for (const plan of [
+    createModuleTestPlan(id),
+    createAffectedTestPlan(
+      [
+        {
+          path,
+          status: 'modified'
+        }
+      ],
+      { status: 'unavailable', testFiles: ['packages/pdf-translation/test/checkpoints.test.ts'] }
+    )
+  ]) {
+    expect(plan.mode).toBe('full')
+    expect(plan.reasonChains).toContainEqual(
+      expect.stringMatching(new RegExp(`^${id} -> .+ -> full$`))
+    )
+    const invocations: string[][] = []
+    expect(
+      executeModuleTestPlan(plan, {
+        environment: { npm_execpath: '/fixture/npm-cli.js' },
+        spawn: (_command: string, args: string[]) => {
+          invocations.push(args)
+          return { status: 0 }
+        }
+      })
+    ).toBe(0)
+    expect(invocations).toEqual([['/fixture/npm-cli.js', 'test', '--']])
+  }
 })
 
 const hostBoundaryManifest = loadModuleImpactManifest()
@@ -399,6 +437,16 @@ it('Compute host edits never register or select upstream Compute units', async (
     'packages/compute/src/model.ts'
   ]) {
     const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
+    if (
+      path.startsWith('src/main/literature/') ||
+      path.startsWith('src/renderer/src/pages/literature/')
+    ) {
+      expect(plan.mode, path).toBe('full')
+      expect(plan.reasonChains).toContainEqual(
+        expect.stringMatching(/^(main_literature|page_literature) -> .+ -> full$/)
+      )
+      continue
+    }
     expect(plan.mode, path).toBe('selective')
     expect(plan.testFiles, path).toEqual(
       expect.arrayContaining([
@@ -469,6 +517,16 @@ it('selects durable file consumers downstream without testing unchanged prerequi
     const packagePlan = createPackageTestPlan([path], registry)
     expect([...packagePlan.selected].sort(), path).toEqual([...selected].sort())
     const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
+    if (
+      path.startsWith('src/main/literature/') ||
+      path.startsWith('src/renderer/src/pages/literature/')
+    ) {
+      expect(plan.mode, path).toBe('full')
+      expect(plan.reasonChains).toContainEqual(
+        expect.stringMatching(/^(main_literature|page_literature) -> .+ -> full$/)
+      )
+      continue
+    }
     expect(plan.mode, path).toBe('selective')
     for (const entry of registry.packages) {
       const included = plan.testFiles.some((test: string) => test.startsWith(entry.root + '/'))
@@ -513,9 +571,10 @@ it('selects durable file consumers downstream without testing unchanged prerequi
   expect(invocations.flat()).toContain('packages/durable-files/src/durable-json-file.test.ts')
 })
 
-it('routes download package changes downstream and host adapters without unchanged package units', async () => {
+it('routes download package changes downstream and honors full host owners', async () => {
   const { createAffectedTestPlan, executeModuleTestPlan } = await import('./module-test-impact.mjs')
   const graph = { status: 'not-used', testFiles: [] }
+  const localModels = loadModuleImpactManifest().modules.main_local_models
   const packageRoot = 'packages/resilient-download'
   for (const path of [
     `${packageRoot}/src/resilient-download.ts`,
@@ -554,14 +613,16 @@ it('routes download package changes downstream and host adapters without unchang
     [
       'src/main/notebook/environment-download.ts',
       'src/main/notebook/environment-download.contract.test.ts'
-    ],
-    [
-      'src/main/notebook/windows-runtime-manager.ts',
-      'src/main/notebook/windows-runtime-download.contract.test.ts'
-    ],
-    ['src/main/session-package/transfer.ts', 'src/main/session-package/transfer.test.ts']
+    ]
   ]) {
     const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
+    if (localModels.fullTestReason && path.startsWith('src/main/local-models/')) {
+      expect(plan.mode, path).toBe('full')
+      expect(plan.reasonChains).toContain(
+        `main_local_models -> ${localModels.fullTestReason} -> full`
+      )
+      continue
+    }
     expect(plan.mode).toBe('selective')
     expect(plan.testFiles).toContain(test)
     for (const entry of registry.packages)
@@ -631,4 +692,130 @@ it('dedicated package edits retain module evidence and platform overlays', async
     ).toEqual([])
     expect(plan.capabilityOverlays, root).toEqual(expect.arrayContaining(owner.capabilityOverlays))
   }
+})
+
+it('keeps provider units upstream of host adapters and selects real downstream contracts', async () => {
+  const { createAffectedTestPlan } = await import('./module-test-impact.mjs')
+  const { packageVerificationPlan } = await import('../package-verification-plan.mjs')
+  const graph = { status: 'not-used', testFiles: [] }
+  for (const path of [
+    'packages/providers/src/providers/lookup.ts',
+    'packages/providers/src/providers/create.ts',
+    'packages/providers/src/providers/connection.ts',
+    'packages/providers/src/protocols/messages/conversion.ts',
+    'packages/providers/src/protocols/chat-completions/stream.ts',
+    'packages/providers/src/protocols/messages/text.ts',
+    'packages/providers/src/protocols/chat-completions/text.ts',
+    'packages/providers/src/protocols/responses/text.ts',
+    'packages/providers/src/providers/definitions.ts',
+    'packages/providers/src/models/types.ts',
+    'packages/providers/src/models/classification.ts',
+    'packages/providers/src/discovery/models.ts',
+    'packages/providers/src/protocols/responses/conversion.ts',
+    'packages/providers/src/protocols/xai/responses.ts',
+    'packages/providers/src/protocols/messages/tokens.ts',
+    'packages/providers/src/responses/native.ts',
+    'packages/providers/src/responses/request.ts',
+    'packages/providers/src/responses/adapter.ts',
+    'packages/providers/src/responses/replay.ts',
+    'packages/providers/src/transport/sse.ts',
+    'packages/providers/src/models/text-generation.ts',
+    'packages/providers/src/providers.ts',
+    'packages/providers/src/protocol.ts',
+    'packages/providers/src/client.ts'
+  ]) {
+    expect(createPackageTestPlan([path], registry).selected).toEqual(['packages/providers'])
+    const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
+    expect(plan.mode).toBe('selective')
+    expect(plan.testFiles).toEqual(
+      expect.arrayContaining([
+        'packages/providers/src/providers/lookup.test.ts',
+        'packages/providers/src/responses/conversion.test.ts',
+        'packages/providers/src/models/text-generation.test.ts',
+        'packages/providers/src/models/classification.test.ts',
+        'packages/providers/src/providers/create.test.ts',
+        'packages/providers/src/protocols/messages/conversion.test.ts',
+        'packages/providers/src/protocols/chat-completions/stream.test.ts',
+        'src/main/settings/classification-settings.test.ts',
+        'src/main/settings/responses-to-chat-completions-bridge.test.ts',
+        'src/main/settings/provider-transport-owner.test.ts',
+        'src/main/literature/pdf-translation/api-target.test.ts',
+        'src/main/agent-framework/codex.test.ts',
+        'src/main/agent-framework/claude-code.test.ts',
+        'src/main/agent-framework/opencode.test.ts'
+      ])
+    )
+    expect(
+      plan.testFiles.filter(
+        (test) => test.startsWith('packages/') && !test.startsWith('packages/providers/')
+      )
+    ).toEqual([])
+  }
+  for (const [path, test] of [
+    ['src/shared/pdf-text.ts', 'src/shared/pdf-text.test.ts'],
+    ['src/shared/fuzzy-match.ts', 'src/renderer/src/pages/workspace/composer/fuzzy-match.test.ts'],
+    [
+      'src/main/settings/responses-to-chat-completions-bridge.ts',
+      'src/main/settings/responses-to-chat-completions-bridge.test.ts'
+    ],
+    [
+      'src/main/settings/classification-settings.ts',
+      'src/main/settings/classification-settings.test.ts'
+    ],
+    [
+      'src/main/settings/native-responses-compatibility.ts',
+      'src/main/settings/native-responses-compatibility.test.ts'
+    ],
+    [
+      'src/main/literature/pdf-translation/text-generation.ts',
+      'src/main/literature/pdf-translation/text-generation.test.ts'
+    ],
+    [
+      'src/main/literature/pdf-translation/api-target.ts',
+      'src/main/literature/pdf-translation/api-target.test.ts'
+    ]
+  ]) {
+    const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
+    expect(plan.mode).toBe('selective')
+    expect(plan.testFiles).toContain(test)
+    expect(plan.testFiles.filter((file) => file.startsWith('packages/providers/'))).toEqual([])
+    expect(createPackageTestPlan([path], registry).selected).toEqual([])
+  }
+  const modules = loadModuleImpactManifest().modules
+  for (const [id, module] of Object.entries(modules)) {
+    if (module.ownerPaths.some((path) => path.startsWith('src/')))
+      expect(
+        Object.values(module.testFiles)
+          .flat()
+          .filter((file) => file.startsWith('packages/providers/')),
+        id
+      ).toEqual([])
+  }
+  expect(
+    createPackageTestPlan(['packages/diagnostics/src/diagnostic-redaction.ts'], registry).selected
+  ).toContain('packages/providers')
+  expect(
+    createPackageTestPlan(['packages/resilient-download/src/resilient-download.ts'], registry)
+      .selected
+  ).not.toContain('packages/providers')
+  expect(packageVerificationPlan(registry, ['packages/providers'])).toEqual({
+    builds: ['packages/diagnostics', 'packages/providers'],
+    tests: ['packages/providers']
+  })
+  const older = {
+    ...registry,
+    packages: registry.packages.filter((entry) => entry.root !== 'packages/providers')
+  }
+  expect(createPackageTestPlan(['packages/providers/src/client.ts'], older).excluded).toEqual([])
+  expect(
+    packageVerificationPlan(
+      registry,
+      [],
+      older.packages.map((entry) => entry.root)
+    ).tests
+  ).toContain('packages/providers')
+  expect(
+    createPackageTestPlan(['scripts/check-providers-package.mjs'], registry, { verification: true })
+      .selected
+  ).toEqual(['packages/providers'])
 })

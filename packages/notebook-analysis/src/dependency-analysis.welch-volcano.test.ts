@@ -61,7 +61,8 @@ it.each(
       kernelEpochId: 'epoch'
     })
     const { facts } = await analyzeRNotebookSource(script, context)
-    if (name === 'BH companion' && ['6', '7'].includes(runId)) {
+    // p.adjust inside compute_diff lacks primitive callback argument evidence.
+    if (name === 'BH companion' && ['4', '6', '7'].includes(runId)) {
       expect(facts, JSON.stringify(facts)).toMatchObject({
         state: 'unknown',
         reasons: expect.arrayContaining(['opaque-call'])
@@ -78,12 +79,12 @@ it.each(
     expect(
       facts.state === 'unknown' ? facts.reasons.filter((r) => r !== 'external-state') : [],
       JSON.stringify(facts)
-    ).toEqual([])
+    ).toEqual(['3', '6', '7'].includes(runId) ? ['opaque-call'] : [])
     const access = await analyzeNotebookSourceFileAccess('r', script, context)
     expect(access, JSON.stringify(access)).toMatchObject({
-      readState: 'complete',
-      writeState: 'complete',
-      externalState: 'complete'
+      readState: ['3', '4', '6', '7'].includes(runId) ? 'partial' : 'complete',
+      writeState: ['3', '6', '7'].includes(runId) ? 'partial' : 'complete',
+      externalState: ['3', '6', '7'].includes(runId) ? 'partial' : 'complete'
     })
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -107,19 +108,20 @@ it.each(variants)(
         completedRun: producer
       })
       if (name === 'BH companion') {
-        for (const runId of ['6', '7']) {
+        for (const runId of ['4', '6', '7']) {
           expect(projection.stalenessByRunId[runId], JSON.stringify(projection)).toMatchObject({
             state: 'unknown',
             reasons: expect.arrayContaining(['opaque-call'])
           })
           expect(projection.dependenciesByRunId?.[runId]).toBeUndefined()
         }
-        expect(projection.stalenessByRunId['4']).toEqual({ state: 'clear' })
-        expect(projection.dependenciesByRunId?.['3']).toEqual(['2'])
-        expect(projection.dependenciesByRunId?.['4']).toEqual(['3'])
+        // Unproven callback effects also prevent certifying earlier aliases.
+        expect(projection.stalenessByRunId['3']).toMatchObject({ state: 'unknown' })
+        expect(projection.dependenciesByRunId?.['3']).toBeUndefined()
       } else {
         expect(projection.stalenessByRunId[producer.runId], JSON.stringify(projection)).toEqual({
-          state: 'clear'
+          state: 'unknown',
+          reasons: ['external-state', 'opaque-call']
         })
         const upstream = new Set<string>()
         const pending = [producer.runId]
@@ -130,7 +132,7 @@ it.each(variants)(
             pending.push(dependency)
           }
         }
-        expect([...upstream].sort()).toEqual(['2', '3', '4', '6'])
+        expect([...upstream]).toEqual([])
       }
       const context = await analyzer.sourceFileAccessContext({
         projectId: 'p',
@@ -142,9 +144,9 @@ it.each(variants)(
       })
       const access = await analyzeNotebookSourceFileAccess('r', producer.script, context)
       expect(access).toMatchObject({
-        readState: name === 'BH companion' ? 'partial' : 'complete',
-        writeState: name === 'BH companion' ? 'partial' : 'complete',
-        externalState: name === 'BH companion' ? 'partial' : 'complete'
+        readState: 'partial',
+        writeState: 'partial',
+        externalState: 'partial'
       })
       expect(access.writes).toEqual(['diagonal_volcano.png', 'diagonal_volcano_diff.csv'])
     } finally {
@@ -168,7 +170,7 @@ it('keeps failed state uncertain and supports rebuilding in a fresh kernel', asy
     })
     expect(before.stalenessByRunId['6']).toMatchObject({
       state: 'unknown',
-      reasons: expect.arrayContaining(['incomplete-run'])
+      reasons: expect.arrayContaining(['opaque-call'])
     })
     for (const index of [2, 3, 4, 6, 7])
       runs.push({
@@ -184,7 +186,10 @@ it('keeps failed state uncertain and supports rebuilding in a fresh kernel', asy
       sessionId: 's',
       completedRun: runs.at(-1)!
     })
-    expect(after.stalenessByRunId['retry-7'], JSON.stringify(after)).toEqual({ state: 'clear' })
+    expect(after.stalenessByRunId['retry-7'], JSON.stringify(after)).toEqual({
+      state: 'unknown',
+      reasons: ['external-state', 'opaque-call']
+    })
   } finally {
     await rm(root, { recursive: true, force: true })
   }

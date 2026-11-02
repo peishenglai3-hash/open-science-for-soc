@@ -31,6 +31,49 @@ For historical releases that predate this directory, the mirror workflow preserv
 it reads and condenses the GitHub Release body into English notes. A historical release therefore does
 not need a repository directory unless localized backfill is wanted.
 
+## Contributor recognition
+
+Before publishing, review the merged PRs and associated issues in the release range for contributor
+credit, including documentation, translations, testing, and bug reports. The release workflow uses
+`en.md` directly; it does not automatically append GitHub's generated contributor list.
+
+- When there are contributions to acknowledge, retain or add a concise **Acknowledgements** section or credit the
+  person beside the relevant change. Link their public GitHub profile and the supporting PR or issue.
+- Verify attribution against the original contribution. Do not infer a person's employer or label
+  them as internal or external from their profile, and do not invent names or contributions.
+- Respect preferred public identities and requests for anonymity. For security reports, coordinate
+  credit and disclosure timing through the [security policy](../SECURITY.md).
+- Keep credited identities and contribution links consistent in every translation supplied for the
+  release. A missing translation uses the existing English fallback.
+- Finalize acknowledgements in `en.md` before publishing the stable tag: it is also the GitHub Release
+  body and Zenodo description. Do not rely on a later GitHub body edit to update the archived record.
+
+See [Contributor recognition](../CONTRIBUTING.md#contributor-recognition) for authorship and
+co-author handling during review and merge.
+
+## Scope, safety, and privacy disclosures
+
+Review each release for changes to functional boundaries, security controls, and data handling.
+When a change affects a user's deployment or approval decision, include a concise scope/safety
+notice in that release's notes, alongside the relevant feature or fix:
+
+- Name the affected feature, version, platform, execution path, and setup requirements.
+- Describe new permissions, external recipients, data categories, persistent access, or changed
+  defaults, including compatibility or reduced-protection modes.
+- State important known limitations, their impact, and a practical mitigation or workaround. Link
+  the relevant [limitation entry](../docs/known-limitations.md) and owning module documentation.
+- Separate implemented controls and completed verification from experimental work, unmeasured
+  behavior, and future plans. An integrity check or replay result is not a general safety claim.
+- For a resolved limitation, record the fixed version and verification scope. For a security fix,
+  coordinate publication with the [security policy](../SECURITY.md); do not expose an undisclosed
+  vulnerability through release-note drafts.
+
+Update the [security model](../docs/security.md), [intended-use guide](../docs/usage-scope.md), and
+affected package README notices when their facts change. Keep critical warnings consistent in
+provided translations. Use version/tag-pinned repository URLs for release-specific details so
+historical notes do not silently acquire a later version's claims. Review the items above even when
+no new notice is needed; do not add boilerplate sections asserting an absence of risk.
+
 ## Nightly release prerequisite
 
 Nightly publishing reuses one long-lived GitHub prerelease and moves its `nightly` tag only after the

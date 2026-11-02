@@ -1,9 +1,14 @@
 diff --git a/node_modules/app-builder-lib/templates/nsis/include/installUtil.nsh b/node_modules/app-builder-lib/templates/nsis/include/installUtil.nsh
 --- a/node_modules/app-builder-lib/templates/nsis/include/installUtil.nsh
 +++ b/node_modules/app-builder-lib/templates/nsis/include/installUtil.nsh
-@@ -209,34 +209,20 @@ Function uninstallOldVersion
+@@ -209,34 +209,24 @@ Function uninstallOldVersion
    StrCpy $uninstallerFileNameTemp "$PLUGINSDIR\old-uninstaller.exe"
-   !insertmacro copyFile "$uninstallerFileName" "$uninstallerFileNameTemp"
+-  !insertmacro copyFile "$uninstallerFileName" "$uninstallerFileNameTemp"
++  !ifmacrodef customCopyUninstaller
++    !insertmacro customCopyUninstaller
++  !else
++    !insertmacro copyFile "$uninstallerFileName" "$uninstallerFileNameTemp"
++  !endif
 
 -  # Retry counter
 -  StrCpy $R5 0
@@ -48,3 +53,21 @@ diff --git a/node_modules/app-builder-lib/templates/nsis/include/installUtil.nsh
 
    DoesNotExist:
      SetErrors
+diff --git a/node_modules/app-builder-lib/templates/nsis/include/extractAppPackage.nsh b/node_modules/app-builder-lib/templates/nsis/include/extractAppPackage.nsh
+--- a/node_modules/app-builder-lib/templates/nsis/include/extractAppPackage.nsh
++++ b/node_modules/app-builder-lib/templates/nsis/include/extractAppPackage.nsh
+@@ -104,5 +104,8 @@ !macroend
+
+ !macro extractUsing7za FILE
++  !ifmacrodef customExtractAppPackage
++    !insertmacro customExtractAppPackage "${FILE}"
++  !else
+   Push $OUTDIR
+   CreateDirectory "$PLUGINSDIR\7z-out"
+   ClearErrors
+@@ -155,4 +158,5 @@ !macro extractUsing7za FILE
+     Goto LoopExtract7za
+
+   DoneExtract7za:
++  !endif
+ !macroend

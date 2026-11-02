@@ -1,6 +1,19 @@
 /* eslint-disable @typescript-eslint/explicit-function-return-type -- Test fixtures retain inferred mock types. */
-import { LibraryTransaction, normalizeIdentifier, normalizedIdentifiers } from '../src/index.js'
-import { literatureItemInputSchema, type LiteratureCatalogCommand } from '../src/contracts.js'
+import {
+  LibraryImporter,
+  LibraryTransaction,
+  normalizeIdentifier,
+  normalizedIdentifiers,
+  type LibraryImportStore
+} from '../src/index.js'
+import {
+  literatureCatalogCommandSchema,
+  literatureCatalogReceiptSchema,
+  literatureCatalogSearchRequestSchema,
+  literatureItemInputSchema,
+  literatureItemViewSchema,
+  type LiteratureCatalogCommand
+} from '../src/contracts.js'
 import { describe, expect, it, vi } from 'vitest'
 import { memoryLibrary as createMemoryLibrary } from './memory-store.js'
 const memoryLibrary = () =>
@@ -18,9 +31,139 @@ const candidate = (doi = '10.1234/paper') => ({
 })
 const imported = async (db: ReturnType<typeof memoryLibrary>) =>
   (await db.run((tx) => tx.importItems([paper()]))).itemIds[0]!
+describe('import-only storage', () => {
+  it('previews, deduplicates and supplements without project, screening or Inbox capabilities', async () => {
+    const db = memoryLibrary()
+    const store: LibraryImportStore = {
+      importIdentityRecords: db.store.importIdentityRecords,
+      collection: db.store.collection,
+      lastCollectionOrder: db.store.lastCollectionOrder,
+      linkCollection: db.store.linkCollection,
+      createItem: db.store.createItem,
+      restoreItem: db.store.restoreItem,
+      item: db.store.item,
+      replaceMetadata: db.store.replaceMetadata
+    }
+    const importer = new LibraryImporter(store)
+    const inputs = [paper(), paper()]
+    const preview = await importer.inspectImportItems(inputs, [])
+    expect(preview.map(({ status }) => status)).toEqual(['warning', 'existing'])
+    const receipt = await db.run(() => importer.importItems(inputs))
+    expect(receipt).toMatchObject({ createdCount: 1, reusedCount: 1 })
+    await db.run(() =>
+      importer.importItems([{ ...paper(), abstract: 'New abstract' }], undefined, 'fill-missing')
+    )
+    expect(db.state.items.get(receipt.itemIds[0])?.item.abstract).toBe('New abstract')
+    expect(db.state.projects).toEqual(new Set(['project']))
+    expect(db.state.candidates.size).toBe(0)
+    expect(db.state.invalidated).toEqual([])
+  })
+
+  it('retains the transaction rollback requirement for a partially written import', async () => {
+    const db = memoryLibrary()
+    const store = { ...db.store, createItem: vi.fn(db.store.createItem) }
+    store.createItem
+      .mockImplementationOnce(db.store.createItem)
+      .mockRejectedValueOnce(new Error('disk full'))
+    const importer = new LibraryImporter(store)
+    await expect(
+      db.run(() => importer.importItems([paper(), paper('10.1234/another')]))
+    ).rejects.toThrow('disk full')
+    expect(db.state.items.size).toBe(0)
+  })
+})
+
+describe('personal reading status', () => {
+  it('accepts bounded status commands and filters while keeping old snapshots compatible', async () => {
+    const db = memoryLibrary(),
+      id = await imported(db)
+    const oldSnapshot = { ...db.state.items.get(id)! }
+    delete oldSnapshot.readingStatus
+    expect(literatureItemViewSchema.parse(oldSnapshot).readingStatus).toBeUndefined()
+    for (const readingStatus of ['unread', 'reading', 'read'] as const) {
+      const command = { kind: 'set-reading-status', itemIds: [id], readingStatus }
+      expect(literatureCatalogCommandSchema.parse(command)).toEqual(command)
+      expect(
+        literatureCatalogSearchRequestSchema.parse({ scope: 'library', filter: { readingStatus } })
+      ).toMatchObject({ filter: { readingStatus } })
+    }
+    for (const itemIds of [[], Array.from({ length: 201 }, (_, index) => `item-${index}`)])
+      expect(
+        literatureCatalogCommandSchema.safeParse({
+          kind: 'set-reading-status',
+          itemIds,
+          readingStatus: 'read'
+        }).success
+      ).toBe(false)
+    expect(
+      literatureCatalogCommandSchema.safeParse({
+        kind: 'set-reading-status',
+        itemIds: [id],
+        readingStatus: 'finished'
+      }).success
+    ).toBe(false)
+    expect(
+      literatureCatalogSearchRequestSchema.safeParse({
+        scope: 'library',
+        filter: { readingStatus: 'finished' }
+      }).success
+    ).toBe(false)
+    expect(literatureItemInputSchema.safeParse({ ...paper(), readingStatus: 'read' }).success).toBe(
+      false
+    )
+    expect(
+      literatureCatalogReceiptSchema.parse({ kind: 'item', id, itemIds: [id], state: 'present' })
+        .itemIds
+    ).toEqual([id])
+  })
+
+  it('changes only personal state and rolls back batches containing unavailable references', async () => {
+    const db = memoryLibrary(),
+      id = await imported(db)
+    const original = structuredClone(db.state.items.get(id)!)
+    expect(original.readingStatus).toBe('unread')
+    expect(
+      await db.run((tx) =>
+        tx.setReadingStatus({
+          kind: 'set-reading-status',
+          itemIds: [id, id],
+          readingStatus: 'reading'
+        })
+      )
+    ).toEqual({ kind: 'item', id, itemIds: [id], state: 'present' })
+    expect(db.state.items.get(id)).toMatchObject({
+      item: original.item,
+      metadataRevision: original.metadataRevision,
+      readingStatus: 'reading'
+    })
+    expect(db.state.invalidated).toEqual([])
+    for (const unavailable of ['missing', 'deleted', 'merged']) {
+      if (unavailable !== 'missing')
+        db.state.items.set(unavailable, {
+          ...original,
+          id: unavailable,
+          ...(unavailable === 'deleted' ? { deletedAt: 1 } : { mergedIntoItemId: id })
+        })
+      const before = structuredClone([...db.state.items])
+      await expect(
+        db.run((tx) =>
+          tx.setReadingStatus({
+            kind: 'set-reading-status',
+            itemIds: [id, unavailable],
+            readingStatus: 'read'
+          })
+        )
+      ).rejects.toThrow('unavailable')
+      expect([...db.state.items]).toEqual(before)
+    }
+    expect(db.state.invalidated).toEqual([])
+    expect(db.state.items.get(id)!.readingStatus).toBe('reading')
+  })
+})
+
 describe('independent library transactions', () => {
-  it('removes text joined to a DOI without requiring a host provider', () =>
-    expect(normalizeIdentifier('doi', '10.1234/exampleCopyright')).toBe('10.1234/example'))
+  it('preserves opaque DOI suffixes without requiring a host provider', () =>
+    expect(normalizeIdentifier('doi', '10.1234/exampleCopyright')).toBe('10.1234/examplecopyright'))
   it('previews repeated identities using virtual targets and commits one reference', async () => {
     const db = memoryLibrary(),
       inputs = [paper(), paper()]

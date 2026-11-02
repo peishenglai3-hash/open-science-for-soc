@@ -102,6 +102,7 @@ const createCommands = (): ConnectorCommands => ({
   setConnectorAutoAllow: vi.fn(async () => snapshot()),
   setToolPermission: vi.fn(async () => detail),
   setNcbiCredentials: vi.fn(async () => snapshot()),
+  setSemanticScholarCredential: vi.fn(async () => snapshot()),
   setOpenAlexCredential: vi.fn(async () => snapshot()),
   validateOpenAlexCredential: vi.fn(async () => ({ valid: true as const })),
   addCustomServer: vi.fn(async () => snapshot()),
@@ -153,7 +154,11 @@ describe('settings Connectors slice', () => {
         oauth: {}
       })
       await credentials.saveOAuthState(credential.id, {
-        tokens: { access_token: 'old-token', token_type: 'Bearer' }
+        tokens: {
+          access_token: 'old-token',
+          token_type: 'Bearer',
+          issuer: 'https://auth.example.test'
+        }
       })
       const list = async (): Promise<{ credentials: DeviceCredentialView[] }> => ({
         credentials: (await credentials.list()).map((entry) => credentials.view(entry, []))

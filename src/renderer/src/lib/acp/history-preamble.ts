@@ -3,7 +3,7 @@ import type {
   HistoryReplayDescriptor,
   HistoryReplayTarget
 } from '../../../../shared/history-replay-contract'
-import { resolveModelContextWindow } from '../../../../shared/provider-registry'
+import { resolveModelContextWindow } from '../../../../shared/provider-model-policy'
 import { buildSessionHistoryReplay } from '../../../../shared/session-history-replay'
 import { isHiddenControlMessage } from '../../../../shared/session-persistence'
 import {
@@ -13,7 +13,7 @@ import {
   type ProviderView
 } from '../../../../shared/settings'
 import type { UploadedAttachment } from '../../../../shared/uploads'
-import type { ChatMessage } from '../../stores/session-store'
+import type { ChatMessage } from '../../stores/session-store-contract'
 
 export const resolveHistoryReplayTarget = (
   frameworkId: AgentFrameworkId | undefined,
@@ -22,6 +22,7 @@ export const resolveHistoryReplayTarget = (
 ): HistoryReplayTarget => {
   if (frameworkId === 'opencode') return 'opencode'
   if (frameworkId === 'codebuddy') return 'codebuddy'
+  if (frameworkId === 'pi') return 'pi'
   if (frameworkId !== 'codex') return 'claude-code'
   if (
     provider &&

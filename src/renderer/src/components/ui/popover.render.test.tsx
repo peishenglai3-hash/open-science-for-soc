@@ -20,6 +20,22 @@ if (!Element.prototype.scrollIntoView) Element.prototype.scrollIntoView = (): vo
 
 afterEach(cleanup)
 
+it('mounts content in an explicit portal container', () => {
+  const host = document.createElement('div')
+  document.body.append(host)
+  const { unmount } = render(
+    <Popover defaultOpen>
+      <PopoverTrigger>Filters</PopoverTrigger>
+      <PopoverContent container={host} aria-label="Filters">
+        <input aria-label="Year" />
+      </PopoverContent>
+    </Popover>
+  )
+  expect(host.contains(screen.getByRole('dialog', { name: 'Filters' }))).toBe(true)
+  unmount()
+  host.remove()
+})
+
 const renderPopover = (menu = false): void => {
   render(
     <Popover>
@@ -103,4 +119,15 @@ it('preserves selection and closes one layer at a time with Escape, restoring fo
   await waitFor(() =>
     expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Filters' }))
   )
+})
+
+it('uses a theme-matched surface for nested notices and secondary copy', () => {
+  renderPopover()
+  const content = screen.getByRole('dialog')
+  expect(content.className).toContain('bg-popover')
+  expect(content.className).toContain('text-popover-foreground')
+  expect(content.className).toContain('border-border')
+  expect(content.className).toContain('shadow-menu')
+  expect(content.className).not.toContain('bg-text-000')
+  expect(content.className).not.toContain('text-bg-000')
 })

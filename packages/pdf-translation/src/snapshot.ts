@@ -1,10 +1,25 @@
 import { z } from 'zod'
+import { clippedNavigationRect } from './reader/native-source-geometry.js'
 
 const item = z
   .object({ index: z.number().int().min(0).max(1000000), text: z.string().max(100000) })
   .strict()
 const pageNumber = z.number().int().min(1).max(500)
 const count = z.number().int().min(0).max(1000000)
+const originalRegion = z
+  .object({
+    pageNumber,
+    rect: z
+      .object({
+        x: z.number().min(0).max(1),
+        y: z.number().min(0).max(1),
+        width: z.number().positive().max(1),
+        height: z.number().positive().max(1)
+      })
+      .strict()
+      .refine((r) => r.x + r.width <= 1.000001 && r.y + r.height <= 1.000001)
+  })
+  .strict()
 
 // This version describes stored data, not the currently installed grouping algorithm.
 // Old runs keep their original ownership, reading order and coordinates after upgrades.
@@ -13,6 +28,7 @@ export const pdfTranslationLayoutSnapshotSchema = z
     version: z.literal(1),
     parserVersion: z.string().min(1).max(128),
     fingerprint: z.string().min(1).max(256),
+    originalRegions: z.array(originalRegion).max(10000).optional(),
     pages: z
       .array(
         z
@@ -31,11 +47,23 @@ export const pdfTranslationLayoutSnapshotSchema = z
             id: z.string().min(1).max(256),
             source: z.string().min(1).max(100000),
             sourceOnly: z.literal(true).optional(),
+            figure: z.literal(true).optional(),
+            preserve: z.enum(['formula', 'code', 'literal', 'reference']).optional(),
+            referenceBoundary: z.literal(true).optional(),
             fragments: z
               .array(
                 z
                   .object({
                     pageNumber,
+                    unclippedRect: z
+                      .object({
+                        x: z.number(),
+                        y: z.number(),
+                        width: z.number().positive(),
+                        height: z.number().positive()
+                      })
+                      .strict()
+                      .optional(),
                     rect: z
                       .object({
                         x: z.number().min(-1e-9).max(1),
@@ -106,12 +134,30 @@ export const pdfTranslationLayoutSnapshotSchema = z
         value.coverage.pageCount !== value.pages.length ||
         value.coverage.textItemCount !==
           value.coverage.includedItemCount + value.coverage.excludedItemCount ||
-        new Set(value.units.map((unit) => unit.id)).size !== value.units.length
+        new Set(value.units.map((unit) => unit.id)).size !== value.units.length ||
+        value.originalRegions?.some((region) => region.pageNumber > value.pages.length)
       )
         return false
       const owned = new Set<string>()
       for (const unit of value.units)
         for (const fragment of unit.fragments) {
+          if (fragment.unclippedRect) {
+            const clipped = clippedNavigationRect(fragment.unclippedRect)
+            if (
+              !clipped ||
+              !unit.sourceOnly ||
+              unit.fragments.length !== 1 ||
+              fragment.items.length !== 1 ||
+              unit.source !== fragment.items[0].text ||
+              (['x', 'y', 'width', 'height'] as const).some(
+                (key) => clipped[key] !== fragment.rect[key]
+              ) ||
+              !value.coverage.warnings.some(
+                (w) => w.unitId === unit.id && w.reasons.includes('partially-outside-page')
+              )
+            )
+              return false
+          }
           if (fragment.pageNumber > value.pages.length) return false
           for (const item of fragment.items) {
             const key = `${fragment.pageNumber}:${item.index}`

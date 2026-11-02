@@ -6,7 +6,7 @@ import type {
   DelegatedWorkResolvedAgent,
   ResolvedSubagentModelSnapshot
 } from '../delegated-work-contract'
-import type { ResolvedReasoningEffort } from '../reasoning-effort'
+import type { ResolvedReasoningEffort } from '@aipoch/providers'
 import type { AgentFrameworkId } from '../settings'
 import {
   AGENT_FRAMEWORK_IDS,
@@ -57,6 +57,7 @@ const SUBAGENT_MODEL_ROUTES = new Set<ResolvedSubagentModelSnapshot['modelRoute'
   'opencode-anthropic',
   'opencode-openai',
   'codebuddy-openai',
+  'pi',
   'codex-responses',
   'codex-responses-compatibility',
   'codex-bridge'

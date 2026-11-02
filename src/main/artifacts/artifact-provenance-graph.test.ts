@@ -371,7 +371,7 @@ describe('artifact provenance graph', () => {
   })
 
   it.each(['proportional_venn_5sets.png', 'proportional_venn_5sets_hires.png'])(
-    'reconstructs %s without discarded font probes and failed theme setup',
+    'retains %s without certifying unproved Excel set operations',
     async (filename) => {
       const cells: string[] = JSON.parse(
         await readFile(join(__dirname, '../notebook/reported-venn-layers.fixture.json'), 'utf8')
@@ -439,7 +439,8 @@ describe('artifact provenance graph', () => {
           computeActivities: [],
           notebookDependencies: dependencies
         })
-        expect(graph.completeness, JSON.stringify(graph.reasonCodes)).toBe('complete')
+        expect(graph.completeness, JSON.stringify(graph.reasonCodes)).toBe('incomplete')
+        expect(graph.reasonCodes).toContain('kernel-dependencies-unavailable')
         const recipe = reproductionRecipes.sealArtifactReproducibilityRecipe({
           provenanceGraph: graph,
           inputFiles: [],
@@ -452,15 +453,17 @@ describe('artifact provenance graph', () => {
           )
         })
         expect(recipe.steps.map((step) => step.activityId)).toEqual(['run-6'])
+        expect(recipe.capture.state).toBe('blocked')
+        expect(recipe.capture.reasonCodes).toContain('target-graph-incomplete')
         expect(
           reproductionRecipes.resolveArtifactReproducibilityExecutionPlan(recipe, 'original-inputs')
-        ).toBeDefined()
+        ).toBeUndefined()
       } finally {
         await rm(root, { recursive: true, force: true })
       }
     }
   )
-  it('reconstructs the Venn PNG from its Excel input and two required R cells', async () => {
+  it('retains the Venn target and blocks unproved Excel-to-kernel steps', async () => {
     const cells: string[] = JSON.parse(
       await readFile(join(__dirname, '../notebook/reported-venn.fixture.json'), 'utf8')
     )
@@ -509,7 +512,8 @@ describe('artifact provenance graph', () => {
         computeActivities: [],
         notebookDependencies: dependencies
       })
-      expect(graph.completeness, JSON.stringify(graph.reasonCodes)).toBe('complete')
+      expect(graph.completeness, JSON.stringify(graph.reasonCodes)).toBe('incomplete')
+      expect(graph.reasonCodes).toContain('kernel-dependencies-unavailable')
       const recipe = reproductionRecipes.sealArtifactReproducibilityRecipe({
         provenanceGraph: graph,
         inputFiles: [],
@@ -517,10 +521,21 @@ describe('artifact provenance graph', () => {
           recipeRun(a.run.runId, a.runIndex, { script: a.run.script, kernelKind: 'r' })
         )
       })
-      expect(recipe.steps.map((step) => step.activityId)).toEqual(['run-2', 'run-3'])
+      // Unknown kernel dependencies cannot certify the earlier Excel cell as
+      // required. Retain the observed writer, but block this incomplete recipe.
+      expect(graph.entities).toContainEqual(
+        expect.objectContaining({
+          kind: 'file-generation',
+          generationId: 'png',
+          checksum: checksum('b')
+        })
+      )
+      expect(recipe.steps.map((step) => step.activityId)).toEqual(['run-3'])
+      expect(recipe.capture.state).toBe('blocked')
+      expect(recipe.capture.reasonCodes).toContain('target-graph-incomplete')
       expect(
         reproductionRecipes.resolveArtifactReproducibilityExecutionPlan(recipe, 'original-inputs')
-      ).toBeDefined()
+      ).toBeUndefined()
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -622,87 +637,110 @@ describe('artifact provenance graph', () => {
     }
   })
 
-  it('reconstructs a generated RDS bridge instead of requiring it to be an uploaded input', async () => {
-    const cells = JSON.parse(
-      await readFile(join(__dirname, '../notebook/reported-rds-clean-volcano.fixture.json'), 'utf8')
-    ) as Array<{ index: number; script: string }>
-    const root = await mkdtemp(join(tmpdir(), 'rds-file-recipe-'))
-    const relation = (
-      kind: string,
-      id: string,
-      path: string,
-      digest: string
-    ): Record<string, unknown> => ({
-      relation: kind,
-      relativePath: path,
-      pathPortability: 'relative',
-      authority: 'advisory',
-      generation: generation(id, path, checksum(digest))
-    })
-    const activities = [
-      notebookActivity(
-        'producer',
-        7,
-        [
-          relation(
-            'present-before',
-            'xlsx',
-            'data/inputs/differential-results-333333333333.xlsx',
-            'a'
-          ),
-          relation('created', 'rds', 'data/diff_df_clean.rds', 'b')
-        ],
-        { script: cells[7].script, kernelKind: 'r', kernelEpochId: 'first' }
-      ),
-      notebookActivity(
-        'plot',
-        8,
-        [
-          relation('present-before', 'rds', 'data/diff_df_clean.rds', 'b'),
-          relation('created', 'png', 'data/diagonal_volcano.png', 'c')
-        ],
-        { script: cells[8].script, kernelKind: 'r', kernelEpochId: 'second' }
-      )
-    ]
-    try {
-      for (const activity of activities) {
-        const path = join(root, activity.run.fileEvidence!.storageKey!)
-        await mkdir(dirname(path), { recursive: true })
-        await writeFile(path, activity.evidenceJson!)
-      }
-      const dependencies = await createNotebookDependencyAnalyzer({
-        storageRoot: root,
-        repository: { readSessionRuns: async () => activities.map((a) => a.run) }
-      }).project({ projectId: 'p', sessionId: 's', throughRunId: 'plot' })
-      const graph = sealArtifactProvenanceGraph({
-        target: {
-          versionId: 'v',
-          filename: 'diagonal_volcano.png',
-          checksum: checksum('c'),
-          sizeBytes: 10,
-          producerRunId: 'plot',
-          sourceGenerationId: 'png'
-        },
-        notebookActivities: activities,
-        computeActivities: [],
-        notebookDependencies: dependencies
-      })
-      expect(graph.completeness, JSON.stringify(graph.reasonCodes)).toBe('complete')
-      const recipe = reproductionRecipes.sealArtifactReproducibilityRecipe({
-        provenanceGraph: graph,
-        inputFiles: [],
-        runs: activities.map((a) =>
-          recipeRun(a.run.runId, a.runIndex, { script: a.run.script, kernelKind: 'r' })
+  it.each([false, true])(
+    'retains an RDS bridge without certifying plot column types with proven producer=%s',
+    async (provenProducer) => {
+      const cells = JSON.parse(
+        await readFile(
+          join(__dirname, '../notebook/reported-rds-clean-volcano.fixture.json'),
+          'utf8'
         )
+      ) as Array<{ index: number; script: string }>
+      const root = await mkdtemp(join(tmpdir(), 'rds-file-recipe-'))
+      const relation = (
+        kind: string,
+        id: string,
+        path: string,
+        digest: string
+      ): Record<string, unknown> => ({
+        relation: kind,
+        relativePath: path,
+        pathPortability: 'relative',
+        authority: 'advisory',
+        generation: generation(id, path, checksum(digest))
       })
-      expect(recipe.steps.map((step) => step.activityId)).toEqual(['producer', 'plot'])
-      expect(
-        reproductionRecipes.resolveArtifactReproducibilityExecutionPlan(recipe, 'original-inputs')
-      ).toBeDefined()
-    } finally {
-      await rm(root, { recursive: true, force: true })
+      const activities = [
+        notebookActivity(
+          'producer',
+          7,
+          [
+            relation(
+              'present-before',
+              'xlsx',
+              'data/inputs/differential-results-333333333333.xlsx',
+              'a'
+            ),
+            relation('created', 'rds', 'data/diff_df_clean.rds', 'b')
+          ],
+          {
+            script: provenProducer
+              ? 'df <- data.frame(log2FoldChange=c(-2,2), neg_log10_p=c(3,4), status=c("Down","Up"), label=c("a","b"));saveRDS(df,"diff_df_clean.rds")'
+              : cells[7].script,
+            kernelKind: 'r',
+            kernelEpochId: 'first'
+          }
+        ),
+        notebookActivity(
+          'plot',
+          8,
+          [
+            relation('present-before', 'rds', 'data/diff_df_clean.rds', 'b'),
+            relation('created', 'png', 'data/diagonal_volcano.png', 'c')
+          ],
+          { script: cells[8].script, kernelKind: 'r', kernelEpochId: 'second' }
+        )
+      ]
+      try {
+        for (const activity of activities) {
+          const path = join(root, activity.run.fileEvidence!.storageKey!)
+          await mkdir(dirname(path), { recursive: true })
+          await writeFile(path, activity.evidenceJson!)
+        }
+        const dependencies = await createNotebookDependencyAnalyzer({
+          storageRoot: root,
+          repository: { readSessionRuns: async () => activities.map((a) => a.run) }
+        }).project({ projectId: 'p', sessionId: 's', throughRunId: 'plot' })
+        const graph = sealArtifactProvenanceGraph({
+          target: {
+            versionId: 'v',
+            filename: 'diagonal_volcano.png',
+            checksum: checksum('c'),
+            sizeBytes: 10,
+            producerRunId: 'plot',
+            sourceGenerationId: 'png'
+          },
+          notebookActivities: activities,
+          computeActivities: [],
+          notebookDependencies: dependencies
+        })
+        // A proven producer and physical generations retain the bridge, but
+        // RDS/table ownership does not establish types of plotted columns.
+        expect(graph.completeness, JSON.stringify(graph.reasonCodes)).toBe('incomplete')
+        expect(dependencies.stalenessByRunId.plot).toMatchObject({
+          state: 'unknown',
+          reasons: expect.arrayContaining(['opaque-call'])
+        })
+        expect(graph.reasonCodes).toContain('kernel-dependencies-unavailable')
+        const recipe = reproductionRecipes.sealArtifactReproducibilityRecipe({
+          provenanceGraph: graph,
+          inputFiles: [],
+          runs: activities.map((a) =>
+            recipeRun(a.run.runId, a.runIndex, { script: a.run.script, kernelKind: 'r' })
+          )
+        })
+        expect(recipe.steps.map((step) => step.activityId)).toEqual(['producer', 'plot'])
+        const plan = reproductionRecipes.resolveArtifactReproducibilityExecutionPlan(
+          recipe,
+          'original-inputs'
+        )
+        expect(recipe.capture.state).toBe('blocked')
+        expect(recipe.capture.reasonCodes).toContain('target-graph-incomplete')
+        expect(plan).toBeUndefined()
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
     }
-  })
+  )
   it('retains contrast plot source without certifying unproven memory-dependent R cells', async () => {
     const cells = JSON.parse(
       await readFile(join(__dirname, '../notebook/reported-contrasts-volcano.fixture.json'), 'utf8')
@@ -956,7 +994,7 @@ describe('artifact provenance graph', () => {
   )
 
   it.each(['png', 'pdf'])(
-    'replays Python preparation and R plotting for the %s target',
+    'retains Python preparation and blocks unproved R plotting for the %s target',
     async (extension) => {
       const cells = JSON.parse(
         await readFile(
@@ -1021,8 +1059,9 @@ describe('artifact provenance graph', () => {
           storageRoot: root,
           repository: { readSessionRuns: async () => activities.map((a) => a.run) }
         }).project({ projectId: 'p', sessionId: 's', throughRunId: 'run-8' })
-        expect(dependencies.stalenessByRunId['run-8'], JSON.stringify(dependencies)).toEqual({
-          state: 'clear'
+        expect(dependencies.stalenessByRunId['run-8'], JSON.stringify(dependencies)).toMatchObject({
+          state: 'unknown',
+          reasons: expect.arrayContaining(['opaque-call'])
         })
         const graph = sealArtifactProvenanceGraph({
           target: {
@@ -1037,7 +1076,8 @@ describe('artifact provenance graph', () => {
           computeActivities: [],
           notebookDependencies: dependencies
         })
-        expect(graph.completeness, JSON.stringify(graph.reasonCodes)).toBe('complete')
+        expect(graph.completeness, JSON.stringify(graph.reasonCodes)).toBe('incomplete')
+        expect(graph.reasonCodes).toContain('kernel-dependencies-unavailable')
         expect(
           graph.activities.filter((a) => a.kind === 'notebook-run').map((a) => a.activityId),
           JSON.stringify(dependencies)
@@ -1053,9 +1093,11 @@ describe('artifact provenance graph', () => {
           )
         })
         expect(recipe.steps.map((s) => s.activityId)).toEqual(['run-5', 'run-8'])
+        expect(recipe.capture.state).toBe('blocked')
+        expect(recipe.capture.reasonCodes).toContain('target-graph-incomplete')
         expect(
           reproductionRecipes.resolveArtifactReproducibilityExecutionPlan(recipe, 'original-inputs')
-        ).toBeDefined()
+        ).toBeUndefined()
       } finally {
         await rm(root, { recursive: true, force: true })
       }
@@ -2745,6 +2787,50 @@ describe('artifact provenance graph', () => {
           sizeBytes: 10
         })
       ])
+    }
+  )
+
+  it.each(['mapped', 'conflicting', 'unused'] as const)(
+    'validates predecessor generation mappings: %s',
+    (condition) => {
+      const activity = notebookActivity('run-2', 2, [
+        {
+          relation: 'modified',
+          relativePath: 'result.csv',
+          pathPortability: 'relative',
+          authority: 'advisory',
+          previousGenerationId: 'g-before',
+          generation: generation('g-target', 'result.csv', checksum('b'))
+        }
+      ])
+      const sidecar = JSON.parse(activity.evidenceJson!)
+      sidecar.predecessorGenerations = [generation('g-before', 'result.csv', checksum('a'))]
+      if (condition === 'conflicting')
+        sidecar.predecessorGenerations.push(generation('g-before', 'result.csv', checksum('c')))
+      if (condition === 'unused')
+        sidecar.predecessorGenerations.push(generation('g-unused', 'result.csv', checksum('c')))
+      activity.evidenceJson = JSON.stringify(sidecar)
+      activity.run.fileEvidence!.checksum = sha256(activity.evidenceJson)
+      const graph = sealArtifactProvenanceGraph({
+        target: target(),
+        notebookActivities: [activity],
+        computeActivities: []
+      })
+      if (condition === 'mapped') {
+        expect(graph.edges).toContainEqual(
+          expect.objectContaining({
+            kind: 'used',
+            activityId: 'run-2',
+            entityId: 'file-generation:g-before'
+          })
+        )
+      } else {
+        expect(
+          graph.edges.some(
+            (edge) => 'entityId' in edge && edge.entityId === 'file-generation:g-before'
+          )
+        ).toBe(false)
+      }
     }
   )
 

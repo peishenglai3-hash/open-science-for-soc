@@ -20,7 +20,7 @@ import type {
   ActionMenuDefinition,
   ActionMenuRecipeEntry
 } from '@/components/action-menu'
-import type { ChatSession, SessionStatus } from '@/stores/session-store'
+import type { ChatSession, SessionStatus } from '@/stores/session-store-contract'
 import { projectPresentedSessionActionability } from './session-wait-reason'
 
 export type SessionActionId =
@@ -197,8 +197,11 @@ export const createSessionActionBindings = (
     disabled: ({ session }) => !options.canArchiveSession?.(session)
   },
   delete: {
-    execute: ({ session }) => options.onDeleteSession?.(session),
-    hidden: !options.onDeleteSession,
+    execute: ({ session }) => {
+      if (!session.firstPromptDraft && !session.isPending) options.onDeleteSession?.(session)
+    },
+    hidden: ({ session }) =>
+      !options.onDeleteSession || Boolean(session.firstPromptDraft || session.isPending),
     disabled: !options.canDeleteConversations
   }
 })

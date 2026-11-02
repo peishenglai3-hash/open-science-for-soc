@@ -12,9 +12,14 @@ import type {
 } from '../../../../shared/acp'
 import type { UploadedAttachment } from '../../../../shared/uploads'
 import { resetSessionConversationIntentsForTests } from '../../stores/session-conversation-intents'
-import { createInitialSessionState, useSessionStore } from '../../stores/session-store'
+import {
+  createInitialSessionState,
+  toPersistedSession,
+  useSessionStore
+} from '../../stores/session-store'
 import {
   resetSessionPersistenceWriteFailuresForTests,
+  saveSessionInOrder,
   type SessionPersistenceApi
 } from '../session-persistence/session-persistence'
 import {
@@ -22,6 +27,10 @@ import {
   type SendWorkspaceMessageIntent
 } from './workspace-runtime-command-owner'
 import { cancelWorkspaceRun } from './workspace-runtime-session-lifecycle-owner'
+import {
+  hasPendingWorkspacePromptRollback,
+  resetWorkspacePromptRollbacksForTests
+} from './workspace-prompt-preparation'
 import { finalizeWorkspaceAttachments } from './workspace-runtime-attachment-owner'
 import { initI18n, prepareI18nLocale } from '../../i18n'
 import {
@@ -42,7 +51,10 @@ const snapshot = {
   sessionIds: ['bound-session'],
   status: 'connected',
   events: [],
-  permissions: []
+  permissions: [],
+  pendingPermissions: [],
+  pendingElicitations: [],
+  promptInFlightSessionIds: []
 } as unknown as AcpStateSnapshot
 const runtime = (): {
   state: AcpStateSnapshot
@@ -129,12 +141,17 @@ const mainBoundary = (
 }
 
 beforeEach(() => {
+  resetWorkspacePromptRollbacksForTests()
   resetSessionConversationIntentsForTests()
   resetSessionPersistenceWriteFailuresForTests()
   useSessionStore.setState(createInitialSessionState())
   useWorkspaceOperationErrors.setState({ errors: {} })
 })
 afterEach(() => vi.unstubAllGlobals())
+
+const settleCleanup = async (): Promise<void> => {
+  for (let index = 0; index < 150; index += 1) await Promise.resolve()
+}
 
 describe('prompt admission across Main preparation and pending binding', () => {
   it('deduplicates a Main seed push before binding and dispatches the exact tagged prompt', async () => {
@@ -172,13 +189,26 @@ describe('prompt admission across Main preparation and pending binding', () => {
       await cancelWorkspaceRun(agent, pending.id)
       main.waiting.resolve()
       expect(await sending).toBeUndefined()
+      await settleCleanup()
       expect(agent.sendPrompt).not.toHaveBeenCalled()
-      expect(main.read()?.messages).toEqual([])
-      expect(main.read()?.conversationGraph?.messages).toEqual([])
-      expect(main.read()?.activeRun).toBeUndefined()
-      expect(
-        useSessionStore.getState().sessions.find(({ id }) => id === 'bound-session')?.messages
-      ).toEqual([])
+      expect(main.read()).toBeUndefined()
+      expect(main.deleteSession).toHaveBeenCalledExactlyOnceWith({
+        projectId: 'project',
+        sessionId: 'bound-session'
+      })
+      // This boundary fake does not broadcast native deletion; any cached seed must stay idle.
+      const cachedSeed = useSessionStore
+        .getState()
+        .sessions.find(({ id }) => id === 'bound-session')
+      expect(cachedSeed?.messages ?? []).toEqual([])
+      expect(cachedSeed?.activeRun).toBeUndefined()
+      expect(useSessionStore.getState().sessions.find(({ id }) => id === pending.id)).toMatchObject(
+        {
+          messages: [],
+          status: 'idle',
+          activeRun: undefined
+        }
+      )
     }
   )
 
@@ -259,7 +289,7 @@ describe('prompt admission across Main preparation and pending binding', () => {
     )
   })
 
-  it('reports an Operation Error that includes a failed seed cleanup', async () => {
+  it('reports the original Operation Error independently of failed seed cleanup', async () => {
     const main = mainBoundary(undefined, true, true)
     main.deleteSession.mockResolvedValueOnce({
       status: 'failed',
@@ -275,12 +305,12 @@ describe('prompt admission across Main preparation and pending binding', () => {
     const reported = Object.values(useWorkspaceOperationErrors.getState().errors)
     expect(reported).toHaveLength(1)
     expect(reported[0]).toContain('Preparation write failed')
-    expect(reported[0]).toMatch(/could not be removed/i)
+    expect(reported[0]).toBe('Preparation write failed')
     expect(main.deleteSession).toHaveBeenCalledTimes(1)
     expect(main.deleteSession.mock.calls[0][0].sessionId).toBe('bound-session')
   })
 
-  it('localizes the failed seed cleanup sentence and its Session cleanup fragment', async () => {
+  it('preserves the original preparation failure in a translated locale when cleanup fails', async () => {
     await prepareI18nLocale('zh-Hans')
     initI18n('zh-Hans')
     try {
@@ -298,7 +328,7 @@ describe('prompt admission across Main preparation and pending binding', () => {
       const reported = Object.values(useWorkspaceOperationErrors.getState().errors)
       expect(reported).toHaveLength(1)
       expect(reported[0]).toContain('Preparation write failed')
-      expect(reported[0]).toContain('未发送的会话无法移除（智能体会话清理未完成。）')
+      expect(reported[0]).toBe('Preparation write failed')
       expect(reported[0]).not.toMatch(/could not be removed/i)
     } finally {
       initI18n('en')
@@ -402,5 +432,191 @@ describe('prompt admission across Main preparation and pending binding', () => {
       .sessions.find(({ id }) => id === 'source-session')
     expect(sourceAfter?.messages.map(({ id }) => id)).toEqual(['source-prompt'])
     expect(main.read('source-session')).toBeUndefined()
+  })
+})
+
+describe('Stop before an existing Session prompt reaches Main', () => {
+  const existing = async (
+    pause?: 'prepare'
+  ): Promise<{ main: ReturnType<typeof mainBoundary>; agent: ReturnType<typeof runtime> }> => {
+    const main = mainBoundary(pause)
+    const seed = materializeSessionConversationGraph({
+      id: 'bound-session',
+      projectId: 'project',
+      title: 'Existing Session',
+      cwd: '/workspace',
+      status: 'idle',
+      messages: [],
+      createdAt: 1,
+      updatedAt: 1
+    })
+    await saveSessionInOrder(seed)
+    useSessionStore.getState().hydrateSessions([main.read()!])
+    const agent = runtime()
+    agent.cancel.mockResolvedValue(snapshot as unknown as AcpRuntimeState)
+    return { main, agent }
+  }
+  const input = {
+    sessionId: 'bound-session',
+    text: 'Stopped question',
+    cwd: '/workspace',
+    projectId: 'project'
+  }
+  const saveCurrent = async (): Promise<void> => {
+    await saveSessionInOrder(toPersistedSession(useSessionStore.getState().sessions[0]))
+  }
+
+  it.each(['prepare', 'flush'] as const)(
+    'rolls back an exact unsent preparation after Stop during %s',
+    async (phase) => {
+      const { main, agent } = await existing(phase === 'prepare' ? 'prepare' : undefined)
+      const waiting = gate()
+      const flush = vi.fn(async () => {
+        await saveCurrent()
+        if (phase === 'flush' && useSessionStore.getState().sessions[0].activeRun)
+          await waiting.promise
+      })
+      const sending = sendWorkspaceMessage(agent, input, { flushPersistence: flush })
+      await vi.waitFor(() =>
+        phase === 'prepare'
+          ? expect(
+              main.saveSession.mock.calls.some(([, options]) =>
+                options?.conversationCommands?.some(({ kind }) => kind === 'prepare-prompt')
+              )
+            ).toBe(true)
+          : expect(useSessionStore.getState().sessions[0].activeRun).toBeDefined()
+      )
+      const stopping = cancelWorkspaceRun(agent, input.sessionId)
+      main.waiting.resolve()
+      waiting.resolve()
+      await stopping
+      expect(await sending).toBeUndefined()
+      await settleCleanup()
+      expect(agent.sendPrompt).not.toHaveBeenCalled()
+      expect(agent.cancel).not.toHaveBeenCalled()
+      expect(main.read()?.messages).toEqual([])
+      expect(main.read()?.activeRun).toBeUndefined()
+      expect(main.read()?.promptPreparation).toBeUndefined()
+      expect(
+        main.saveSession.mock.calls.filter(([, options]) =>
+          options?.conversationCommands?.some(({ kind }) => kind === 'rollback-prompt')
+        )
+      ).toHaveLength(1)
+      expect(useSessionStore.getState().sessions[0].activeRun).toBeUndefined()
+      expect(useWorkspaceOperationErrors.getState().errors).toEqual({})
+    }
+  )
+
+  it('keeps Main cancellation after the prompt IPC was dispatched', async () => {
+    const { agent } = await existing()
+    const response = gate()
+    agent.sendPrompt.mockImplementation(async () => {
+      await response.promise
+      return snapshot
+    })
+    const sending = sendWorkspaceMessage(agent, input, {
+      flushPersistence: saveCurrent,
+      awaitPromptAdmission: true
+    })
+    await vi.waitFor(() => expect(agent.sendPrompt).toHaveBeenCalledOnce())
+    await cancelWorkspaceRun(agent, input.sessionId)
+    expect(agent.cancel).toHaveBeenCalledExactlyOnceWith(input.sessionId)
+    response.resolve()
+    expect(await sending).toBeDefined()
+  })
+
+  it('still cancels the active Main run when another local send has not passed admission', async () => {
+    const { agent } = await existing()
+    useSessionStore
+      .getState()
+      .appendUserMessage({ sessionId: input.sessionId, content: 'Running question' })
+    const sending = sendWorkspaceMessage(agent, input)
+    await cancelWorkspaceRun(agent, input.sessionId)
+    await sending
+    expect(agent.cancel).toHaveBeenCalledExactlyOnceWith(input.sessionId)
+    expect(agent.sendPrompt).not.toHaveBeenCalled()
+  })
+
+  it('retains a failed Stop rollback and retries it without dispatch or a Main cancellation', async () => {
+    const { main, agent } = await existing()
+    const save = main.saveSession.getMockImplementation()!
+    let failRollback = true
+    main.saveSession.mockImplementation(async (candidate, options) => {
+      if (
+        failRollback &&
+        options?.conversationCommands?.some(({ kind }) => kind === 'rollback-prompt')
+      )
+        throw new Error('Disk full')
+      return save(candidate, options)
+    })
+    const waiting = gate()
+    const sending = sendWorkspaceMessage(agent, input, {
+      flushPersistence: async () => {
+        await saveCurrent()
+        if (useSessionStore.getState().sessions[0].activeRun) await waiting.promise
+      }
+    })
+    await vi.waitFor(() => expect(useSessionStore.getState().sessions[0].activeRun).toBeDefined())
+    const stopped = expect(cancelWorkspaceRun(agent, input.sessionId)).resolves.toBeUndefined()
+    waiting.resolve()
+    await Promise.all([sending, stopped])
+    await settleCleanup()
+    expect(hasPendingWorkspacePromptRollback(input.sessionId)).toBe(true)
+    expect(agent.sendPrompt).not.toHaveBeenCalled()
+    expect(agent.cancel).not.toHaveBeenCalled()
+    failRollback = false
+    await cancelWorkspaceRun(agent, input.sessionId)
+    expect(hasPendingWorkspacePromptRollback(input.sessionId)).toBe(false)
+    expect(main.read()?.messages).toEqual([])
+    expect(main.read()?.activeRun).toBeUndefined()
+    expect(agent.cancel).not.toHaveBeenCalled()
+  })
+
+  it('compensates the exact preparation when a flush rejects after its write reached Main', async () => {
+    const { main, agent } = await existing()
+    const waiting = gate()
+    const sending = sendWorkspaceMessage(agent, input, {
+      flushPersistence: async () => {
+        await saveCurrent()
+        if (useSessionStore.getState().sessions[0].activeRun) {
+          await waiting.promise
+          throw new Error('Save response lost')
+        }
+      }
+    })
+    await vi.waitFor(() => expect(useSessionStore.getState().sessions[0].activeRun).toBeDefined())
+    const stopping = cancelWorkspaceRun(agent, input.sessionId)
+    waiting.resolve()
+    await Promise.all([sending, stopping])
+    await settleCleanup()
+    expect(main.read()?.messages).toEqual([])
+    expect(main.read()?.promptPreparation).toBeUndefined()
+    expect(agent.sendPrompt).not.toHaveBeenCalled()
+    expect(useWorkspaceOperationErrors.getState().errors).toEqual({})
+  })
+
+  it('settles the old Stop before a later send and never cancels the later prompt', async () => {
+    const { main, agent } = await existing()
+    const waiting = gate()
+    const sending = sendWorkspaceMessage(agent, input, {
+      flushPersistence: async () => {
+        await saveCurrent()
+        if (useSessionStore.getState().sessions[0].activeRun) await waiting.promise
+      }
+    })
+    await vi.waitFor(() => expect(useSessionStore.getState().sessions[0].activeRun).toBeDefined())
+    const stopping = cancelWorkspaceRun(agent, input.sessionId)
+    waiting.resolve()
+    await Promise.all([sending, stopping])
+    await settleCleanup()
+    const next = await sendWorkspaceMessage(
+      agent,
+      { ...input, text: 'Later question' },
+      { flushPersistence: saveCurrent }
+    )
+    expect(next).toBeDefined()
+    expect(agent.sendPrompt).toHaveBeenCalledOnce()
+    expect(agent.cancel).not.toHaveBeenCalled()
+    expect(main.read()?.messages.map(({ content }) => content)).toEqual(['Later question'])
   })
 })

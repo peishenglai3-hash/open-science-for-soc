@@ -83,6 +83,10 @@ jobs:
           package-manager-cache: false
       - name: Install dependencies
         run: node scripts/ci/npm-ci.mjs
+      - name: Build Windows sandbox native host
+        # The checked-in host can predate current lifecycle and ACL contracts. Both portable
+        # process tests and controlled mutations must consume this revision's native source.
+        run: node packages/notebook-network-sandbox/vendor/windows/build.mjs x64
       - name: Download Windows Notebook runtime
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -154,9 +158,13 @@ jobs:
           TEST_NAME_PATTERN: ${{ inputs.test_name_pattern || '.*' }}
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'regressions' }}
         # Reuse the full job's runner, install and effective project budgets without running the
-        # unrelated shards or native sandbox. These are the suites from the recent failed batches.
+        # unrelated shards or native lifecycle smoke. These are suites from recent failed batches.
         run: >-
           npm test --
+          src/main/acp/file-reference-resolver.test.ts
+          scripts/ci/pr-gate-workflow.test.ts
+          src/main/notebook/shell-cell-session.integration.test.ts
+          src/main/notebook/windows-shell.integration.test.ts
           cli/locate-app.test.ts
           scripts/credential-helper-signing.test.ts
           src/main/credential-identity/sqlite-snapshot.test.ts
@@ -167,7 +175,10 @@ jobs:
           src/main/session-package/literature.test.ts
           src/main/session-plan/plan-context-file.test.ts
           test/config/vitest.config.test.ts
+          scripts/ci/notebook-analysis-native.test.ts
+          scripts/pdf-package-fixtures.test.ts
           scripts/ci/windows-test-sequencer.test.ts
+          scripts/package-verification-plan.test.ts
           scripts/ci/release-workflows.test.ts
           scripts/windows-release-workflows.test.ts
           src/main/database/database-null-and-version-bounds.test.ts
@@ -193,6 +204,7 @@ jobs:
           packages/notebook-analysis/src/source-file-access-analysis.clinical-formats.test.ts
           packages/notebook-analysis/src/source-file-access-analysis.workflow-orchestration.test.ts
           src/main/session-package/archive.test.ts
+          src/main/session-package/content-verification.test.ts
           src/main/session-package/service.test.ts
           packages/environment/src/package-manager.test.ts
           src/main/notebook/package-process-sandbox.test.ts
@@ -224,6 +236,12 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'scheduled-fixes' }}
         run: >-
           npm test --
+          src/main/desktop-runtime-recovery.integration.test.ts
+          src/main/desktop-update-integration.test.ts
+          src/main/storage/content-repository.test.ts
+          src/main/session-package/browser-import.test.ts
+          src/main/notebook/working-file-observer.test.ts
+          src/main/session-persistence/projection.test.ts
           src/main/session-package/fork.test.ts
           src/main/agents/completion-gate.execute-control.integration.test.ts
           src/main/database/agent-memory-project-scope-migration.test.ts

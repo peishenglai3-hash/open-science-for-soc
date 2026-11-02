@@ -23,6 +23,69 @@ const jsonRes = (body: unknown): Response =>
   ({ ok: true, status: 200, json: async () => body }) as Response
 
 describe('ConnectorService', () => {
+  it('routes OmniPath through the existing Structures category and per-tool policy', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => Response.json([]))
+    const settings = {
+      enabledIds: [],
+      autoAllowIds: [],
+      disabledConnectorIds: [] as string[],
+      blockedToolIds: [] as string[]
+    }
+    const service = new ConnectorService({
+      registry: builtinConnectorRegistry,
+      engine: new ParserEngine({ fetchImpl, retries: 0 }),
+      getConnectors: () => settings,
+      resolveApiKey: () => undefined
+    })
+    const args = { accession: 'P00533', direction: 'upstream' }
+    await expect(
+      service.call('structures', 'omnipath_query_regulation', args, internal)
+    ).resolves.toMatchObject({ records: [], returned: 0 })
+    settings.blockedToolIds.push('structures/omnipath_query_regulation')
+    await expect(
+      service.call('structures', 'omnipath_query_regulation', args, internal)
+    ).rejects.toThrow(/blocked/)
+    settings.blockedToolIds.length = 0
+    settings.disabledConnectorIds.push('structures')
+    await expect(
+      service.call('structures', 'omnipath_query_regulation', args, internal)
+    ).rejects.toThrow(/disabled/)
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['tcia', 'kegg', 'orphadata', 'rxnorm', 'dailymed', 'biosamples', 'wikipathways'])(
+    'gates %s before transport until explicit opt-in, with opt-out winning conflicts',
+    async (id) => {
+      const tool = builtinConnectorRegistry.getConnectorTools(id)[0]
+      let settings = {
+        enabledIds: [],
+        autoAllowIds: [],
+        enabledConnectorIds: [] as string[],
+        disabledConnectorIds: [] as string[]
+      }
+      const call = vi.fn().mockResolvedValue({ source: 'Orphadata' })
+      const service = new ConnectorService({
+        registry: builtinConnectorRegistry,
+        getConnectors: () => settings,
+        resolveApiKey: () => undefined,
+        engine: { call } as unknown as ParserEngine
+      })
+      await expect(service.call(id, tool.id, tool.exampleArgs!, internal)).rejects.toThrow(
+        /disabled/
+      )
+      expect(call).not.toHaveBeenCalled()
+      settings = { ...settings, enabledConnectorIds: [id] }
+      await expect(service.call(id, tool.id, tool.exampleArgs!, internal)).resolves.toEqual({
+        source: 'Orphadata'
+      })
+      settings = { ...settings, disabledConnectorIds: [id] }
+      await expect(service.call(id, tool.id, tool.exampleArgs!, internal)).rejects.toThrow(
+        /disabled/
+      )
+      expect(call).toHaveBeenCalledTimes(1)
+    }
+  )
+
   it('dispatches only the injected descriptor set with the usual argument gate', async () => {
     const run = vi.fn(async () => ({ value: 42 }))
     const registry = createConnectorRegistry([
@@ -1869,7 +1932,7 @@ describe('ConnectorService', () => {
       expect(call).not.toHaveBeenCalled()
     })
 
-    it('records structured authentication failures for a host-managed OAuth connector', async () => {
+    it('does not invalidate host OAuth for a business-tool login failure', async () => {
       const call = vi.fn().mockRejectedValue(new McpToolCallError('Not logged in. Sign in again.'))
       const onCustomServerAvailabilityChanged = vi.fn()
       const svc = new ConnectorService({
@@ -1896,13 +1959,16 @@ describe('ConnectorService', () => {
       })
 
       await expect(svc.call('oauth-server', 'lookup', {}, internal)).rejects.toThrow(
-        'connector_unauthenticated'
+        'connector_tool_error'
       )
       await expect(svc.call('oauth-server', 'lookup', {}, internal)).rejects.toThrow(
-        'connector_unauthenticated'
+        'connector_tool_error'
       )
-      expect(call).toHaveBeenCalledOnce()
-      expect(onCustomServerAvailabilityChanged).toHaveBeenCalledWith('oauth-1', 'unauthenticated')
+      expect(call).toHaveBeenCalledTimes(2)
+      expect(onCustomServerAvailabilityChanged).not.toHaveBeenCalledWith(
+        'oauth-1',
+        'unauthenticated'
+      )
     })
 
     it.each([

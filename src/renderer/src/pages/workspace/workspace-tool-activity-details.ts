@@ -2,6 +2,10 @@ import type { ContentBlock, ToolCallContent, ToolKind } from '@agentclientprotoc
 
 import { formatByteSize } from '@/lib/utils'
 import {
+  readAuthorizedDirectories,
+  type AuthorizedDirectorySnapshot
+} from './authorized-directories-presentation'
+import {
   buildNotebookToolSummary,
   isNotebookSummaryTool,
   readNotebookToolResult,
@@ -9,11 +13,12 @@ import {
   type NotebookCodeReview,
   type ToolSummary
 } from './notebook-tool-presentation'
-import type { ToolActivity } from '@/stores/session-store'
+import type { ToolActivity } from '@/stores/session-store-contract'
 import { memoryAgentRememberResultSchema, memoryAgentResultSchema } from '../../../../shared/memory'
 import type { NotebookRunStatus } from '../../../../shared/notebook'
 import {
   getNotebookMemoryToolDisplayName,
+  isAuthorizedDirectoryTool,
   isNotebookManagePackagesToolName,
   matchNotebookMemoryTool,
   resolveNotebookLanguage,
@@ -27,7 +32,9 @@ import {
 } from './workspace-skill-load'
 import {
   buildLiteratureLibraryToolSummary,
+  buildPdfAnnotationToolSummary,
   pdfElementToolAction,
+  pdfAnnotationToolAction,
   buildPdfElementToolSummary,
   buildLiteratureToolSummary,
   getLiteratureLibraryToolAction,
@@ -65,7 +72,11 @@ type ToolLiteratureSection = {
 
 type ToolSummarySection = { kind: 'summary'; summary: ToolSummary; file?: boolean }
 type ToolDetailSection =
-  ToolCodeSection | ToolDiffSection | ToolLiteratureSection | ToolSummarySection
+  | ToolCodeSection
+  | ToolDiffSection
+  | ToolLiteratureSection
+  | ToolSummarySection
+  | { kind: 'authorized-directories'; snapshot: AuthorizedDirectorySnapshot }
 
 type ToolActivityDetails = {
   codeReview?: NotebookCodeReview
@@ -96,6 +107,42 @@ const TOOL_KIND_LABELS: Record<ToolKind, string> = {
   switch_mode: 'Switch Mode',
   other: 'Tool'
 }
+
+const TRANSLATABLE_TOOL_DETAIL_COPY = new Set([
+  ...Object.values(TOOL_KIND_LABELS),
+  'Agent SDK',
+  'Code',
+  'Code risk review',
+  'Command',
+  'Content',
+  'Error',
+  'File',
+  'Input',
+  'Log',
+  'Literature library',
+  'Manage packages',
+  'Memory categories',
+  'Notebook run',
+  'Output',
+  'Packages',
+  'Prompt',
+  'Request',
+  'Result',
+  'Reading',
+  'Save memory',
+  'Search memory',
+  'Shell',
+  'Skill',
+  'Tool output image',
+  'Tool search',
+  'Tools found',
+  'Web Fetch',
+  'Write file'
+])
+
+// Shares the tool row's existing translations with compact group summaries.
+const translateToolDetailCopy = (value: string, t: TranslateClause): string =>
+  TRANSLATABLE_TOOL_DETAIL_COPY.has(value) ? t(value) : value
 
 // Maps common file extensions to Shiki-friendly language ids for diff/read highlighting.
 const EXTENSION_LANGUAGES: Record<string, string> = {
@@ -429,15 +476,18 @@ const buildLiteratureDetails = (activity: ToolActivity): ToolActivityDetails | u
     : getLiteratureLibraryToolAction(activity.providerToolName, activity.title)
   const isReading = isLiteratureReadDocumentTool(activity.providerToolName, activity.title)
   const elementAction = pdfElementToolAction(activity.providerToolName, activity.title)
-  if (!libraryAction && !isReading && !elementAction) return undefined
+  const annotationAction = pdfAnnotationToolAction(activity.providerToolName, activity.title)
+  if (!libraryAction && !isReading && !elementAction && !annotationAction) return undefined
 
   const contentTexts = collectToolTexts(activity)
   const output = [...contentTexts, activity.rawOutput]
-  const summary = elementAction
-    ? buildPdfElementToolSummary(elementAction, output)
-    : libraryAction
-      ? buildLiteratureLibraryToolSummary(libraryAction, activity.rawInput, output)
-      : buildLiteratureToolSummary(activity.rawInput, output)
+  const summary = annotationAction
+    ? buildPdfAnnotationToolSummary(annotationAction, activity.rawInput, output)
+    : elementAction
+      ? buildPdfElementToolSummary(elementAction, output)
+      : libraryAction
+        ? buildLiteratureLibraryToolSummary(libraryAction, activity.rawInput, output)
+        : buildLiteratureToolSummary(activity.rawInput, output)
   // Only replace acquisition output when a pending receipt provides an actionable destination.
   // Keep generic diagnostics for not-found, already-reviewed, failures and unknown outcomes.
   if (isAcquiringPdf && !summary.pdfDownloaded) {
@@ -1124,12 +1174,12 @@ const buildManagePackagesDetails = (
   }
 }
 
-// Detects Claude's tool-discovery (ToolSearch) rows by provider name or synthetic title.
+// Detects structured discovery identities; human-readable Pi titles include the query.
 const isToolSearchActivity = (activity: ToolActivity): boolean => {
   const providerName = trimDetail(activity.providerToolName)?.toLowerCase()
   const title = trimDetail(activity.title)?.toLowerCase()
 
-  return providerName === 'toolsearch' || title === 'toolsearch'
+  return providerName === 'toolsearch' || providerName === 'tool_search' || title === 'toolsearch'
 }
 
 // Reads the "Tools found: A, B, C" summary the tool-search feature emits in its result content.
@@ -1146,16 +1196,27 @@ const extractFoundTools = (activity: ToolActivity): string | undefined => {
 // Summarizes a tool-search step by the tools it discovered instead of a bare "ToolSearch" label.
 const buildToolSearchDetails = (activity: ToolActivity): ToolActivityDetails | undefined => {
   const output = getOutputText(activity)
+  const query = isRecord(activity.rawInput)
+    ? getRecordString(activity.rawInput, 'query')
+    : undefined
 
   // A wrapper row with no result carries nothing useful; let it fall back to a plain chip.
-  if (!output) return undefined
+  if (!output) {
+    return activity.providerToolName === 'tool_search'
+      ? { displayName: 'Tool search', subtitle: query, sections: [] }
+      : undefined
+  }
 
   const foundTools = extractFoundTools(activity)
-  const section = createCodeSection('Tools found', output.code, output.language)
+  const section = createCodeSection(
+    activity.status === 'failed' ? 'Output' : 'Tools found',
+    output.code,
+    output.language
+  )
 
   return {
     displayName: 'Tool search',
-    subtitle: foundTools,
+    subtitle: foundTools ?? query,
     sections: section ? [section] : []
   }
 }
@@ -1265,6 +1326,27 @@ const buildToolActivityDetails = (
       ? { ...details, displayName: 'Skill', subtitle: getLoadedSkillName(activity) }
       : undefined
   }
+  if (isAuthorizedDirectoryTool(activity.providerToolName, activity.title)) {
+    const snapshot =
+      activity.status === 'completed' &&
+      !(isRecord(activity.rawOutput) && activity.rawOutput.isError === true)
+        ? [activity.rawOutput, ...collectToolTexts(activity)]
+            .map((value) => readAuthorizedDirectories(value))
+            .find(Boolean)
+        : undefined
+    return {
+      displayName: t('List authorized directories'),
+      metaLabel: snapshot
+        ? t('{{count}} directories', {
+            count: snapshot.directories.length,
+            defaultValue_one: '{{count}} directory'
+          })
+        : undefined,
+      sections: snapshot
+        ? [{ kind: 'authorized-directories', snapshot }]
+        : (buildGenericDetails(activity)?.sections ?? [])
+    }
+  }
   const literatureDetails = buildLiteratureDetails(activity)
   if (literatureDetails) return literatureDetails
   // Saved files show a metadata summary instead of dumping their (possibly base64) content.
@@ -1327,6 +1409,7 @@ const buildToolActivityDetails = (
 
 export {
   buildToolActivityDetails,
+  translateToolDetailCopy,
   getNotebookRunIdFromActivity,
   getNotebookRunStatusFromActivity,
   getSkillLoadDocument,
@@ -1334,7 +1417,8 @@ export {
   isEditActivity,
   getManagePackagesFallbackText,
   parseManagePackagesResult,
-  isSkillActivity
+  isSkillActivity,
+  isToolSearchActivity
 }
 export type {
   ToolActivityDetails,

@@ -1,12 +1,12 @@
+// @vitest-environment jsdom
+import { createLiteratureTestRenderer } from '../../../../../test/renderer/literature'
 import type { PdfAnnotation } from '../../../../shared/pdf-annotations'
 import * as annotationReveal from '../workspace/annotations/annotation-reveal'
-// @vitest-environment jsdom
 import { act, createRef, Profiler, StrictMode } from 'react'
-import { createRoot, type Root } from 'react-dom/client'
+import { type Root } from 'react-dom/client'
 import { fireEvent, waitFor } from '@testing-library/react'
 import * as Dialog from '@/components/ui/dialog'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
-
 import { LinkSafetyModal } from '@/components/streamdown/LinkSafetyModal'
 import { APP } from '../../../../shared/app-config'
 import { MINIMUM_CLAUDE_CLI_VERSION } from '../../../../shared/claude-runtime'
@@ -26,6 +26,17 @@ import { useStorageInfoStore } from '@/stores/storage-info-store'
 import { createInitialTagState, useTagStore } from '@/stores/tag-store'
 import { SettingsPage, type SettingsPageHandle } from './SettingsPage'
 import { clickRadixMenuItem, openRadixMenu } from './test-utils'
+import {
+  marketplaceCatalog,
+  marketplaceDetail
+} from '../../../../shared/__fixtures__/skill-marketplace'
+
+const { createRoot } = createLiteratureTestRenderer({
+  get api() {
+    return window.api
+  },
+  onRecovered: () => () => {}
+})
 
 vi.mock('../workspace/FilePreviewDialog', () => ({
   FilePreviewDialog: ({
@@ -65,6 +76,7 @@ const originalSettingsActions = (() => {
 // Suspense boundary; lazy-loading itself has separate architecture coverage.
 beforeAll(async () => {
   await Promise.all([
+    import('../workspace/pdf-annotations/PdfAnnotationPreviewDialog'),
     import('./AgentPanel'),
     import('./ArchivedPanel'),
     import('./ComputeAddForm'),
@@ -88,11 +100,6 @@ beforeAll(async () => {
     import('./TokenUsagePanel')
   ])
 })
-
-import {
-  marketplaceCatalog,
-  marketplaceDetail
-} from '../../../../shared/__fixtures__/skill-marketplace'
 
 // Minimal window.api surface the settings store touches when the dialog opens. Attached onto the
 // real jsdom window so DOM globals radix relies on (getComputedStyle, etc.) stay intact.
@@ -466,7 +473,7 @@ const installCustomProviderSnapshot = (): ProviderView => {
     baseUrl: 'https://gateway.example',
     model: 'model-a',
     models: ['model-a'],
-    apiEndpoints: ['anthropic'],
+    apiEndpoints: ['messages'],
     supportsImageInput: false,
     hasKey: true,
     maskedKey: 'sk-…test',
@@ -484,7 +491,7 @@ const installCustomProviderSnapshot = (): ProviderView => {
       {
         id: 'opencode',
         displayName: 'OpenCode',
-        supportedApiTypes: ['anthropic', 'openai'],
+        supportedApiTypes: ['messages', 'chat-completions'],
         supportsSkills: true
       }
     ]
@@ -493,6 +500,29 @@ const installCustomProviderSnapshot = (): ProviderView => {
 }
 
 describe('SettingsPage layout', () => {
+  it('retains the requested recovery model through the settings route', async () => {
+    const provider = installCustomProviderSnapshot()
+    provider.models.push('pinned-model')
+    useSettingsStore.getState().openSettingsToProvider(provider.id, 'pinned-model')
+    await act(async () => root.render(<SettingsPage open onClose={vi.fn()} />))
+    const copy = 'Update the saved credential, then test the connection.'
+    expect(document.body.textContent).toContain(copy)
+    act(() =>
+      useSettingsStore.setState({
+        providers: [{ ...provider, lastValidatedAt: 20, lastValidatedTarget: { model: 'model-a' } }]
+      })
+    )
+    expect(document.body.textContent).toContain(copy)
+    act(() =>
+      useSettingsStore.setState({
+        providers: [
+          { ...provider, lastValidatedAt: 30, lastValidatedTarget: { model: 'pinned-model' } }
+        ]
+      })
+    )
+    expect(document.body.textContent).not.toContain(copy)
+  })
+
   it('retains model tab DOM across model routes and navigation Back', async () => {
     window.api.settings.getClassification = vi.fn().mockResolvedValue({ revision: 0, services: [] })
     window.api.localModels = {
@@ -2194,7 +2224,7 @@ describe('SettingsPage layout', () => {
         {
           id: 'opencode',
           displayName: 'OpenCode',
-          supportedApiTypes: ['anthropic', 'openai'],
+          supportedApiTypes: ['messages', 'chat-completions'],
           supportsSkills: true
         }
       ],
@@ -2226,7 +2256,7 @@ describe('SettingsPage layout', () => {
       baseUrl: 'https://gateway.example',
       model: 'model-a',
       models: ['model-a'],
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       supportsImageInput: false,
       hasKey: true,
       maskedKey: 'sk-…test',
@@ -2244,7 +2274,7 @@ describe('SettingsPage layout', () => {
         {
           id: 'opencode',
           displayName: 'OpenCode',
-          supportedApiTypes: ['anthropic', 'openai'],
+          supportedApiTypes: ['messages', 'chat-completions'],
           supportsSkills: true
         }
       ]
@@ -2777,7 +2807,7 @@ describe('SettingsPage layout', () => {
     await act(async () => navButton('Remote')?.click())
 
     expect(document.body.textContent).toContain('Trusted browsers')
-    expect(document.body.textContent).toContain('Safari · macOS')
+    expect(document.body.textContent).toContain('Safari / macOS')
     expect(document.body.textContent).toContain('Expires')
     expect(document.body.textContent).toContain(
       'Remote access is paused. Provider setup and trusted browsers are kept for reuse.'
@@ -3021,7 +3051,7 @@ describe('SettingsPage layout', () => {
     await act(async () => navButton('Remote')?.click())
 
     expect(remoteAccess.getSnapshot).toHaveBeenCalledTimes(2)
-    expect(document.body.textContent).toContain('Safari · macOS')
+    expect(document.body.textContent).toContain('Safari / macOS')
     expect(document.body.textContent).toContain('654321')
   })
 
@@ -3361,8 +3391,8 @@ describe('SettingsPage layout', () => {
       })
       await act(async () => navButton('Remote')?.click())
 
-      expect(document.body.textContent).toContain('Chrome on iOS · iOS/iPadOS')
-      expect(document.body.textContent).toContain('Google Chrome · Windows')
+      expect(document.body.textContent).toContain('Chrome on iOS / iOS/iPadOS')
+      expect(document.body.textContent).toContain('Google Chrome / Windows')
       expect(document.body.textContent).toContain('123456')
       expect(document.body.textContent).toContain('Allow for up to 12 hours')
       expect(document.body.textContent).not.toContain('Allow once')
@@ -5505,7 +5535,7 @@ describe('SettingsPage Codex framework', () => {
       id: 'codebuddy',
       displayName: 'CodeBuddy',
       supportsSkills: false,
-      supportedApiTypes: ['openai']
+      supportedApiTypes: ['chat-completions']
     }
   ]
 
@@ -5627,7 +5657,7 @@ describe('SettingsPage Codex framework', () => {
     const codexRadio = document.body.querySelector<HTMLButtonElement>('[aria-label="Use Codex"]')
     expect(codexRadio).not.toBeNull()
     // The native and adapter versions are displayed separately; the repo link points at the ACP adapter.
-    expect(document.body.textContent).toContain('Codex CLI 0.157.1 · ACP 1.6.2')
+    expect(document.body.textContent).toContain('Codex CLI 0.157.1, ACP 1.6.2')
     expect(document.body.textContent).toContain('agentclientprotocol/codex-acp')
 
     await act(async () => codexRadio?.click())
@@ -5828,8 +5858,8 @@ describe('SettingsPage Codex framework', () => {
     await openAgentPanel()
 
     // Two ready runtimes land in the Installed group; Codex/CodeBuddy (not ready) in Available.
-    expect(document.body.textContent).toContain('Installed · 2')
-    expect(document.body.textContent).toContain('Available · 2')
+    expect(document.body.textContent).toContain('Installed / 2')
+    expect(document.body.textContent).toContain('Available / 2')
     // Claude is renamed in this panel only.
     expect(document.body.textContent).toContain('Claude Agent')
 
@@ -5881,8 +5911,8 @@ describe('SettingsPage Codex framework', () => {
     })
     await openAgentPanel()
 
-    expect(document.body.textContent).toContain('Installed · 2')
-    expect(document.body.textContent).toContain('Available · 2')
+    expect(document.body.textContent).toContain('Installed / 2')
+    expect(document.body.textContent).toContain('Available / 2')
     expect(document.body.textContent).toContain('CodeBuddy')
     expect(document.body.textContent).toContain('v2.138.0')
     expect(document.body.textContent).toContain(
@@ -6028,8 +6058,8 @@ describe('SettingsPage Codex framework', () => {
     })
     await openAgentPanel()
 
-    expect(document.body.textContent).toContain('Installed · 2')
-    expect(document.body.textContent).toContain('Available · 2')
+    expect(document.body.textContent).toContain('Installed / 2')
+    expect(document.body.textContent).toContain('Available / 2')
     expect(document.body.textContent).toContain('Update required')
     expect(document.body.querySelector('[aria-label="Update Codex"]')).not.toBeNull()
     const frameworkRadios = Array.from(
@@ -6763,8 +6793,8 @@ describe('Provider editor leave protection', () => {
 })
 
 describe('Settings Compute completion navigation', () => {
-  it.each(['left', 'returned', 'closed', 'closed-during-exit'] as const)(
-    'keeps the selected Settings location after an old host creation succeeds (%s)',
+  it.each(['panel', 'back', 'closed', 'closed-during-exit'] as const)(
+    'waits for a save during navigation but relinquishes completion authority after host-driven close (%s)',
     async (location) => {
       const previous = useComputeStore.getState()
       let resolve!: (host: Awaited<ReturnType<typeof previous.createHost>>) => void
@@ -6828,17 +6858,19 @@ describe('Settings Compute completion navigation', () => {
             expect(document.querySelector('#compute-alias')).toBeNull()
           }
         } else {
-          await act(async () => navButton('General')!.click())
-          if (location === 'returned') {
-            await act(async () =>
-              document.querySelector<HTMLButtonElement>('[aria-label="Back"]')!.click()
+          await act(async () => {
+            if (location === 'panel') navButton('General')!.click()
+            else document.querySelector<HTMLButtonElement>('[aria-label="Back"]')!.click()
+          })
+          expect(document.body.textContent).toContain(
+            'Wait for the current save to finish before leaving.'
+          )
+          expect(
+            document.querySelector<HTMLButtonElement>(
+              '[data-testid="skill-discard-confirmation"] button[data-slot="button"]'
             )
-            act(() =>
-              fireEvent.change(document.querySelector('#compute-alias')!, {
-                target: { value: 'new-draft' }
-              })
-            )
-          }
+          ).not.toBeNull()
+          expect(navButton('Compute')?.getAttribute('aria-current')).toBe('page')
         }
         await act(async () =>
           resolve({ providerId: 'ssh:cluster' } as Awaited<ReturnType<typeof previous.createHost>>)
@@ -6847,12 +6879,13 @@ describe('Settings Compute completion navigation', () => {
         expect(probeHost).toHaveBeenCalledExactlyOnceWith('ssh:cluster')
         if (location === 'closed' || location === 'closed-during-exit')
           await act(async () => render(true))
-        if (location === 'left')
-          expect(navButton('General')?.getAttribute('aria-current')).toBe('page')
-        else
-          expect(document.querySelector<HTMLInputElement>('#compute-alias')?.value).toBe(
-            location === 'returned' ? 'new-draft' : ''
-          )
+        if (location === 'closed' || location === 'closed-during-exit') {
+          expect(document.querySelector<HTMLInputElement>('#compute-alias')?.value).toBe('')
+        } else {
+          expect(navButton('Compute')?.getAttribute('aria-current')).toBe('page')
+          expect(document.querySelector('[data-testid="skill-discard-confirmation"]')).toBeNull()
+          expect(document.querySelector('#compute-alias')).toBeNull()
+        }
       } finally {
         useComputeStore.setState({
           createHost: previous.createHost,
@@ -7039,4 +7072,255 @@ it('dismisses a network leave request when the pending save succeeds', async () 
   expect(document.body.textContent).not.toContain('Your network rules have not been saved.')
   expect(onClose).not.toHaveBeenCalled()
   expect(document.body.querySelector('[aria-label="Domain hostname"]')).not.toBeNull()
+})
+
+describe('Connection editor shared leave protection', () => {
+  const click = async (label: string): Promise<void> => {
+    const button = [...document.querySelectorAll<HTMLButtonElement>('button')].find(
+      (item) => item.textContent?.trim() === label
+    )!
+    expect(button, label).toBeDefined()
+    await act(async () => button.click())
+  }
+  it.each(['Connectors', 'Compute'] as const)(
+    'protects %s drafts through panel, breadcrumb, back and close',
+    async (panel) => {
+      window.api.compute.passwordCapability = vi.fn().mockResolvedValue({ available: true })
+      const onClose = vi.fn()
+      await act(async () => root.render(<SettingsPage open onClose={onClose} />))
+      await act(async () => navButton(panel)!.click())
+      if (panel === 'Compute') await click('Add SSH host')
+      else {
+        openRadixMenu(
+          [...document.querySelectorAll<HTMLButtonElement>('button')].find((button) =>
+            button.textContent?.includes('Add connector')
+          )
+        )
+        await act(async () => {
+          clickRadixMenuItem(
+            [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find((item) =>
+              item.textContent?.includes('Local command')
+            )
+          )
+          await Promise.resolve()
+        })
+      }
+      const selector = panel === 'Compute' ? '#compute-alias' : '[aria-label="Display name"]'
+      const field = (): HTMLInputElement => document.querySelector(selector)!
+      act(() => fireEvent.change(field(), { target: { value: 'Draft research connection' } }))
+      const leaveButtons = [
+        navButton('General')!,
+        document.querySelector<HTMLButtonElement>(`[aria-label="Back to ${panel.toLowerCase()}"]`)!,
+        document.querySelector<HTMLButtonElement>('[aria-label="Back"]')!,
+        document.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!
+      ]
+      for (const leave of leaveButtons) {
+        expect(leave).not.toBeNull()
+        await act(async () => leave.click())
+        expect(document.querySelector('[data-testid="skill-discard-confirmation"]')).not.toBeNull()
+        expect(onClose).not.toHaveBeenCalled()
+        await click('Keep editing')
+        expect(field().value).toBe('Draft research connection')
+      }
+      await act(async () => navButton('General')!.click())
+      await click('Discard changes')
+      expect(navButton('General')?.getAttribute('aria-current')).toBe('page')
+      await act(async () =>
+        document.querySelector<HTMLButtonElement>('[aria-label="Back"]')!.click()
+      )
+      expect(field().value).toBe('')
+    }
+  )
+})
+
+describe('Resource editor leave protection', () => {
+  it('protects Memory category drafts through panel navigation', async () => {
+    await act(async () => root.render(<SettingsPage open onClose={vi.fn()} />))
+    await act(async () => navButton('Memory')!.click())
+    const newCategory = await waitFor(() =>
+      [...document.body.querySelectorAll<HTMLButtonElement>('button')].find(
+        (button) => button.textContent?.trim() === 'New category'
+      )
+    )
+    await act(async () => newCategory!.click())
+    const name = document.querySelector<HTMLInputElement>('input[name="memory-category-name"]')!
+    const guidance = document.querySelector<HTMLTextAreaElement>(
+      'textarea[name="memory-category-guidance"]'
+    )!
+    fireEvent.change(name, { target: { value: 'Unsaved category' } })
+    fireEvent.change(guidance, { target: { value: 'Unsaved guidance' } })
+
+    await act(async () => navButton('General')!.click())
+    expect(document.querySelector('[data-testid="skill-discard-confirmation"]')).not.toBeNull()
+    expect(document.body.textContent).toContain('Your changes have not been saved.')
+    expect(name.value).toBe('Unsaved category')
+
+    const keepEditing = [...document.body.querySelectorAll<HTMLButtonElement>('button')].find(
+      (button) => button.textContent?.trim() === 'Keep editing'
+    )!
+    await act(async () => keepEditing.click())
+    expect(document.querySelector('[data-testid="skill-discard-confirmation"]')).toBeNull()
+    expect(name.value).toBe('Unsaved category')
+    expect(guidance.value).toBe('Unsaved guidance')
+
+    await act(async () => navButton('General')!.click())
+    const discard = [...document.body.querySelectorAll<HTMLButtonElement>('button')].find(
+      (button) => button.textContent?.trim() === 'Discard changes'
+    )!
+    await act(async () => discard.click())
+    await waitFor(() => expect(navButton('General')?.getAttribute('aria-current')).toBe('page'))
+    expect(document.querySelector('input[name="memory-category-name"]')).toBeNull()
+  })
+
+  it('resets discarded Memory drafts when Settings closes and reopens', async () => {
+    const onClose = vi.fn()
+    await act(async () => root.render(<SettingsPage open onClose={onClose} />))
+    await act(async () => navButton('Memory')!.click())
+    const newCategory = await waitFor(() =>
+      [...document.body.querySelectorAll<HTMLButtonElement>('button')].find(
+        (button) => button.textContent?.trim() === 'New category'
+      )
+    )
+    await act(async () => newCategory!.click())
+    const name = document.querySelector<HTMLInputElement>('input[name="memory-category-name"]')!
+    const guidance = document.querySelector<HTMLTextAreaElement>(
+      'textarea[name="memory-category-guidance"]'
+    )!
+    fireEvent.change(name, { target: { value: 'Discard on close' } })
+    fireEvent.change(guidance, { target: { value: 'Discard this too' } })
+
+    await act(async () =>
+      document.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click()
+    )
+    const discard = [...document.body.querySelectorAll<HTMLButtonElement>('button')].find(
+      (button) => button.textContent?.trim() === 'Discard changes'
+    )!
+    await act(async () => discard.click())
+    expect(onClose).toHaveBeenCalledOnce()
+
+    await act(async () => root.render(<SettingsPage open={false} onClose={onClose} />))
+    await act(async () => root.render(<SettingsPage open onClose={onClose} />))
+    await waitFor(() =>
+      expect(document.querySelector('input[name="memory-category-name"]')).not.toBeNull()
+    )
+    expect(
+      document.querySelector<HTMLInputElement>('input[name="memory-category-name"]')?.value
+    ).toBe('')
+    expect(
+      document.querySelector<HTMLTextAreaElement>('textarea[name="memory-category-guidance"]')
+        ?.value
+    ).toBe('')
+  })
+
+  it.each(['back', 'forward', 'search', 'close'] as const)(
+    'protects Memory category drafts through %s navigation',
+    async (route) => {
+      const onClose = vi.fn()
+      await act(async () => root.render(<SettingsPage open onClose={onClose} />))
+      await act(async () => navButton('Memory')!.click())
+      const newCategory = await waitFor(() =>
+        [...document.body.querySelectorAll<HTMLButtonElement>('button')].find(
+          (button) => button.textContent?.trim() === 'New category'
+        )
+      )
+      await act(async () => newCategory!.click())
+      if (route === 'forward') {
+        await act(async () => navButton('General')!.click())
+        await act(async () =>
+          document.querySelector<HTMLButtonElement>('[aria-label="Back"]')!.click()
+        )
+      }
+      const name = document.querySelector<HTMLInputElement>('input[name="memory-category-name"]')!
+      fireEvent.change(name, { target: { value: `Draft through ${route}` } })
+
+      await act(async () => {
+        if (route === 'back' || route === 'forward') {
+          document
+            .querySelector<HTMLButtonElement>(
+              `[aria-label="${route === 'back' ? 'Back' : 'Forward'}"]`
+            )!
+            .click()
+        } else if (route === 'close') {
+          document.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click()
+        } else {
+          fireEvent.change(
+            document.querySelector<HTMLInputElement>('[aria-label="Search settings"]')!,
+            {
+              target: { value: 'language' }
+            }
+          )
+          fireEvent.keyDown(
+            document.querySelector<HTMLInputElement>('[aria-label="Search settings"]')!,
+            {
+              key: 'Enter'
+            }
+          )
+        }
+      })
+      expect(document.querySelector('[data-testid="skill-discard-confirmation"]')).not.toBeNull()
+      expect(onClose).not.toHaveBeenCalled()
+      expect(name.value).toBe(`Draft through ${route}`)
+
+      const keepEditing = [...document.body.querySelectorAll<HTMLButtonElement>('button')].find(
+        (button) => button.textContent?.trim() === 'Keep editing'
+      )!
+      await act(async () => keepEditing.click())
+      expect(name.value).toBe(`Draft through ${route}`)
+    }
+  )
+
+  it.each(['resolve', 'reject'] as const)(
+    'settles a leave request made during a Memory save (%s)',
+    async (outcome) => {
+      let finish!: (value: string) => void
+      let fail!: (error: Error) => void
+      const createCategory = vi.fn(
+        () =>
+          new Promise<string>((resolve, reject) => {
+            finish = resolve
+            fail = reject
+          })
+      )
+      useMemoryStore.setState({ createCategory })
+      const onClose = vi.fn()
+      await act(async () => root.render(<SettingsPage open onClose={onClose} />))
+      await act(async () => navButton('Memory')!.click())
+      const newCategory = await waitFor(() =>
+        [...document.body.querySelectorAll<HTMLButtonElement>('button')].find(
+          (button) => button.textContent?.trim() === 'New category'
+        )
+      )
+      await act(async () => newCategory!.click())
+      const name = document.querySelector<HTMLInputElement>('input[name="memory-category-name"]')!
+      fireEvent.change(name, { target: { value: 'Save before leaving' } })
+      fireEvent.change(
+        document.querySelector<HTMLTextAreaElement>('textarea[name="memory-category-guidance"]')!,
+        { target: { value: 'Keep this guidance while saving' } }
+      )
+      await act(async () => name.closest('form')!.requestSubmit())
+      await act(async () =>
+        document.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click()
+      )
+      expect(document.querySelector('[data-testid="skill-discard-confirmation"]')).not.toBeNull()
+      expect(onClose).not.toHaveBeenCalled()
+
+      await act(async () => {
+        if (outcome === 'resolve') finish('category-saved')
+        else fail(new Error('Memory save failed'))
+      })
+      if (outcome === 'resolve') {
+        expect(document.querySelector('[data-testid="skill-discard-confirmation"]')).toBeNull()
+        expect(document.querySelector('input[name="memory-category-name"]')).toBeNull()
+      } else {
+        expect(document.querySelector('[data-testid="skill-discard-confirmation"]')).not.toBeNull()
+        const keepEditing = [...document.body.querySelectorAll<HTMLButtonElement>('button')].find(
+          (button) => button.textContent?.trim() === 'Keep editing'
+        )!
+        await act(async () => keepEditing.click())
+        expect(name.value).toBe('Save before leaving')
+        expect(document.body.textContent).toContain('Memory could not be updated.')
+      }
+      expect(onClose).not.toHaveBeenCalled()
+    }
+  )
 })

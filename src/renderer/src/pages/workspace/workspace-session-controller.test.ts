@@ -211,6 +211,23 @@ afterEach(() => {
 })
 
 describe('workspace session controller', () => {
+  it.each(['deleted', 'disabled'] as const)(
+    'blocks sending after the catalog reflects a %s bound Specialist',
+    (operation) => {
+      const active = session({ specialistId: 'literature' })
+      const profile = specialist('literature', 'LITERATURE_EXPERT')
+      const items = [profile]
+      const hook = renderController({ activeSession: active, specialistItems: items })
+      mounted.push(hook)
+      expect(hook.result.current.view.specialist.sendAvailable).toBe(true)
+      if (operation === 'deleted') items.splice(0)
+      else profile.enabled = false
+      hook.rerender(active)
+      expect(hook.result.current.view.specialist.unavailable).toBe(true)
+      expect(hook.result.current.view.specialist.sendAvailable).toBe(false)
+    }
+  )
+
   it('does not treat a newer saved binding as the applied target of an older handoff', async () => {
     const active = session({ specialistId: 'specialist-c', specialistBindingPending: true })
     const saved = specialist('specialist-c', 'Specialist C')
@@ -1298,6 +1315,8 @@ describe('workspace session controller', () => {
       specialistId: 'specialist-b'
     })
     expect(hook.result.current.view.specialist.barrierInFlight).toBe(true)
+    expect(hook.result.current.view.specialist.reconfigureError).toBeNull()
+    expect(hook.result.current.view.specialist.sendAvailable).toBe(false)
     const visibleSpecialistWhilePending = hook.result.current.view.specialist.historyId
 
     await act(async () => {
@@ -1307,6 +1326,98 @@ describe('workspace session controller', () => {
 
     expect(visibleSpecialistWhilePending).toBe('specialist-b')
     expect(useSessionStore.getState().sessions[0].specialistId).toBe('specialist-b')
+    expect(hook.result.current.view.specialist.barrierInFlight).toBe(false)
+    expect(hook.result.current.view.specialist.reconfigureError).toBeNull()
+  })
+
+  it('does not turn a live pending binding update into a failed Specialist switch', async () => {
+    const active = session({ specialistId: 'specialist-a' })
+    const switchRequest = deferred<{ status: 'applied'; contextReset: boolean }>()
+    const setSessionSpecialist = vi.fn(() => switchRequest.promise)
+    useSessionStore.setState({ sessions: [active], selectedSessionId: active.id })
+    window.api = { specialist: { setSessionSpecialist } } as unknown as Window['api']
+    const hook = renderController({
+      activeSession: active,
+      specialistItems: [specialist('specialist-b', 'Specialist B')]
+    })
+    mounted.push(hook)
+
+    act(() => hook.result.current.actions.selectSpecialist('specialist-b'))
+    // Main persists and broadcasts pending before applying the runtime and resolving the request.
+    act(() => useSessionStore.getState().setSessionSpecialistId(active.id, 'specialist-b', true))
+    hook.rerender(useSessionStore.getState().sessions[0])
+    const duringSwitch = { ...hook.result.current.view.specialist }
+
+    act(() => useSessionStore.getState().setSessionSpecialistId(active.id, 'specialist-b'))
+    hook.rerender(useSessionStore.getState().sessions[0])
+    await act(async () => {
+      switchRequest.resolve({ status: 'applied', contextReset: false })
+      await switchRequest.promise
+    })
+
+    expect(duringSwitch.barrierInFlight).toBe(true)
+    expect(duringSwitch.sendAvailable).toBe(false)
+    expect(duringSwitch.reconfigureError).toBeNull()
+    expect(hook.result.current.view.specialist.reconfigureError).toBeNull()
+    expect(hook.result.current.view.specialist.barrierInFlight).toBe(false)
+  })
+
+  it.each(['runtime-application-failed', 'pending-state-clear-failed'] as const)(
+    'exposes the %s reason only after the switch request finishes',
+    async (reason) => {
+      const active = session({ specialistId: 'specialist-a' })
+      const switchRequest = deferred<{ status: 'pending'; reason: typeof reason }>()
+      const setSessionSpecialist = vi.fn(() => switchRequest.promise)
+      useSessionStore.setState({ sessions: [active], selectedSessionId: active.id })
+      window.api = { specialist: { setSessionSpecialist } } as unknown as Window['api']
+      const hook = renderController({
+        activeSession: active,
+        specialistItems: [specialist('specialist-b', 'Specialist B')]
+      })
+      mounted.push(hook)
+
+      act(() => hook.result.current.actions.selectSpecialist('specialist-b'))
+      act(() => useSessionStore.getState().setSessionSpecialistId(active.id, 'specialist-b', true))
+      hook.rerender(useSessionStore.getState().sessions[0])
+      const duringSwitch = { ...hook.result.current.view.specialist }
+      await act(async () => {
+        switchRequest.resolve({ status: 'pending', reason })
+        await switchRequest.promise
+      })
+
+      expect(duringSwitch.reconfigureError).toBeNull()
+      expect(duringSwitch.barrierInFlight).toBe(true)
+      expect(hook.result.current.view.specialist.barrierInFlight).toBe(false)
+      expect(hook.result.current.view.specialist.reconfigureError).toMatchObject({
+        committed: true,
+        specialistName: 'Specialist B',
+        reason
+      })
+      expect(hook.result.current.view.specialist.sendAvailable).toBe(false)
+    }
+  )
+
+  it('retains a concrete failure reason when retrying a restored pending binding', async () => {
+    const active = session({ specialistId: 'specialist-b', specialistBindingPending: true })
+    const setSessionSpecialist = vi.fn().mockRejectedValue(new Error('connection lost'))
+    useSessionStore.setState({ sessions: [active], selectedSessionId: active.id })
+    window.api = { specialist: { setSessionSpecialist } } as unknown as Window['api']
+    const hook = renderController({
+      activeSession: active,
+      specialistItems: [specialist('specialist-b', 'Specialist B')]
+    })
+    mounted.push(hook)
+
+    await act(async () => {
+      expect(
+        await hook.result.current.lifecycle.prepareSpecialistSend(active.id, 'specialist-b')
+      ).toBe(false)
+    })
+    expect(hook.result.current.view.specialist.barrierInFlight).toBe(false)
+    expect(hook.result.current.view.specialist.reconfigureError).toMatchObject({
+      committed: true,
+      message: 'connection lost'
+    })
   })
 
   it('keeps idle Specialist failures scoped to each Session', async () => {

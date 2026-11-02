@@ -1,8 +1,32 @@
 import { describe, expect, it } from 'vitest'
+import { RequestError } from '@agentclientprotocol/sdk'
 
 import { AcpSessionResumePolicy } from './session-resume-policy'
 
 describe('ACP Session resume policy', () => {
+  it('recovers the pinned Pi adapter missing-session error', () => {
+    expect(
+      new AcpSessionResumePolicy().classifyFailure(
+        RequestError.invalidParams(undefined, 'unknown session: native-missing'),
+        { currentFrameworkId: 'pi', providerSessionIdPersisted: true }
+      )
+    ).toEqual({ disposition: 'adoptable', reason: 'session-not-found-message' })
+  })
+
+  it.each([
+    { framework: 'codex' as const, detail: 'unknown session: native-missing' },
+    { framework: 'pi' as const, detail: 'unknown model: native-missing' },
+    { framework: 'pi' as const, detail: 'provider returned unknown session: native-missing' },
+    { framework: 'pi' as const, detail: 'unknown session: native-missing; authentication failed' }
+  ])('preserves unrelated invalid-params errors: $detail ($framework)', ({ framework, detail }) => {
+    expect(
+      new AcpSessionResumePolicy().classifyFailure(RequestError.invalidParams(undefined, detail), {
+        currentFrameworkId: framework,
+        providerSessionIdPersisted: true
+      })
+    ).toMatchObject({ disposition: 'authoritative' })
+  })
+
   it('resumes a compatible provider Session without replacing the stable App Session identity', () => {
     const policy = new AcpSessionResumePolicy()
 
@@ -458,8 +482,27 @@ describe('ACP Session resume policy', () => {
       )
     ).toEqual({
       disposition: 'adoptable',
-      reason: 'legacy-unresumable-details'
+      reason: 'codex-rollout-not-found'
     })
+  })
+
+  it.each([
+    'Provider error: no rollout found for thread id 019fb8c8-6c66-7f22-9653-17b5b287dbbb',
+    'no rollout found for thread id arbitrary-private-text',
+    'no rollout found for thread id 019fb8c8-6c66-7f22-9653-17b5b287dbbb; credential=private',
+    'Failed to resume session'
+  ])('does not allow Specialist reset for a non-matching native diagnostic: %s', (details) => {
+    const policy = new AcpSessionResumePolicy()
+    expect(
+      policy.classifyFailure(
+        { code: -32603, message: 'Internal error', data: { details } },
+        {
+          currentFrameworkId: 'codex',
+          currentModelRoute: 'codex-bridge',
+          providerSessionIdPersisted: true
+        }
+      ).reason
+    ).not.toBe('codex-rollout-not-found')
   })
 
   it('keeps a provider-wrapped missing-rollout diagnostic authoritative in Codex context', () => {

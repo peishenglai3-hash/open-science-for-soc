@@ -1,3 +1,8 @@
+import {
+  listPdfAnnotationsInput,
+  locatePdfAnnotationInput,
+  createPdfAnnotationInput
+} from '../pdf-annotations/agent-tools'
 import { z } from 'zod'
 
 import {
@@ -32,11 +37,11 @@ import {
   SKILL_IMPORT_MCP_SERVER_NAME
 } from '../../shared/skill-import'
 import { requestSkillImportToolSchema } from '../skills/mcp-server'
-import type { ResponsesBridgeNamespacedTool } from './responses-protocol-types'
+import type { ResponsesNamespacedTool } from '@aipoch/providers/protocol'
 import { ARTIFACT_MCP_SERVER_NAME, writeArtifactFileToolSchema } from '../artifacts/mcp-server'
 
-const jsonSchema = (schema: z.ZodType): ResponsesBridgeNamespacedTool['parameters'] =>
-  z.toJSONSchema(schema, { target: 'draft-7' }) as ResponsesBridgeNamespacedTool['parameters']
+const jsonSchema = (schema: z.ZodType): ResponsesNamespacedTool['parameters'] =>
+  z.toJSONSchema(schema, { target: 'draft-7' }) as ResponsesNamespacedTool['parameters']
 
 export const namespaceFor = (serverName: string): string =>
   `mcp__${serverName.replace(/[^a-zA-Z0-9_]/g, '_')}`
@@ -46,14 +51,14 @@ const tool = (
   name: string,
   description: string,
   schema: z.ZodType
-): ResponsesBridgeNamespacedTool => ({
+): ResponsesNamespacedTool => ({
   namespace: namespaceFor(server),
   name,
   description,
   parameters: jsonSchema(schema)
 })
 
-const SKILL_IMPORT_TOOLS: ResponsesBridgeNamespacedTool[] = [
+const SKILL_IMPORT_TOOLS: ResponsesNamespacedTool[] = [
   tool(
     SKILL_IMPORT_MCP_SERVER_NAME,
     REQUEST_SKILL_IMPORT_TOOL_NAME,
@@ -72,7 +77,7 @@ const candidate = z.object({
   source: z.object({}).passthrough()
 })
 
-const LIBRARY_CORE_TOOLS: ResponsesBridgeNamespacedTool[] = [
+const LIBRARY_CORE_TOOLS: ResponsesNamespacedTool[] = [
   tool(
     LITERATURE_LIBRARY_MCP_SERVER_NAME,
     LITERATURE_LIBRARY_SEARCH_TOOL_NAME,
@@ -158,10 +163,10 @@ const LIBRARY_CORE_TOOLS: ResponsesBridgeNamespacedTool[] = [
 ]
 
 const LIBRARY_OPTIONAL_TOOLS: Readonly<{
-  formatReferences: ResponsesBridgeNamespacedTool
-  formatCitationDocument: ResponsesBridgeNamespacedTool
-  prepareLatexBundle: ResponsesBridgeNamespacedTool
-  acquirePdf: ResponsesBridgeNamespacedTool
+  formatReferences: ResponsesNamespacedTool
+  formatCitationDocument: ResponsesNamespacedTool
+  prepareLatexBundle: ResponsesNamespacedTool
+  acquirePdf: ResponsesNamespacedTool
 }> = {
   formatReferences: LIBRARY_CORE_TOOLS[3]!,
   formatCitationDocument: LIBRARY_CORE_TOOLS[4]!,
@@ -176,7 +181,7 @@ const libraryTools = (
     prepareLatexBundle?: boolean
     acquirePdf?: boolean
   } = {}
-): ResponsesBridgeNamespacedTool[] => [
+): ResponsesNamespacedTool[] => [
   ...LIBRARY_CORE_TOOLS.slice(0, 3),
   ...(options.formatReferences === false ? [] : [LIBRARY_OPTIONAL_TOOLS.formatReferences]),
   ...(options.formatCitationDocument === false
@@ -187,7 +192,7 @@ const libraryTools = (
   ...(options.acquirePdf === false ? [] : [LIBRARY_OPTIONAL_TOOLS.acquirePdf])
 ]
 
-const LITERATURE_CORE_TOOLS: ResponsesBridgeNamespacedTool[] = [
+const LITERATURE_CORE_TOOLS: ResponsesNamespacedTool[] = [
   tool(
     LITERATURE_MCP_SERVER_NAME,
     LITERATURE_READ_DOCUMENT_TOOL_NAME,
@@ -213,12 +218,36 @@ const LITERATURE_CORE_TOOLS: ResponsesBridgeNamespacedTool[] = [
   )
 ]
 
-const literatureTools = (options: { elements?: boolean } = {}): ResponsesBridgeNamespacedTool[] => [
+const literatureTools = (
+  options: { elements?: boolean; annotations?: boolean } = {}
+): ResponsesNamespacedTool[] => [
   LITERATURE_CORE_TOOLS[0]!,
-  ...(options.elements === false ? [] : LITERATURE_CORE_TOOLS.slice(1))
+  ...(options.elements === false ? [] : LITERATURE_CORE_TOOLS.slice(1)),
+  ...(options.annotations
+    ? [
+        tool(
+          LITERATURE_MCP_SERVER_NAME,
+          'list_pdf_annotations',
+          'Read bounded Notes & Annotations for a PDF linked to this Reading message; follow nextCursor.',
+          listPdfAnnotationsInput
+        ),
+        tool(
+          LITERATURE_MCP_SERVER_NAME,
+          'locate_pdf_annotation_target',
+          'Resolve a target before writing: target.kind document-note, page-note, text (physical pageNumber, exact quote, optional prefix/suffix), or element (elementRef from list_pdf_elements). Read evidence first. Text matches are alternatives; element targets are separate regions. Never guess an ambiguous match. References are current-message-only and expire. No OCR.',
+          locatePdfAnnotationInput
+        ),
+        tool(
+          LITERATURE_MCP_SERVER_NAME,
+          'create_pdf_annotation',
+          'Create a user-requested persistent PDF note/highlight/area from a located targetRef. Use a distinct requestId per mark and reuse it with identical content on retries. Notes/marks share across Literature and Workspace. Committed writes survive cancellation; multiple marks are not atomic and have no batch undo. Use list_pdf_annotations if a reply is lost. Does not edit/delete existing marks.',
+          createPdfAnnotationInput
+        )
+      ]
+    : [])
 ]
 
-const ARTIFACT_TOOLS: ResponsesBridgeNamespacedTool[] = [
+const ARTIFACT_TOOLS: ResponsesNamespacedTool[] = [
   tool(
     ARTIFACT_MCP_SERVER_NAME,
     'write_artifact_file',
@@ -227,7 +256,7 @@ const ARTIFACT_TOOLS: ResponsesBridgeNamespacedTool[] = [
   )
 ]
 
-const notebookTools = (options: NotebookToolEnvironmentOptions): ResponsesBridgeNamespacedTool[] =>
+const notebookTools = (options: NotebookToolEnvironmentOptions): ResponsesNamespacedTool[] =>
   notebookRpcToolsForEnvironment(options).map((definition) => ({
     namespace: namespaceFor(NOTEBOOK_MCP_SERVER_NAME),
     name: definition.name,
@@ -249,9 +278,9 @@ export const createCodexBridgeMcpTools = (options: {
         prepareLatexBundle?: boolean
         acquirePdf?: boolean
       }
-  literature?: boolean | { elements?: boolean }
+  literature?: boolean | { elements?: boolean; annotations?: boolean }
   artifacts?: boolean
-}): ResponsesBridgeNamespacedTool[] => {
+}): ResponsesNamespacedTool[] => {
   const tools = [
     ...(options.artifacts ? ARTIFACT_TOOLS : []),
     ...(options.notebook ? notebookTools(options.notebook) : []),
@@ -266,11 +295,11 @@ export const createCodexBridgeMcpTools = (options: {
   return tools
 }
 
-export const codexBridgeStaticMcpTools = (): ResponsesBridgeNamespacedTool[] =>
+export const codexBridgeStaticMcpTools = (): ResponsesNamespacedTool[] =>
   createCodexBridgeMcpTools({
     notebook: { memoryTools: false, wslSetupTools: false },
     library: true,
-    literature: true,
+    literature: { annotations: true },
     artifacts: true
   })
 

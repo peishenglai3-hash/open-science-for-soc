@@ -23,13 +23,14 @@ describe('renderer contract catalog', () => {
     })
     expect(WEB_INVOKE_CHANNELS['remoteAccess.revokeBrowsers']).toBe('remote-access:revoke-browsers')
   })
-  it('registers all four local model methods across the intended surfaces', () => {
+  it('registers all local model methods across the intended surfaces', () => {
     const group = RENDERER_CONTRACT_GROUPS.find(({ capability }) => capability === 'local-models')
     expect(group?.contracts.map(({ publicPath }) => publicPath).sort()).toEqual([
       'localModels.cancel',
       'localModels.getSnapshot',
       'localModels.install',
-      'localModels.remove'
+      'localModels.remove',
+      'localModels.setOcrLanguages'
     ])
     for (const contract of group!.contracts) {
       expect(contract.surfaceInstallation).toMatchObject({
@@ -56,6 +57,27 @@ describe('renderer contract catalog', () => {
       })
     }
   })
+  it('exposes managed file inspection to remote Web without exposing edits', () => {
+    const contracts = new Map(
+      RENDERER_CONTRACT_CATALOG.map((contract) => [contract.publicPath, contract])
+    )
+
+    expect(contracts.get('managedFileVersions.inspect')).toMatchObject({
+      surfaceInstallation: { electron: 'preload', localWeb: 'web-rpc', remoteWeb: 'web-rpc' }
+    })
+    for (const publicPath of [
+      'managedFileVersions.saveTextEdit',
+      'managedFileVersions.diffText',
+      'managedFileVersions.cancelDiff'
+    ]) {
+      expect(contracts.get(publicPath)?.surfaceInstallation.remoteWeb).not.toBe('web-rpc')
+    }
+    expect(WEB_INVOKE_CHANNELS['managedFileVersions.inspect']).toBe('managed-file-versions:inspect')
+    expect(Object.values(WEB_INVOKE_CHANNELS)).not.toContain('managed-file-versions:save-text-edit')
+    expect(Object.values(WEB_INVOKE_CHANNELS)).not.toContain('managed-file-versions:diff-text')
+    expect(Object.values(WEB_INVOKE_CHANNELS)).not.toContain('managed-file-versions:cancel-diff')
+  })
+
   it('does not expose the retired Runtime Selection API', () => {
     expect(
       RENDERER_CONTRACT_CATALOG.filter(({ publicPath }) =>
@@ -237,7 +259,13 @@ describe('renderer contract catalog', () => {
           surfaceInstallation.localWeb === 'web-rpc' &&
           parameterCodec.electron !== parameterCodec.web
       )
-    ).toEqual(['acp.connect', 'acp.createSession', 'notebookEnv.cancel', 'sessions.saveSession'])
+    ).toEqual([
+      'acp.connect',
+      'acp.createSession',
+      'notebookEnv.cancel',
+      'sessions.importPackage',
+      'sessions.saveSession'
+    ])
 
     const explicitEquivalentTransforms = paths(
       ({ parameterCodec }) =>
@@ -493,6 +521,7 @@ describe('renderer contract catalog', () => {
       'literature.addPdf',
       'literature.cancelPdfImport',
       'literature.citationStyles',
+      'literature.collect',
       'literature.completeMetadata',
       'literature.exportRecord',
       'literature.formatDocument',
@@ -505,8 +534,13 @@ describe('renderer contract catalog', () => {
       'literature.jobs',
       'literature.journals',
       'literature.lookupMetadata',
+      'literature.publicationCheck',
+      'literature.related',
       'literature.search',
       'literature.sources',
+      'literature.supplementAttachment',
+      'literature.supplementAttachmentProgress',
+      'literature.supplements',
       'literature.transact',
       'memory.clearAll',
       'memory.createCategory',
@@ -545,6 +579,7 @@ describe('renderer contract catalog', () => {
       'sessionReplay.saveView',
       'sessionReplay.unlinkSession',
       'sessions.cancelDiagnostics',
+      'sessions.deleteRecoveryFile',
       'sessions.deleteSession',
       'sessions.editDetails',
       'sessions.exportDiagnostics',
@@ -559,6 +594,8 @@ describe('renderer contract catalog', () => {
       'sessions.setDelegationPolicy',
       'sessions.unlinkPdfContext',
       'sessions.updateArchive',
+      'sessions.useCaseCatalog',
+      'sessions.useCaseIntroduction',
       'settings.getSettings',
       'tags.create',
       'tags.delete',
@@ -583,6 +620,7 @@ describe('renderer contract catalog', () => {
       'literature:add-pdf',
       'literature:cancel-pdf-import',
       'literature:citation-styles',
+      'literature:collect',
       'literature:complete-metadata',
       'literature:export-record',
       'literature:format-document',
@@ -595,8 +633,13 @@ describe('renderer contract catalog', () => {
       'literature:jobs',
       'literature:journals',
       'literature:lookup-metadata',
+      'literature:publication-check',
+      'literature:related',
       'literature:search',
       'literature:sources',
+      'literature:supplement-attachment',
+      'literature:supplement-attachment-progress',
+      'literature:supplements',
       'literature:transact',
       'memory:clear-all',
       'memory:create-category',
@@ -635,6 +678,7 @@ describe('renderer contract catalog', () => {
       'session-replay:save-view',
       'session-replay:unlink-session',
       'sessions:cancel-diagnostics',
+      'sessions:delete-recovery-file',
       'sessions:delete-session',
       'sessions:edit-details',
       'sessions:export-diagnostics',
@@ -649,6 +693,8 @@ describe('renderer contract catalog', () => {
       'sessions:set-delegation-policy',
       'sessions:unlink-pdf-context',
       'sessions:update-archive',
+      'sessions:use-case-catalog',
+      'sessions:use-case-introduction',
       'settings:get-settings',
       'tags:create',
       'tags:delete',

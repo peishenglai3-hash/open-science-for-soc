@@ -1,6 +1,12 @@
 /* eslint-disable @typescript-eslint/explicit-function-return-type */
 import {
   backendDependencyIncludes,
+  createDesktopDependencyFilter,
+  desktopBackendDependencies,
+  desktopBackendPeerDependencies,
+  desktopBundledDependencies,
+  generatedPrismaIncludes,
+  inlineDesktopDependencyMaps,
   isBackendRuntimeDependency,
   isElectronPackage,
   prismaEngineFilenames
@@ -8,17 +14,36 @@ import {
 import { cp, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve, relative, sep } from 'node:path'
+import { parseArgs } from 'node:util'
+import { stageDesktopPdfLib } from './desktop-pdf-lib.mjs'
+import {
+  assertPrivateDependencyChain,
+  stageDesktopDependencyChain
+} from './desktop-dependency-chains.mjs'
 
 const root = resolve(import.meta.dirname, '..')
-const stage = join(root, 'out/standalone')
+const { values } = parseArgs({ options: { desktop: { type: 'boolean', default: false } } })
+const stage = join(root, values.desktop ? 'out/desktop-backend' : 'out/standalone')
+const backend = join(root, values.desktop ? 'out/desktop-backend-build' : 'out/backend')
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
 const cliManifest = JSON.parse(
   await readFile(join(root, 'packages/open-science/package.json'), 'utf8')
 )
 const forbidden = isElectronPackage
+const metadata = JSON.parse(await readFile(join(backend, 'dependencies.json'), 'utf8'))
+const bundledDependencies = desktopBundledDependencies(metadata)
+const dependencyRoots = values.desktop
+  ? desktopBackendDependencies(manifest.dependencies, metadata)
+  : Object.keys(manifest.dependencies)
 await rm(stage, { recursive: true, force: true })
 await mkdir(stage, { recursive: true })
-await cp(join(root, 'out/backend'), join(stage, 'out/backend'), { recursive: true })
+await cp(backend, join(stage, 'out/backend'), {
+  recursive: true,
+  // Dependency analysis is consumed above; it is not a runtime or diagnostic source map.
+  filter: (path) => !values.desktop || path !== join(backend, 'dependencies.json')
+})
+// Pi dependencies are downloaded only after an explicit runtime install.
+await cp(join(root, 'out/pi-bootstrap'), join(stage, 'out/pi-bootstrap'), { recursive: true })
 await cp(join(root, 'out/web'), join(stage, 'out/web'), { recursive: true })
 await cp(join(root, 'resources'), join(stage, 'resources'), {
   recursive: true,
@@ -57,6 +82,7 @@ await cp(join(root, 'packages/open-science/README.md'), join(stage, 'README.md')
 await cp(join(root, 'packages/open-science/CLI.md'), join(stage, 'CLI.md'))
 
 const installed = new Map()
+const privateDependencies = new Set()
 async function packageDirectory(name, from) {
   let directory = from
   while (true) {
@@ -73,7 +99,12 @@ async function packageDirectory(name, from) {
   }
 }
 async function copyDependency(name, from, destinationParent = stage) {
+  assertPrivateDependencyChain(name, privateDependencies)
   if (forbidden(name)) throw new Error(`Standalone dependency closure includes ${name}`)
+  if (bundledDependencies.has(name))
+    throw new Error(
+      `External dependency at ${from} requires bundled ${name}; keep it external instead.`
+    )
   const source = await packageDirectory(name, from)
   const pkg = JSON.parse(await readFile(join(source, 'package.json'), 'utf8'))
   let destination = join(destinationParent, 'node_modules', name)
@@ -82,11 +113,31 @@ async function copyDependency(name, from, destinationParent = stage) {
   if (!atRoot) destination = join(stage, 'node_modules', name)
   if (installed.get(destination) === pkg.version) return
   installed.set(destination, pkg.version)
-  await cp(source, destination, {
-    recursive: true,
-    dereference: true,
-    filter: (path) => backendDependencyIncludes(pkg, relative(source, path))
-  })
+  const desktopIncludes = values.desktop ? createDesktopDependencyFilter(pkg) : undefined
+  const chain = values.desktop
+    ? await stageDesktopDependencyChain(pkg, source, destination)
+    : undefined
+  if (chain) {
+    for (const dependency of chain) privateDependencies.add(dependency)
+    for (const path of installed.keys())
+      assertPrivateDependencyChain(
+        path.split(`${sep}node_modules${sep}`).at(-1).split(sep).join('/'),
+        privateDependencies
+      )
+  }
+  if (!chain && !(values.desktop && (await stageDesktopPdfLib(pkg, source, destination))))
+    await cp(source, destination, {
+      recursive: true,
+      dereference: true,
+      filter: async (path) => {
+        const file = relative(source, path)
+        return (
+          backendDependencyIncludes(pkg, file) &&
+          (!desktopIncludes || desktopIncludes(file, (await stat(path)).isDirectory()))
+        )
+      }
+    })
+  if (values.desktop) await inlineDesktopDependencyMaps(pkg, destination)
   // These are prebuilt target artifacts. npm must not reinterpret them as a source installation.
   if (name.startsWith('@aipoch/') || name === '@prisma/client') {
     delete pkg.scripts
@@ -94,6 +145,7 @@ async function copyDependency(name, from, destinationParent = stage) {
     await writeFile(join(destination, 'package.json'), JSON.stringify(pkg, null, 2) + '\n')
   }
   for (const dependency of Object.keys({ ...pkg.dependencies, ...pkg.optionalDependencies })) {
+    if (chain?.has(dependency)) continue
     if (!isBackendRuntimeDependency(dependency, name)) continue
     try {
       await copyDependency(dependency, source, destination)
@@ -105,7 +157,10 @@ async function copyDependency(name, from, destinationParent = stage) {
         throw error
     }
   }
-  for (const dependency of Object.keys(pkg.peerDependencies ?? {})) {
+  const peerDependencies = values.desktop
+    ? desktopBackendPeerDependencies(pkg)
+    : Object.keys(pkg.peerDependencies ?? {})
+  for (const dependency of peerDependencies) {
     if (!isBackendRuntimeDependency(dependency, name)) continue
     try {
       await copyDependency(dependency, source, destination)
@@ -119,7 +174,7 @@ async function copyDependency(name, from, destinationParent = stage) {
   }
 }
 const dependencies = {}
-for (const name of Object.keys(manifest.dependencies)) {
+for (const name of dependencyRoots) {
   if (forbidden(name) || name === '@aipoch/notebook-network-sandbox') continue
   await copyDependency(name, root)
   dependencies[name] = installed.get(join(stage, 'node_modules', name))
@@ -147,7 +202,7 @@ await cp(join(root, 'node_modules/.prisma/client'), join(stage, 'resources/prism
   dereference: true,
   filter: (path) => {
     const file = relative(join(root, 'node_modules/.prisma/client'), path)
-    return !file.includes('query_engine-') || prismaEngines.includes(file)
+    return generatedPrismaIncludes(file, { desktop: values.desktop })
   }
 })
 for (const entry of ['index.js', 'default.js']) {
@@ -174,9 +229,6 @@ const assertNoBuildIntermediates = async (directory) => {
 }
 await assertNoBuildIntermediates(join(stage, 'node_modules'))
 const nativeRequire = createRequire(join(stage, 'package.json'))
-// GPU providers are pruned only on Linux x64; its native binding must still load.
-// Do not add a gate on other targets: ONNX 1.24.3 ships no Darwin x64 binding.
-if (process.platform === 'linux' && process.arch === 'x64') nativeRequire('onnxruntime-node')
 for (const name of ['@aipoch/process-tree-native', '@aipoch/safe-file-publisher-native'])
   nativeRequire(name)
 for (const path of Object.values(nativeRequire('@aipoch/credential-identity-probe-native')))
@@ -200,5 +252,5 @@ await writeFile(
   ) + '\n'
 )
 console.log(
-  `Staged ${process.platform}/${process.arch} standalone artifact at ${stage}; ${installed.size} dependency placements, no Electron.`
+  `Staged ${process.platform}/${process.arch} ${values.desktop ? 'desktop' : 'standalone'} artifact at ${stage}; ${installed.size} dependency placements, no Electron.`
 )

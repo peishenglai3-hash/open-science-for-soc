@@ -5,6 +5,7 @@ import {
   CodexMono,
   NvidiaColor,
   OpenCodeMono,
+  PiColor,
   TencentCloudColor
 } from './provider-brand-icons'
 
@@ -29,7 +30,7 @@ import xiaomimimoLogo from '@/assets/provider-icons/xiaomimimo.svg'
 import sensenovaLogo from '@/assets/provider-icons/sensenova.svg'
 import typesafeLogo from '@/assets/provider-icons/typesafe.svg'
 import volcengineLogo from '@/assets/provider-icons/volcengine.svg'
-import type { OfficialVendorId } from '../../../../shared/provider-registry'
+import type { OfficialVendorId } from '@aipoch/providers'
 import type { AgentFrameworkId } from '../../../../shared/settings'
 
 // The same framework marks are used by Settings cards and completed-message metadata.
@@ -49,6 +50,7 @@ export const AgentFrameworkIcon = ({
   if (frameworkId === 'codebuddy') {
     return <img src={codebuddyLogo} alt="" width={size} height={size} className={className} />
   }
+  if (frameworkId === 'pi') return <PiColor size={size} className={className} />
   return <CodexMono size={size} className={cn('text-foreground', className)} />
 }
 

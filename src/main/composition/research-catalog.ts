@@ -4,6 +4,9 @@ import { LiteratureCitationStyleLibrary } from '@aipoch/literature-citations/sty
 import {
   LiteratureBatchJobs,
   LiteratureFullTextFinder,
+  LiteratureRelatedFinder,
+  LiteratureSupplementFinder,
+  LiteraturePublicationChecker,
   LiteratureMetadataEnricher,
   LiteratureReferenceResolver
 } from '@aipoch/literature-discovery'
@@ -15,11 +18,13 @@ import type { ApplicationEvents } from '../application-events'
 import { type ApplicationModuleBuilder } from '../application-runtime'
 import { AgentPdfAcquisition } from '../literature/agent-pdf-acquisition'
 import { LiteratureCatalog } from '../literature/catalog'
+import { LiteratureCollector } from '../literature/collector'
 import { LiteratureCitationDocument } from '../literature/citation-document'
 import { discoveryJobOptions } from '../literature/discovery-adapters'
 import { LiteratureDocumentReader } from '../literature/document-reader'
 import { JournalAttributes } from '../literature/journal-attributes'
 import { LiteraturePdfImporter } from '../literature/pdf-importer'
+import { LiteratureSupplementAttachments } from '../literature/supplement-attachments'
 import { createLiteratureScreening } from '../literature/screening-adapter'
 import { MemoryRepository } from '../memory/repository'
 import { MemoryService } from '../memory/service'
@@ -74,13 +79,17 @@ export async function composeResearchCatalog({
   memoryService: MemoryService
   literatureCatalog: LiteratureCatalog
   journalAttributes: JournalAttributes
-  literatureCitationStyles: LiteratureCitationStyleLibrary
   literatureCitationFormatter: LiteratureCitationFormatter
   literatureCitationDocument: LiteratureCitationDocument
   literatureReferenceResolver: LiteratureReferenceResolver
   literatureMetadataEnricher: LiteratureMetadataEnricher<LiteratureItemView>
+  literatureSupplementAttachments: LiteratureSupplementAttachments
+  literatureRelatedFinder: LiteratureRelatedFinder
+  literatureSupplementFinder: LiteratureSupplementFinder
+  literaturePublicationChecker: LiteraturePublicationChecker
   literatureFullTextFinder: LiteratureFullTextFinder<LiteratureItemView>
   literaturePdfImporter: LiteraturePdfImporter
+  literatureCollector: LiteratureCollector
   literaturePdfAcquisition: AgentPdfAcquisition
   literatureBatchJobs: LiteratureBatchJobs
   removeResourceTagsOrThrow: (
@@ -166,7 +175,9 @@ export async function composeResearchCatalog({
     maxBytes,
     onProgress,
     _resolveProxy,
-    signal
+    signal,
+    _tunnel,
+    options
   ) =>
     downloadFullText(
       url,
@@ -177,8 +188,30 @@ export async function composeResearchCatalog({
         return environment.HTTPS_PROXY ?? environment.ALL_PROXY
       },
       signal,
-      (proxy, address, port, signal) => tunnelThroughProxy(proxy, address, port, undefined, signal)
+      (proxy, address, port, signal) => tunnelThroughProxy(proxy, address, port, undefined, signal),
+      options
     )
+  const literatureRelatedFinder = new LiteratureRelatedFinder({
+    catalog: literatureCatalog,
+    fetch: netFetchStandard,
+    apiKey: async () =>
+      tryDecryptKey((await settingsService.getConnectors())?.semanticScholarApiKeyRef)
+  })
+  const literaturePublicationChecker = new LiteraturePublicationChecker({
+    catalog: literatureCatalog,
+    fetch: netFetchStandard
+  })
+  const literatureSupplementFinder = new LiteratureSupplementFinder({
+    catalog: literatureCatalog,
+    fetch: netFetchStandard
+  })
+  const literatureSupplementAttachments = new LiteratureSupplementAttachments({
+    finder: literatureSupplementFinder,
+    catalog: literatureCatalog,
+    content: contentRepository,
+    download: downloadLiteraturePdf,
+    pageCount: inspectPdfPageCount
+  })
   const literatureFullTextFinder = new LiteratureFullTextFinder({
     fetch: netFetchStandard,
     pageCount: inspectPdfPageCount,
@@ -197,6 +230,10 @@ export async function composeResearchCatalog({
     workspace: { annotations: pdfAnnotationRepository, sources: pdfAnnotationService },
     onNativeImportProgress: (progress) =>
       applicationEvents.publish('pdf-annotations:import-progress', progress)
+  })
+  const literatureCollector = new LiteratureCollector({
+    catalog: literatureCatalog,
+    content: contentRepository
   })
   const literaturePdfAcquisition = new AgentPdfAcquisition({
     catalog: literatureCatalog,
@@ -236,13 +273,17 @@ export async function composeResearchCatalog({
     memoryService,
     journalAttributes,
     literatureCatalog,
-    literatureCitationStyles,
     literatureCitationFormatter,
     literatureCitationDocument,
     literatureReferenceResolver,
     literatureMetadataEnricher,
     literatureFullTextFinder,
+    literatureRelatedFinder,
+    literatureSupplementFinder,
+    literaturePublicationChecker,
+    literatureSupplementAttachments,
     literaturePdfImporter,
+    literatureCollector,
     literaturePdfAcquisition,
     literatureBatchJobs,
     removeResourceTagsOrThrow,

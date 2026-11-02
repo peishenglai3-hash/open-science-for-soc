@@ -21,6 +21,14 @@ export type ShutdownOutcome = {
   legacyShellRecovery?: LegacyShellRecovery
 }
 
+/** The final leave widened App-only consent; keep the connection and ask about current impact. */
+export class QuitScopeChangedError extends Error {
+  constructor() {
+    super('The App quit now requires stopping the whole service.')
+    this.name = 'QuitScopeChangedError'
+  }
+}
+
 export class BackendShutdownOutcomeError extends Error {
   readonly name = 'BackendShutdownOutcomeError'
 
@@ -205,11 +213,12 @@ export class BackendShutdownCoordinator {
   constructor(private readonly deps: BackendShutdownDeps) {}
 
   // Keep the backend transport and reusable owners alive until pending cleanup (including Windows
-  // ACL restoration) finishes. A refused quit can then flush state and retry through the same backend.
+  // ACL restoration) finishes. This is the full cleanup gate, so use its budget rather than the short
+  // terminal-quit budget. A refused quit can flush state and retry through the same backend.
   async runForQuitPreparation(): Promise<
     Extract<ShutdownStepOutcome, 'completed' | 'timeout' | 'failed'>
   > {
-    const outcome = await this.runForUpdateGate(QUIT_SHUTDOWN_BUDGET_MS, {
+    const outcome = await this.runForUpdateGate(UPDATE_SHUTDOWN_BUDGET_MS, {
       holdSideChatAdmission: true
     })
     if (!outcome.completed) return 'timeout'

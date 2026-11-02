@@ -1,5 +1,14 @@
 import {
+  literaturePublicationCheckRequestSchema,
+  literaturePublicationCheckResultSchema,
+  literatureRelatedRequestSchema,
+  literatureRelatedResultSchema,
   literatureFullTextRequestSchema,
+  literatureFullTextProgressSchema,
+  literatureSupplementRequestSchema,
+  literatureSupplementAttachmentRequestSchema,
+  literatureSupplementAttachmentResultSchema,
+  literatureSupplementResultSchema,
   literatureMetadataCompletionRequestSchema
 } from '@aipoch/literature-discovery/contracts'
 
@@ -117,6 +126,26 @@ const literatureApplicationCommandContracts = Object.freeze({
     validationCodec(z.tuple([literatureCandidateStatesRequestSchema])),
     validationCodec(literatureCandidateStatesResultSchema)
   ),
+  supplementAttachmentProgress: defineApplicationCommandContract(
+    validationCodec(z.tuple([literatureSupplementAttachmentRequestSchema])),
+    validationCodec(literatureFullTextProgressSchema.nullable())
+  ),
+  supplementAttachment: defineApplicationCommandContract(
+    validationCodec(z.tuple([literatureSupplementAttachmentRequestSchema])),
+    validationCodec(literatureSupplementAttachmentResultSchema)
+  ),
+  publicationCheck: defineApplicationCommandContract(
+    validationCodec(z.tuple([literaturePublicationCheckRequestSchema])),
+    validationCodec(literaturePublicationCheckResultSchema)
+  ),
+  related: defineApplicationCommandContract(
+    validationCodec(z.tuple([literatureRelatedRequestSchema])),
+    validationCodec(literatureRelatedResultSchema)
+  ),
+  supplements: defineApplicationCommandContract(
+    validationCodec(z.tuple([literatureSupplementRequestSchema])),
+    validationCodec(literatureSupplementResultSchema)
+  ),
   fullText: defineApplicationCommandContract(
     validationCodec(z.tuple([literatureFullTextRequestSchema])),
     validationCodec(literatureFullTextResultSchema)
@@ -153,7 +182,7 @@ const literatureApplicationCommandContracts = Object.freeze({
           .trim()
           .min(1)
           .max(2048)
-          .regex(/^(?:10\.\d{4,9}\/\S+|pmid:\d+)$/u)
+          .regex(/^(?:10\.\d{4,9}\/\S+|pmid:\d+|arxiv:(?:\d{4}\.\d{4,5}|[a-z][a-z.-]*\/\d{7}))$/u)
       ])
     ),
     validationCodec(literatureItemInputSchema)
@@ -193,3 +222,8 @@ export {
 }
 
 export type { LiteratureCatalogSearchPage, LiteraturePdfImportRequest }
+
+export {
+  literatureIssuedYear,
+  normalizeLiteratureIdentifierKey
+} from '@aipoch/literature-citations/contracts'

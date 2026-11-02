@@ -1,3 +1,4 @@
+import { useLiteratureHost } from '../renderer-host'
 import {
   AUTOMATIC_CLASSIFICATION_RUN_LIMIT,
   AUTOMATIC_CLASSIFICATION_DAY_LIMIT
@@ -32,14 +33,16 @@ import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { ErrorNotice } from '@/components/error-notice'
+import { useLiteratureScreeningExport } from '../workflows/useLiteratureScreeningExport'
 import { ConfirmActionDialog } from '@/components/ui/confirm-action-dialog'
 import { ActionMenuProvider, ActionMenuTarget, useActionMenu } from '@/components/action-menu'
-import { useSettingsStore } from '@/stores/settings-store'
+
 import type { SmartCollectionView, SmartScope } from '@aipoch/literature-screening/contracts'
 
 const catalog = {
   bibtex: { labelKey: 'BibTeX', icon: FileText },
   ris: { labelKey: 'RIS', icon: FileText },
+  screeningCsv: { labelKey: 'Export screening results (CSV)', icon: Download },
   review: { labelKey: 'Review with agent', icon: Sparkles },
   preview: { labelKey: 'Trial run (up to 20 references)', icon: Eye },
   recompute: { labelKey: 'Re-evaluate all', icon: RotateCcw },
@@ -113,8 +116,13 @@ export function SmartCollectionPanel({
   exportDisabled?: boolean
   searchActions?: React.ReactNode
 }): React.JSX.Element {
+  const { useSettingsStore } = useLiteratureHost()
+
+  const { api: hostApi } = useLiteratureHost()
+
   const { t } = useTranslation()
   const progressStatusId = useId()
+  const screeningExport = useLiteratureScreeningExport(collectionId)
   const settingsOpen = useSettingsStore((state) => state.isSettingsOpen)
   const view = useSyncExternalStore(state.subscribe, state.getSnapshot)
   const [revision, setRevision] = useState(0)
@@ -149,7 +157,7 @@ export function SmartCollectionPanel({
   const load = useCallback(
     async () =>
       (
-        await window.api.literature.transact({
+        await hostApi.literature.transact({
           kind: 'smart-collection',
           offset: 0,
           collectionId,
@@ -157,7 +165,7 @@ export function SmartCollectionPanel({
           summaryOnly: true
         })
       ).smart,
-    [collectionId]
+    [collectionId, hostApi.literature]
   )
   useEffect(() => {
     let live = true
@@ -219,7 +227,7 @@ export function SmartCollectionPanel({
       setUpdateRunId(undefined)
     }
     try {
-      const receipt = await window.api.literature.transact({
+      const receipt = await hostApi.literature.transact({
         kind: 'smart-collection',
         offset: 0,
         collectionId,
@@ -442,7 +450,7 @@ export function SmartCollectionPanel({
                       <Trash2 className="size-4" aria-hidden="true" />
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent side="top" className="bg-black text-white">
+                  <TooltipContent side="top">
                     {t(
                       'Abandon this run. Completed results will be kept, and this run will not resume.'
                     )}
@@ -481,9 +489,7 @@ export function SmartCollectionPanel({
                         <RotateCcw className="size-4" aria-hidden="true" />
                       </Button>
                     </TooltipTrigger>
-                    <TooltipContent side="top" className="bg-black text-white">
-                      {t('Continue in a new run')}
-                    </TooltipContent>
+                    <TooltipContent side="top">{t('Continue in a new run')}</TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
               )
@@ -541,6 +547,9 @@ export function SmartCollectionPanel({
   )
   return (
     <section className="shrink-0" aria-label={t('Smart collection')}>
+      {screeningExport.error && (
+        <ErrorNotice inline tone="amber" description={screeningExport.error} />
+      )}
       {refreshFailed && (
         <ErrorNotice
           inline
@@ -591,9 +600,17 @@ export function SmartCollectionPanel({
                 icon: Download,
                 actions: ['bibtex', 'ris']
               },
+              { kind: 'action', action: 'screeningCsv' },
               ...recipe
             ]}
             bindings={{
+              screeningCsv: {
+                execute: async () => {
+                  await screeningExport.exportResults()
+                },
+                disabled:
+                  screeningExport.exporting || !view?.sourceAvailable || active || decisionPending
+              },
               bibtex: {
                 execute: async () => {
                   await onExport?.('bibtex')

@@ -25,6 +25,120 @@ const createActivity = (overrides: Partial<ToolActivity>): ToolActivity => ({
 })
 
 describe('workspace tool activity details', () => {
+  it.each([
+    'mcp__open-science-notebook__list_authorized_directories',
+    'mcp__open_science_notebook__list_authorized_directories',
+    'open-science-notebook.list_authorized_directories',
+    'open-science-notebook/list_authorized_directories',
+    'open-science-notebook_list_authorized_directories'
+  ])('labels authorized directory discovery without exposing its transport: %s', (name) => {
+    for (const identity of [{ providerToolName: name }, { title: name }]) {
+      const details = buildToolActivityDetails(
+        createActivity({
+          ...identity,
+          toolKind: 'execute',
+          rawOutput: { revision: 'v1', directories: [] }
+        })
+      )
+      expect(details?.displayName).toBe('List authorized directories')
+      expect(details?.subtitle).toBeUndefined()
+      expect(details?.sections).toEqual([
+        { kind: 'authorized-directories', snapshot: { revision: 'v1', directories: [] } }
+      ])
+    }
+  })
+
+  const directorySnapshot = {
+    revision: 'directory-revision',
+    directories: [
+      {
+        name: 'Research',
+        path: '/Users/test/Research',
+        access: 'ro',
+        grantedAt: '2026-10-26T01:42:00.000Z'
+      }
+    ]
+  }
+
+  it.each([
+    directorySnapshot,
+    JSON.stringify(directorySnapshot),
+    { structuredContent: directorySnapshot },
+    { result: { content: [{ type: 'text', text: JSON.stringify(directorySnapshot) }] } }
+  ])('projects authorized directories from provider result envelopes', (rawOutput) => {
+    expect(
+      buildToolActivityDetails(
+        createActivity({
+          providerToolName: 'mcp__open-science-notebook__list_authorized_directories',
+          rawOutput
+        })
+      )?.sections
+    ).toEqual([{ kind: 'authorized-directories', snapshot: directorySnapshot }])
+  })
+
+  it('projects directory results from ACP content blocks in restored history', () => {
+    const activity = createActivity({
+      providerToolName: 'mcp__open-science-notebook__list_authorized_directories',
+      toolContent: [
+        { type: 'content', content: { type: 'text', text: JSON.stringify(directorySnapshot) } }
+      ]
+    })
+    expect(buildToolActivityDetails(JSON.parse(JSON.stringify(activity)))?.sections).toEqual([
+      { kind: 'authorized-directories', snapshot: directorySnapshot }
+    ])
+  })
+
+  it.each([
+    { status: 'failed' as const, rawOutput: directorySnapshot },
+    { rawOutput: { isError: true, structuredContent: directorySnapshot } },
+    {
+      rawOutput: { isError: true, content: [{ type: 'text', text: 'record query failed' }] },
+      toolContent: [
+        {
+          type: 'content' as const,
+          content: { type: 'text' as const, text: JSON.stringify(directorySnapshot) }
+        }
+      ]
+    },
+    { rawOutput: { ...directorySnapshot, directories: [{}] } },
+    {
+      rawOutput: {
+        ...directorySnapshot,
+        directories: [{ ...directorySnapshot.directories[0], access: 'admin' }]
+      }
+    },
+    {
+      rawOutput: {
+        ...directorySnapshot,
+        directories: [{ ...directorySnapshot.directories[0], grantedAt: 'invalid' }]
+      }
+    },
+    { rawOutput: 'record query failed' }
+  ])('retains inspectable output for failed or malformed directory results', (overrides) => {
+    const details = buildToolActivityDetails(
+      createActivity({
+        providerToolName: 'mcp__open-science-notebook__list_authorized_directories',
+        ...overrides
+      })
+    )
+    expect(details?.sections.some((section) => section.kind === 'code')).toBe(true)
+    expect(details?.sections.some((section) => section.kind === 'authorized-directories')).toBe(
+      false
+    )
+  })
+
+  it('does not relabel an unrelated server with the same tool suffix', () => {
+    const name = 'mcp__open-science-notebook-staging__list_authorized_directories'
+    expect(
+      buildToolActivityDetails(
+        createActivity({
+          providerToolName: name,
+          rawOutput: { directories: [] }
+        })
+      )?.displayName
+    ).toBe(name)
+  })
+
   it('derives a display name from the provider tool name first', () => {
     expect(
       getToolDisplayName(createActivity({ providerToolName: 'Bash', toolKind: 'execute' }))
@@ -32,6 +146,53 @@ describe('workspace tool activity details', () => {
     expect(getToolDisplayName(createActivity({ toolKind: 'execute' }))).toBe('Terminal')
     expect(getToolDisplayName(createActivity({ toolKind: undefined }))).toBe('Tool')
   })
+
+  it.each([
+    ['list_pdf_annotations', 'list', { annotations: [{ id: 'a1', kind: 'highlight' }], total: 1 }],
+    [
+      'locate_pdf_annotation_target',
+      'locate',
+      { targets: [{ targetRef: 'target-1', kind: 'text', pageNumber: 2, quote: 'Result' }] }
+    ],
+    ['create_pdf_annotation', 'create', { id: 'a2', kind: 'highlight', pageNumber: 2 }]
+  ] as const)(
+    'projects %s into a Literature annotation card summary',
+    (tool, operation, output) => {
+      const details = buildToolActivityDetails(
+        createActivity({
+          providerToolName: `mcp__open-science-literature__${tool}`,
+          rawInput: { documentId: 'paper-1' },
+          rawOutput: output
+        })
+      )
+      expect(details?.displayName).toBe('Reading')
+      expect(details?.sections).toContainEqual(
+        expect.objectContaining({
+          kind: 'literature',
+          summary: expect.objectContaining({
+            annotation: expect.objectContaining({ operation, documentId: 'paper-1' })
+          })
+        })
+      )
+    }
+  )
+
+  it.each(['list_pdf_annotations', 'locate_pdf_annotation_target', 'create_pdf_annotation'])(
+    'preserves %s failures as visible Literature errors',
+    (tool) => {
+      const details = buildToolActivityDetails(
+        createActivity({
+          providerToolName: `mcp__open-science-literature__${tool}`,
+          rawOutput: { error: { code: 'PDF_ANNOTATION_FAILED', message: 'Target unavailable.' } }
+        })
+      )
+      const section = details?.sections.find((entry) => entry.kind === 'literature')
+      expect(section).toBeDefined()
+      if (!section || section.kind !== 'literature') throw new Error('literature section required')
+      expect(section.summary.error).toBe('Target unavailable.')
+      expect(section.summary.annotation).toBeUndefined()
+    }
+  )
 
   it('keeps native Skill instruction documents out of expandable activity details', () => {
     const activity = createActivity({
@@ -1708,6 +1869,33 @@ describe('workspace tool activity details', () => {
     expect(details?.subtitle).toBe('WebSearch, WebFetch, CronCreate')
     expect(details?.sections[0]?.kind === 'code' && details.sections[0].text).toContain('WebSearch')
   })
+
+  it.each(['in_progress', 'completed', 'failed'] as const)(
+    'presents Pi tool discovery as tool search when %s',
+    (status) => {
+      const text = status === 'failed' ? 'Discovery failed' : 'No matching tools found.'
+      const details = buildToolActivityDetails(
+        createActivity({
+          providerToolName: 'tool_search',
+          title: "tool_search 'skills'",
+          toolKind: 'search',
+          status,
+          rawInput: { query: 'skills' },
+          ...(status === 'in_progress'
+            ? {}
+            : {
+                toolContent: [
+                  { type: 'content' as const, content: { type: 'text' as const, text } }
+                ]
+              })
+        })
+      )
+      expect(details?.displayName).toBe('Tool search')
+      expect(details?.subtitle).toBe('skills')
+      expect(details?.sections).toHaveLength(status === 'in_progress' ? 0 : 1)
+      if (status === 'failed') expect(details?.sections[0]).toMatchObject({ label: 'Output', text })
+    }
+  )
 
   it('keeps a ToolSearch wrapper without results as a plain chip', () => {
     const activity = createActivity({ providerToolName: 'ToolSearch', title: 'ToolSearch' })

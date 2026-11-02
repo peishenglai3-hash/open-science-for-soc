@@ -1,3 +1,5 @@
+import { downloadUseCase } from './use-case-download'
+import type { UseCaseSource } from '../../shared/use-cases'
 import { desktopShellInteraction, desktopFileInteraction } from '../desktop-interaction'
 import { PACKAGE_REQUIRES_UPDATE } from './archive'
 import {
@@ -6,12 +8,13 @@ import {
 } from './sensitive-content'
 import { ForkRecoveryRequiredError } from './fork-session'
 import { redactSensitiveText } from '@aipoch/diagnostics'
-import { formatPackageBytes } from '../../shared/session-package'
+import { formatPackageBytes, packageImportPercent } from '../../shared/session-package'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, realpath, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readdir, realpath, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join } from 'node:path'
 import type {
+  PackageFileSelection,
   SensitiveContentEvidence,
   SessionPackageExportResult,
   SessionPackageImportResult,
@@ -21,7 +24,7 @@ import { sanitizeExportFilename } from '../../shared/conversation-export'
 import type { NativeTranslator } from '../locale/main-process-messages'
 import { publishUserFile } from '../user-file-publisher'
 import { PACKAGE_MAX_BYTES } from '../../shared/session-package'
-import type { SessionPackageService } from './service'
+import { PackageImportRecoveryRequiredError, type SessionPackageService } from './service'
 import { createLogger, diagnosticErrorFields } from '@aipoch/diagnostics/node'
 import { copyFileWithinBudget } from '../bounded-file-io'
 import { SessionPackageOperation } from './operation'
@@ -39,8 +42,18 @@ type NativeImportFile = {
   filename: string
   target?: import('../../shared/session-package').SessionPackageImportRequest
   originClientId?: string
+  onReleased?: () => void
+  validateBeforeTarget?: boolean
+  work?: Promise<void>
+  recovery?: PackageImportRecoveryRequiredError
 }
 class PackageSourceUnavailableError extends Error {}
+
+// Exact application-owned messages only: parser and filesystem errors can contain research data.
+const safeFailureMessages = new Set([
+  'Legacy file references must have immutable Versions before packaging.',
+  'Session or Notebook references missing file evidence.'
+])
 
 // Native pickers and the preload File bridge supply filesystem paths. A private archive freezes
 // the bytes reviewed in the confirmation before import or external save.
@@ -48,7 +61,22 @@ export class SessionPackageDesktop {
   readonly operations: SessionPackageOperation
   private pendingFiles: NativeImportFile[] = []
   private activeFile?: NativeImportFile
+  private lastExport?: {
+    operationId: string
+    filePath: string
+    selection?: PackageFileSelection
+  }
+  // The sensitive-content retry in respond() never passes export options, so it inherits this
+  // remembered policy instead of falling back into the native save-dialog branch.
+  private stageDownloadForRetries = false
+  private downloadDirectory?: string
   private lastImportFile?: NativeImportFile
+  private pendingUseCase?: {
+    requestId: string
+    source: UseCaseSource
+    callerId?: string
+    originClientId?: string
+  }
   private enqueueing: Promise<void> = Promise.resolve()
   private busy = false
   private readonly pendingCleanup = new Set<() => Promise<void>>()
@@ -72,10 +100,19 @@ export class SessionPackageDesktop {
         evidence: SensitiveContentEvidence[],
         sources: PackageSensitiveContentSource[]
       ) => void
+      cancelBrowserTransfer?: (id: string) => Promise<void>
       assertCanStart?: () => void
     }
   ) {
     this.operations = new SessionPackageOperation((snapshot) => {
+      if (
+        this.lastExport &&
+        (this.lastExport.operationId !== snapshot.id ||
+          snapshot.state === 'succeeded' ||
+          snapshot.state === 'cancelled' ||
+          (snapshot.state === 'failed' && !snapshot.sensitiveContent?.length))
+      )
+        this.lastExport = undefined
       options.onOperationChanged?.(snapshot)
       // Defer until run() has completed ownership release and any active file has settled.
       if (!this.operations.active) queueMicrotask(() => this.pumpOpenFiles())
@@ -89,12 +126,31 @@ export class SessionPackageDesktop {
     )
   }
 
-  enqueueFile(path: string): void {
-    this.enqueueing = this.enqueueing
+  enqueueFile(
+    path: string,
+    onReleased?: () => void,
+    validateBeforeTarget = false
+  ): Promise<boolean> {
+    const releaseSource = onReleased
+    let released = false
+    onReleased = releaseSource
+      ? () => {
+          if (released) return
+          released = true
+          releaseSource()
+        }
+      : undefined
+    const enqueue = this.enqueueing
       .then(async () => {
-        if (this.shutdown.signal.aborted) return
+        if (this.shutdown.signal.aborted) {
+          onReleased?.()
+          return false
+        }
         const canonical = await realpath(path).catch(() => path)
-        if (this.shutdown.signal.aborted) return
+        if (this.shutdown.signal.aborted) {
+          onReleased?.()
+          return false
+        }
         if (
           this.activeFile?.path === canonical ||
           this.pendingFiles.some((file) => file.path === canonical)
@@ -103,29 +159,41 @@ export class SessionPackageDesktop {
             this.pendingFiles.map(({ id, filename }) => ({ id, filename }))
           )
           this.operations.present()
-          return
+          return true
         }
         if (this.pendingFiles.length >= 16) {
+          onReleased?.()
           this.operations.setPendingImports(
             this.pendingFiles.map(({ id, filename }) => ({ id, filename })),
             true
           )
-          return
+          return false
         }
         const startImmediately = this.pendingFiles.length === 0 && !this.operations.active
-        this.pendingFiles.push({ id: randomUUID(), path: canonical, filename: basename(path) })
+        this.pendingFiles.push({
+          id: randomUUID(),
+          path: canonical,
+          filename: basename(path),
+          onReleased,
+          validateBeforeTarget
+        })
         this.operations.setPendingImports(
           this.pendingFiles.map(({ id, filename }) => ({ id, filename }))
         )
         this.pumpOpenFiles(startImmediately)
         this.operations.present()
+        return true
       })
-      .catch((error) =>
+      .catch((error) => {
+        onReleased?.()
         createLogger('session-package').warn(
           'Could not receive package file',
           diagnosticErrorFields(error)
         )
-      )
+        return false
+      })
+    this.enqueueing = enqueue.then(() => undefined)
+    return enqueue
   }
 
   private pumpOpenFiles(force = false): void {
@@ -143,7 +211,16 @@ export class SessionPackageDesktop {
     this.operations.setPendingImports(
       this.pendingFiles.map(({ id, filename }) => ({ id, filename }))
     )
-    void this.import(undefined, file.originClientId, file.target ?? {}, file.path)
+    file.work = this.import(
+      undefined,
+      file.originClientId,
+      file.target ?? {},
+      file.path,
+      file.validateBeforeTarget
+    )
+      .then((result) => {
+        if (result) file.onReleased?.()
+      })
       .catch(() => undefined)
       .finally(() => {
         this.activeFile = undefined
@@ -151,25 +228,58 @@ export class SessionPackageDesktop {
       })
   }
 
+  async cancelReceivedFile(path: string): Promise<void> {
+    await this.enqueueing
+    path = await realpath(path).catch(() => path)
+    // Only this source is cancelled. Other pending imports and an unrelated active operation survive.
+    const pending = this.pendingFiles.filter((file) => file.path === path)
+    this.pendingFiles = this.pendingFiles.filter((file) => file.path !== path)
+    for (const file of pending) file.onReleased?.()
+    this.operations.setPendingImports(
+      this.pendingFiles.map(({ id, filename }) => ({ id, filename }))
+    )
+    const active = this.activeFile
+    if (active?.path === path) {
+      this.operations.cancel()
+      await active.work
+      active.onReleased?.()
+    }
+    if (this.lastImportFile?.path === path) {
+      this.lastImportFile.onReleased?.()
+      this.lastImportFile = undefined
+    }
+  }
+
   respond(
     request: PackageOperationRequest
   ): PackageOperationSnapshot | null | Promise<PackageOperationSnapshot | null> {
+    if (request.action === 'cancel-browser-transfer') {
+      return Promise.resolve(this.options.cancelBrowserTransfer?.(request.transferId)).then(
+        () => this.operations.snapshot
+      )
+    }
     if (request.action === 'export-with-sensitive-content') {
       const failed = this.operations.snapshot
+      const previous = this.lastExport
       if (
         !failed ||
         failed.id !== request.operationId ||
         failed.kind !== 'export' ||
         failed.state !== 'failed' ||
         !failed.session ||
+        (previous && previous.operationId !== failed.id) ||
         !failed.sensitiveContent?.length ||
         failed.cleanupPending ||
         this.operations.active
       )
         throw new Error('No failed sensitive-content export is available.')
-      return this.exportWithPolicy(failed.session, undefined, true).then(
-        () => this.operations.snapshot
-      )
+      return this.exportWithPolicy(
+        failed.session,
+        undefined,
+        true,
+        previous?.filePath,
+        previous?.selection
+      ).then(() => this.operations.snapshot)
     }
     if (
       request.action === 'dismiss-queue-warning' ||
@@ -185,6 +295,21 @@ export class SessionPackageDesktop {
           false
         )
       } else if (request.action === 'discard-import') {
+        if (this.lastImportFile?.id === request.requestId) {
+          if (
+            this.operations.active ||
+            this.activeFile ||
+            this.lastImportFile.recovery ||
+            this.operations.snapshot?.cleanupPending
+          )
+            throw new Error('Wait for the current package operation to finish.')
+          const source = this.lastImportFile
+          return Promise.resolve(source.onReleased?.()).then(() => {
+            if (this.lastImportFile === source) this.lastImportFile = undefined
+            return this.operations.snapshot
+          })
+        }
+        this.pendingFiles.find((file) => file.id === request.requestId)?.onReleased?.()
         this.pendingFiles = this.pendingFiles.filter((file) => file.id !== request.requestId)
         this.operations.setPendingImports(
           this.pendingFiles.map(({ id, filename }) => ({ id, filename }))
@@ -193,6 +318,12 @@ export class SessionPackageDesktop {
         if (this.activeFile || this.operations.active || this.operations.snapshot?.cleanupPending)
           throw new Error('Wait for the current package operation to finish.')
         if (request.action === 'retry-import') {
+          const pending = this.pendingUseCase
+          if (pending && pending.requestId === this.operations.snapshot?.importRequestId) {
+            return this.import(pending.callerId, pending.originClientId, {}, pending.source).then(
+              () => this.operations.snapshot
+            )
+          }
           if (
             !this.lastImportFile ||
             this.operations.snapshot?.importRequestId !== this.lastImportFile.id
@@ -257,12 +388,17 @@ export class SessionPackageDesktop {
   }
 
   async close(): Promise<void> {
+    const sources = [...this.pendingFiles, this.lastImportFile, this.activeFile]
     this.pendingFiles = []
     this.lastImportFile = undefined
+    this.lastExport = undefined
     this.operations.cancel()
     this.shutdown.abort(new Error('Session package desktop is closed.'))
     await this.operations.close()
     await this.operation
+    await this.enqueueing
+    for (const source of sources) await source?.onReleased?.()
+    if (this.downloadDirectory) await rm(this.downloadDirectory, { recursive: true, force: true })
   }
 
   private async acceptCleanup<T>(work: () => Promise<T>): Promise<T> {
@@ -325,6 +461,43 @@ export class SessionPackageDesktop {
     }
   }
 
+  // Local Web callers hand the returned path to the renderer for a browser download, so the
+  // archive lands in private per-host and per-export directories.
+  private async stageDownloadPath(title: string): Promise<string> {
+    const root = (this.downloadDirectory ??= await mkdtemp(
+      join(tmpdir(), 'open-science-package-exports-')
+    ))
+    await this.pruneStaleDownloads(root)
+    const directory = await mkdtemp(join(root, 'export-'))
+    const today = new Date()
+    const date = [
+      today.getFullYear(),
+      String(today.getMonth() + 1).padStart(2, '0'),
+      String(today.getDate()).padStart(2, '0')
+    ].join('-')
+    const base = `${sanitizeExportFilename(title || 'Session', 220)}-${date}`
+    return join(directory, `${base}.science`)
+  }
+
+  // Staged downloads are ephemeral: drop anything a previous caller never claimed.
+  private async pruneStaleDownloads(directory: string): Promise<void> {
+    try {
+      const cutoff = Date.now() - 60 * 60 * 1000
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !entry.name.startsWith('export-')) continue
+        try {
+          const path = join(directory, entry.name)
+          const info = await stat(path)
+          if (info.mtimeMs < cutoff) await rm(path, { recursive: true, force: true })
+        } catch {
+          // A racing download or unreadable entry must not block this export.
+        }
+      }
+    } catch {
+      // Best-effort cleanup: a missing or unreadable directory only delays pruning.
+    }
+  }
+
   private staged<T>(
     work: (directory: string) => Promise<T>,
     request?: SessionPackageRequest
@@ -358,95 +531,103 @@ export class SessionPackageDesktop {
         )
       )
     } catch (error) {
-      if (error instanceof PackageSensitiveContentError && request && error.evidence) {
-        this.operations.setSensitiveContent([error.evidence])
-        try {
-          this.options.onSensitiveContentFailure?.(
-            request,
-            [error.evidence],
-            error.source ? [error.source] : []
-          )
-        } catch {
-          // Diagnostic capture must not change the package operation result.
-        }
-      }
-      createLogger('session-package').warn(
-        'Session package operation failed',
-        diagnosticErrorFields(error)
-      )
-      const detail = error instanceof Error ? error.message : ''
-      const translate = this.options.translate
-      if (detail === PACKAGE_REQUIRES_UPDATE)
-        throw new Error(
-          translate(
-            'This Session package requires a newer version of Open Science. Update Open Science, then try importing it again.'
-          ),
-          { cause: error }
-        )
-      if (error instanceof PackageSourceUnavailableError)
-        throw new Error(
-          translate(
-            'The original package is unavailable. It may have been moved, deleted, or become unreadable. Choose another package.'
-          ),
-          { cause: error }
-        )
-      if (error instanceof PackageCapacityError)
-        throw new Error(
-          translate(
-            'Not enough disk space at {{path}}. The next stage needs at least {{required}} available, including reserved free space; {{available}} is available. Free up at least {{shortfall}}, then try again.',
-            {
-              path: error.directory,
-              required: formatPackageBytes(error.requiredBytes),
-              available: formatPackageBytes(error.freeBytes),
-              shortfall: formatPackageBytes(error.requiredBytes - error.freeBytes)
-            }
-          ),
-          { cause: error }
-        )
-      if (detail.startsWith('An excluded file also exists'))
-        throw new Error(
-          translate(
-            'An excluded file also exists in retained research evidence. Include that file to export this Session.'
-          ),
-          { cause: error }
-        )
-      if (error instanceof PackageSensitiveContentError) {
-        const rules = {
-          field: translate('Credential-like field value'),
-          assignment: translate('Credential-like assignment'),
-          url: translate('Credential-like URL'),
-          token: translate('Credential-like token')
-        }
-        throw new Error(
-          translate(
-            'Sensitive content detected at {{location}}. Check: {{rule}}. Review it before exporting the Session package.',
-            {
-              location: error.location,
-              rule: rules[error.rule]
-            }
-          ),
-          { cause: error }
-        )
-      }
-      if (detail.includes('Sensitive content detected'))
-        throw new Error(
-          translate('Sensitive content detected. Remove it before exporting the Session package.'),
-          { cause: error }
-        )
-      if (detail.startsWith('Wait for') || detail.includes('changed during export'))
-        throw new Error(
-          translate('Wait for all research activity to finish, then try exporting again.'),
-          { cause: error }
-        )
-      throw new Error(
-        translate(
-          'Could not complete the Session package operation. Check the package and available disk space, then try again.'
-        ),
-        { cause: error }
-      )
+      this.failOperation(error, request)
     } finally {
       this.busy = false
     }
+  }
+
+  // Preflight validation and staged operations share the same user-facing error conversion.
+  private failOperation(error: unknown, request?: SessionPackageRequest): never {
+    if (error instanceof PackageSensitiveContentError && request && error.evidence) {
+      this.operations.setSensitiveContent([error.evidence])
+      try {
+        this.options.onSensitiveContentFailure?.(
+          request,
+          [error.evidence],
+          error.source ? [error.source] : []
+        )
+      } catch {
+        // Diagnostic capture must not change the package operation result.
+      }
+    }
+    const detail = error instanceof Error ? error.message : ''
+    const snapshot = this.operations.snapshot
+    createLogger('session-package').warn('Session package operation failed', {
+      ...diagnosticErrorFields(error),
+      operationId: snapshot?.id,
+      phase: snapshot?.progress.phase,
+      ...(safeFailureMessages.has(detail) ? { error: { message: detail } } : {})
+    })
+    const translate = this.options.translate
+    if (detail === PACKAGE_REQUIRES_UPDATE)
+      throw new Error(
+        translate(
+          'This Session package requires a newer version of Open Science. Update Open Science, then try importing it again.'
+        ),
+        { cause: error }
+      )
+    if (error instanceof PackageSourceUnavailableError)
+      throw new Error(
+        translate(
+          'The original package is unavailable. It may have been moved, deleted, or become unreadable. Choose another package.'
+        ),
+        { cause: error }
+      )
+    if (error instanceof PackageCapacityError)
+      throw new Error(
+        translate(
+          'Not enough disk space at {{path}}. The next stage needs at least {{required}} available, including reserved free space; {{available}} is available. Free up at least {{shortfall}}, then try again.',
+          {
+            path: error.directory,
+            required: formatPackageBytes(error.requiredBytes),
+            available: formatPackageBytes(error.freeBytes),
+            shortfall: formatPackageBytes(error.requiredBytes - error.freeBytes)
+          }
+        ),
+        { cause: error }
+      )
+    if (detail.startsWith('An excluded file also exists'))
+      throw new Error(
+        translate(
+          'An excluded file also exists in retained research evidence. Include that file to export this Session.'
+        ),
+        { cause: error }
+      )
+    if (error instanceof PackageSensitiveContentError) {
+      const rules = {
+        field: translate('Credential-like field value'),
+        assignment: translate('Credential-like assignment'),
+        url: translate('Credential-like URL'),
+        token: translate('Credential-like token')
+      }
+      throw new Error(
+        translate(
+          'Sensitive content detected at {{location}}. Check: {{rule}}. Review it before exporting the Session package.',
+          {
+            location: error.location,
+            rule: rules[error.rule]
+          }
+        ),
+        { cause: error }
+      )
+    }
+    if (detail.includes('Sensitive content detected'))
+      throw new Error(
+        translate('Sensitive content detected. Remove it before exporting the Session package.'),
+        { cause: error }
+      )
+    if (detail.startsWith('Wait for') || detail.includes('changed during export'))
+      throw new Error(
+        translate('Wait for all research activity to finish, then try exporting again.'),
+        { cause: error }
+      )
+    throw new Error(
+      translate(
+        'Could not complete the Session package operation. Check the package and available disk space, then try again.'
+      ),
+      { cause: error }
+    )
   }
 
   fork(
@@ -535,58 +716,112 @@ export class SessionPackageDesktop {
       })
   }
 
-  export(request: SessionPackageRequest, callerId?: string): Promise<SessionPackageExportResult> {
-    return this.exportWithPolicy(request, callerId)
+  export(
+    request: SessionPackageRequest,
+    callerId?: string,
+    destinationPath?: string,
+    options?: { stageDownload?: boolean }
+  ): Promise<SessionPackageExportResult> {
+    // Admission records the policy so a rejected concurrent export cannot change retries.
+    return this.exportWithPolicy(
+      request,
+      callerId,
+      false,
+      destinationPath,
+      undefined,
+      options?.stageDownload ?? false
+    )
   }
 
   private exportWithPolicy(
     request: SessionPackageRequest,
     callerId?: string,
-    allowSensitiveContent = false
+    allowSensitiveContent = false,
+    destinationPath?: string,
+    selection?: PackageFileSelection,
+    stageDownload?: boolean
   ): Promise<SessionPackageExportResult> {
+    const stage = stageDownload ?? this.stageDownloadForRetries
     let operationSignal: AbortSignal | undefined
     return this.operations
       .run('export', request, async (signal) => {
         operationSignal = signal
+        this.stageDownloadForRetries = stage
         this.options.assertCanStart?.()
+        if (destinationPath)
+          this.lastExport = {
+            operationId: this.operations.snapshot!.id,
+            filePath: destinationPath,
+            selection
+          }
         this.operations.setCleanupPending(this.pendingCleanup.size > 0)
         const release = await this.options.reserveExport?.(request, signal)
         try {
           return await this.staged(async (directory) => {
             const archive = join(directory, 'session.science')
-            let filePath: string | undefined
+            let filePath: string | undefined = destinationPath
             await this.options.withDataRootWrite(() =>
               this.acceptCleanup(() =>
                 this.options.service.exportTo(request, archive, {
                   ...(allowSensitiveContent ? { allowSensitiveContent: true } : {}),
                   signal,
                   onProgress: this.operations.report,
-                  selectFiles: async (files, budgetSignal, summary, title) => {
-                    const excluded = await this.operations.selectFiles(files, budgetSignal, summary)
-                    this.operations.report({ phase: 'choosing-location' })
-                    signal.throwIfAborted()
-                    const today = new Date()
-                    const date = [
-                      today.getFullYear(),
-                      String(today.getMonth() + 1).padStart(2, '0'),
-                      String(today.getDate()).padStart(2, '0')
-                    ].join('-')
-                    const options = {
-                      title: this.options.translate('Export Session package'),
-                      defaultPath: `${sanitizeExportFilename(title || 'Session', 220)}-${date}.science`,
-                      filters: [{ name: 'Open-Science Session', extensions: ['science'] }]
-                    }
-                    const selected = await this.nativeDialog(
-                      desktopFileInteraction().chooseSavePath(options, callerId),
-                      AbortSignal.any([signal, budgetSignal])
-                    )
-                    if (selected.canceled || !selected.filePath) {
-                      this.operations.cancel()
-                      signal.throwIfAborted()
-                    }
-                    filePath = selected.filePath
-                    return excluded
-                  }
+                  // Reuse acknowledged choices; headless callers without a selection include all files.
+                  ...(selection
+                    ? { selectFiles: async () => selection }
+                    : destinationPath
+                      ? {}
+                      : {
+                          selectFiles: async (files, budgetSignal, summary, title) => {
+                            const excluded = await this.operations.selectFiles(
+                              files,
+                              budgetSignal,
+                              summary
+                            )
+                            if (stage) {
+                              // Local Web callers download the staged archive from the renderer;
+                              // a headless host has no native dialog to ask for a destination.
+                              signal.throwIfAborted()
+                              filePath = await this.stageDownloadPath(title)
+                              this.lastExport = {
+                                operationId: this.operations.snapshot!.id,
+                                filePath: filePath!,
+                                selection: excluded
+                              }
+                              this.operations.report({ phase: 'preparing' })
+                              return excluded
+                            }
+                            this.operations.report({ phase: 'choosing-location' })
+                            signal.throwIfAborted()
+                            const today = new Date()
+                            const date = [
+                              today.getFullYear(),
+                              String(today.getMonth() + 1).padStart(2, '0'),
+                              String(today.getDate()).padStart(2, '0')
+                            ].join('-')
+                            const options = {
+                              title: this.options.translate('Export Session package'),
+                              defaultPath: `${sanitizeExportFilename(title || 'Session', 220)}-${date}.science`,
+                              filters: [{ name: 'Open-Science Session', extensions: ['science'] }]
+                            }
+                            const selected = await this.nativeDialog(
+                              desktopFileInteraction().chooseSavePath(options, callerId),
+                              AbortSignal.any([signal, budgetSignal])
+                            )
+                            if (selected.canceled || !selected.filePath) {
+                              this.operations.cancel()
+                              signal.throwIfAborted()
+                            }
+                            filePath = selected.filePath
+                            this.lastExport = {
+                              operationId: this.operations.snapshot!.id,
+                              filePath: filePath!,
+                              selection: excluded
+                            }
+                            this.operations.report({ phase: 'preparing' })
+                            return excluded
+                          }
+                        })
                 })
               )
             )
@@ -617,19 +852,61 @@ export class SessionPackageDesktop {
     callerId?: string,
     originClientId?: string,
     target: import('../../shared/session-package').SessionPackageImportRequest = {},
-    sourcePath?: string
+    source?: string | UseCaseSource,
+    validateBeforeTarget = false,
+    options?: { readonly nonInteractive?: true; readonly onReleased?: () => Promise<void> }
   ): Promise<SessionPackageImportResult> {
+    let sourcePath = typeof source === 'string' ? source : undefined
+    const useCase = typeof source === 'object' ? source.useCase : undefined
+    const nonInteractive = options?.nonInteractive === true
+    let released: Promise<void> | undefined
+    const releaseSource = options?.onReleased
+      ? () => (released ??= options.onReleased!())
+      : undefined
     let operationSignal: AbortSignal | undefined
+    let importFile: NativeImportFile | undefined
     const rememberSource = (path: string): void => {
       const id = this.operations.snapshot?.importRequestId ?? this.activeFile?.id ?? randomUUID()
+      if (this.lastImportFile?.path !== path) this.lastImportFile?.onReleased?.()
+      const onReleased =
+        this.activeFile?.path === path
+          ? this.activeFile.onReleased
+          : (releaseSource ??
+            (this.lastImportFile?.path === path ? this.lastImportFile.onReleased : undefined))
+      // Only a queued retry owns the previous handle. An explicit import of the same path
+      // remains a new request, and changing its destination cannot inherit recovery authority.
+      const recovery =
+        this.activeFile?.path === path &&
+        this.activeFile.target?.projectId === target.projectId &&
+        this.activeFile.target?.projectName === target.projectName
+          ? this.activeFile.recovery
+          : undefined
       this.lastImportFile = {
         id,
         path,
         filename: basename(path),
         target: { ...target },
-        originClientId
+        originClientId,
+        onReleased,
+        validateBeforeTarget,
+        recovery
       }
+      importFile = this.lastImportFile
       this.operations.setImportSource(id, basename(path), target)
+    }
+    const completeImport = async (
+      result: SessionPackageRequest
+    ): Promise<SessionPackageRequest> => {
+      this.operations.completeResult({ imported: result })
+      try {
+        await this.options.afterImport(result, originClientId, !target.projectId)
+      } catch (error) {
+        createLogger('session-package').warn(
+          'Imported Session notification failed',
+          diagnosticErrorFields(error)
+        )
+      }
+      return result
     }
     return this.operations
       .run(
@@ -637,15 +914,101 @@ export class SessionPackageDesktop {
         undefined,
         async (signal) => {
           operationSignal = signal
+          // Catalog downloads share the operation lock, progress, cancellation and retry ownership.
+          if (useCase) {
+            this.options.assertCanStart?.()
+            const requestId = randomUUID()
+            this.pendingUseCase = { requestId, source: { useCase }, callerId, originClientId }
+            this.operations.setImportSource(requestId, `${useCase}.science`, target)
+            const downloaded = await downloadUseCase(
+              useCase,
+              signal,
+              (completedBytes, totalBytes) =>
+                this.operations.reportUseCaseDownload(completedBytes, totalBytes)
+            ).catch((error) => this.failOperation(error))
+            this.pendingUseCase = undefined
+            sourcePath = downloaded.path
+            rememberSource(sourcePath)
+            this.lastImportFile!.onReleased = () => {
+              void this.acceptCleanup(() =>
+                withPackageCleanup(async () => undefined, downloaded.release)
+              ).catch(() => undefined)
+            }
+            validateBeforeTarget = true
+            this.operations.finishUseCaseDownload()
+          }
           if (
             sourcePath &&
             (!isAbsolute(sourcePath) || extname(sourcePath).toLowerCase() !== '.science')
           )
             throw new Error('Invalid Session package path.')
+          if (nonInteractive && !sourcePath)
+            throw new Error('A package path is required for non-interactive import.')
           if (sourcePath) rememberSource(sourcePath)
-          if (!sourcePath || target.projectId || target.projectName) this.options.assertCanStart?.()
+          if (nonInteractive || !sourcePath || target.projectId || target.projectName)
+            this.options.assertCanStart?.()
           this.operations.setCleanupPending(this.pendingCleanup.size > 0)
-          if (sourcePath && !target.projectId && !target.projectName) {
+          const recovery = importFile?.recovery
+          if (recovery) {
+            this.options.assertCanStart?.()
+            const release = target.projectId
+              ? await this.options.reserveImport?.(target.projectId, signal)
+              : undefined
+            try {
+              this.operations.report({ phase: 'importing' })
+              const result = await this.options.withDataRootWrite(() =>
+                this.acceptCleanup(() =>
+                  recovery.resume(signal).catch((error: unknown) => {
+                    if (
+                      error instanceof PackageCleanupPendingError &&
+                      'value' in error.outcome &&
+                      error.outcome.value === undefined
+                    )
+                      throw new PackageCleanupPendingError(
+                        error.outcome,
+                        async () => {
+                          await error.retryCleanup()
+                          importFile!.recovery = undefined
+                        },
+                        error.cause
+                      )
+                    throw error
+                  })
+                )
+              )
+              if (result || !this.operations.snapshot?.cleanupPending)
+                importFile!.recovery = undefined
+              if (!result) throw recovery
+              return await completeImport(result)
+            } catch (error) {
+              this.failOperation(error)
+            } finally {
+              release?.()
+            }
+          }
+          if (sourcePath && validateBeforeTarget) {
+            const inspectionPath = sourcePath
+            // Browser uploads are untrusted bytes: reuse archive inspection before target selection.
+            // importFrom still revalidates the staged archive and owns packageOrigin/receipt.json.
+            this.options.assertCanStart?.()
+            this.operations.report({ phase: 'validating' })
+            try {
+              await this.acceptCleanup(() =>
+                this.options.service.inspect(inspectionPath, signal, (progress) =>
+                  this.operations.report({
+                    ...progress,
+                    overallPercent: (packageImportPercent(progress) ?? 0) / 4
+                  })
+                )
+              )
+            } catch (error) {
+              this.failOperation(error)
+            }
+            signal.throwIfAborted()
+          }
+          // Headless callers name the destination up front (or accept the automatic
+          // import-<uuid> Project); there is no renderer to run target selection.
+          if (sourcePath && !target.projectId && !target.projectName && !nonInteractive) {
             const selectedTarget = await this.operations.waitForImport({
               requestId: this.operations.snapshot?.importRequestId,
               filename: basename(sourcePath)
@@ -688,51 +1051,75 @@ export class SessionPackageDesktop {
               const archive = join(directory, 'session.science')
               await this.copyArchive(input, archive, 'copying', signal)
               this.operations.report({ phase: 'validating' })
+              let confirmed = false
               const result = await this.options.withDataRootWrite(() =>
                 this.acceptCleanup(() =>
-                  this.options.service.importFrom(
-                    archive,
-                    signal,
-                    // Service progress starts after confirmation; final validation belongs to import.
-                    (progress) =>
-                      this.operations.report(
-                        progress.phase === 'validating' ? { phase: 'importing' } : progress
-                      ),
-                    async (preview, budgetSignal) => {
-                      await this.operations.waitForImport(
-                        { preview, filename: basename(input) },
-                        budgetSignal
-                      )
-                      signal.throwIfAborted()
-                    },
-                    target
-                  )
+                  this.options.service
+                    .importFrom(
+                      archive,
+                      signal,
+                      // Inspection reports before confirmation; subsequent validation belongs to import.
+                      (progress) =>
+                        this.operations.report({
+                          ...progress,
+                          phase:
+                            confirmed && progress.phase === 'validating'
+                              ? 'importing'
+                              : progress.phase,
+                          ...(validateBeforeTarget
+                            ? {
+                                overallPercent:
+                                  10 +
+                                  (packageImportPercent(progress) ?? (confirmed ? 40 : 0)) * 0.9
+                              }
+                            : {})
+                        }),
+                      // Headless import has no renderer to approve the preview; the caller's
+                      // explicit --non-interactive flag is the confirmation.
+                      nonInteractive
+                        ? undefined
+                        : async (preview, budgetSignal) => {
+                            await this.operations.waitForImport(
+                              { preview, filename: basename(input) },
+                              budgetSignal
+                            )
+                            confirmed = true
+                            signal.throwIfAborted()
+                          },
+                      target
+                    )
+                    .catch((error: unknown) => {
+                      if (error instanceof PackageImportRecoveryRequiredError)
+                        importFile!.recovery = error
+                      throw error
+                    })
                 )
               )
-              this.operations.completeResult({ imported: result })
-              try {
-                await this.options.afterImport(result, originClientId, !target.projectId)
-              } catch (error) {
-                createLogger('session-package').warn(
-                  'Imported Session notification failed',
-                  diagnosticErrorFields(error)
-                )
-              }
-              return result
+              return completeImport(result)
             }, undefined)
           } finally {
             release?.()
           }
         },
-        target
+        target,
+        () => Boolean(importFile?.recovery),
+        useCase
       )
-      .catch((error) => {
+      .then(async (result) => {
+        await importFile?.onReleased?.()
+        return result
+      })
+      .catch(async (error) => {
+        if (!importFile) await releaseSource?.()
         if (
           operationSignal?.aborted &&
           !this.shutdown.signal.aborted &&
-          !this.operations.snapshot?.result?.recovery
-        )
+          !this.operations.snapshot?.result?.recovery &&
+          !importFile?.recovery
+        ) {
+          await importFile?.onReleased?.()
           return null
+        }
         throw error
       })
   }

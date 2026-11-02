@@ -1,8 +1,16 @@
 // @vitest-environment jsdom
+import { createLiteratureTestRenderer } from '../../../../../test/renderer/literature'
 import type { LiteratureSourceRecordView } from '@aipoch/literature-library/contracts'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { LiteratureSources } from './LiteratureSources'
+
+const { render } = createLiteratureTestRenderer({
+  get api() {
+    return window.api
+  },
+  onRecovered: () => () => {}
+})
 
 const record: LiteratureSourceRecordView = {
   id: 'source-1',
@@ -46,9 +54,9 @@ describe('LiteratureSources', () => {
     render(<LiteratureSources itemId="item-1" />)
     await toggle('Metadata sources')
     expect(await screen.findByRole('alert')).not.toBeNull()
-    expect(screen.queryByText('No saved metadata sources for this reference.')).toBeNull()
+    expect(screen.queryByText('No sources saved')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
-    expect(await screen.findByText('No saved metadata sources for this reference.')).not.toBeNull()
+    expect(await screen.findByText('No sources saved')).not.toBeNull()
     expect(screen.queryByRole('alert')).toBeNull()
     expect(sources).toHaveBeenCalledTimes(2)
   })

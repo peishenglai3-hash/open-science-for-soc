@@ -14,8 +14,8 @@ import {
 } from '../acp/permission-profile-controller'
 import type { PermissionProfileId } from '../../shared/permission-profiles'
 import { augmentedPathEnv } from '../settings/shell-path'
-import type { ModelReasoningEffort } from '../../shared/reasoning-effort'
-import type { OfficialVendorId } from '../../shared/provider-registry'
+import type { ModelReasoningEffort, OfficialVendorId } from '@aipoch/providers'
+
 import {
   CODEX_ACP_CONFIGURABLE_PROVIDER_ID,
   type AgentFramework,
@@ -56,6 +56,7 @@ const CODEX_PROVIDER_ID = 'open-science'
 // filters, so file edits route through shell rather than the dedicated patch tool.)
 export const CODEX_BRIDGE_MODEL = 'gpt-5.4'
 const CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95
+const CODEX_AUTO_COMPACT_CONTEXT_WINDOW_PERCENT = 90
 const CODEX_NATIVE_MODEL_CATALOG_FILENAME_PREFIX = 'model-catalog-'
 const CODEX_BUNDLED_MODEL_IDS_BY_VERSION = {
   // Existing installations keep their verified catalog until the user explicitly updates.
@@ -196,16 +197,16 @@ const normalizeResponsesBaseUrl = (
 
 const resolveResponsesBaseUrl = (provider: {
   responsesBaseUrl?: string
-  openaiBaseUrl?: string
+  chatCompletionsBaseUrl?: string
   baseUrl?: string
 }): string | undefined => {
   const exactBase = provider.responsesBaseUrl?.trim()
-  const openAiBase = provider.openaiBaseUrl?.trim()
-  const base = exactBase || openAiBase || provider.baseUrl
+  const chatCompletionsBase = provider.chatCompletionsBaseUrl?.trim()
+  const base = exactBase || chatCompletionsBase || provider.baseUrl
   return normalizeResponsesBaseUrl(base, {
     // A custom provider's baseUrl is a root even when it has a path prefix (`/proxy`); only an
     // explicitly projected OpenAI base is already versioned. A native Responses base is exact.
-    appendVersionPath: !exactBase && !openAiBase
+    appendVersionPath: !exactBase && !chatCompletionsBase
   })
 }
 
@@ -218,17 +219,29 @@ const isOfficialOpenAiResponsesBase = (value: string | undefined): boolean => {
   }
 }
 
-// Just the model + reasoning-effort fields a Codex config can carry, with no provider plumbing.
+// Model settings shared by API and subscription sessions, with no provider plumbing.
 // The bridge path layers the open-science custom provider on top of this; the codex-isolated path
 // uses it on its own so codex-acp can drive the ChatGPT subscription with the user's selected
 // model from session start (issue #277).
 const buildCodexModelOptions = (input: {
   model?: string
+  contextWindow?: number
   reasoningEffort?: ModelReasoningEffort
 }): Record<string, unknown> => {
+  const contextWindow =
+    input.contextWindow && input.contextWindow > 0 ? input.contextWindow : undefined
   return {
     ...(input.model ? { model: input.model } : {}),
-    ...(input.reasoningEffort ? { model_reasoning_effort: input.reasoningEffort } : {})
+    ...(input.reasoningEffort ? { model_reasoning_effort: input.reasoningEffort } : {}),
+    ...(contextWindow
+      ? {
+          model_context_window: contextWindow,
+          // Override stale profile thresholds; Codex clamps this again after its model-window cap.
+          model_auto_compact_token_limit: Math.floor(
+            (contextWindow * CODEX_AUTO_COMPACT_CONTEXT_WINDOW_PERCENT) / 100
+          )
+        }
+      : {})
   }
 }
 
@@ -260,9 +273,6 @@ const buildCodexConfig = (provider: {
   const baseUrl = normalizeResponsesBaseUrl(provider.baseUrl, {
     appendVersionPath: !provider.preserveBaseUrl
   })
-  const contextWindow =
-    provider.contextWindow && provider.contextWindow > 0 ? provider.contextWindow : undefined
-
   return {
     ...buildCodexModelOptions(provider),
     // Model metadata can enable native delegation even when both feature flags are off.
@@ -270,14 +280,6 @@ const buildCodexConfig = (provider: {
     agents: { enabled: false },
     features: CODEX_DISABLED_NATIVE_FEATURES,
     memories: CODEX_DISABLED_NATIVE_MEMORY,
-    ...(contextWindow
-      ? {
-          model_context_window: contextWindow,
-          model_auto_compact_token_limit: Math.floor(
-            (contextWindow * CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT) / 100
-          )
-        }
-      : {}),
     ...codexSandboxWriteConfig(provider.grantedLocalRoots),
     model_provider: CODEX_PROVIDER_ID,
     model_providers: {
@@ -295,7 +297,7 @@ type CodexNativeModelCatalogInput = {
   model?: string
   vendorId?: OfficialVendorId
   baseUrl?: string
-  openaiBaseUrl?: string
+  chatCompletionsBaseUrl?: string
   responsesBaseUrl?: string
   nativeVersion?: string
   contextWindow?: number
@@ -318,7 +320,7 @@ const buildCodexNativeModelCatalogEntry = (provider: CodexNativeModelCatalogInpu
       : undefined
   const hasTrustedBundledMetadata =
     (provider.vendorId === 'openai' ||
-      isOfficialOpenAiResponsesBase(provider.openaiBaseUrl ?? provider.baseUrl)) &&
+      isOfficialOpenAiResponsesBase(provider.chatCompletionsBaseUrl ?? provider.baseUrl)) &&
     bundledModelIds?.includes(model ?? '') === true
   if (!model || hasTrustedBundledMetadata) return undefined
 
@@ -566,10 +568,18 @@ export const createCodexFramework = ({
       // session/set_config_option switch (issue #277).
       const modelOptions = buildCodexModelOptions({
         model: provider.model,
+        contextWindow: provider.contextWindow,
         reasoningEffort: ctx.reasoningEffort
       })
       const codexConfig = {
         ...modelOptions,
+        ...(ctx.skillDiscovery
+          ? {
+              skills: {
+                include_instructions: false
+              }
+            }
+          : {}),
         // Model metadata can enable native delegation even when both feature flags are off.
         // Codex 0.157.1 config::multi_agent_version_override requires agents.enabled=false.
         agents: { enabled: false },
@@ -590,7 +600,7 @@ export const createCodexFramework = ({
       }
     }
 
-    const bridge = ctx.responsesBridge
+    const bridge = ctx.responsesConnection
     const useChatBridge =
       bridge !== undefined &&
       bridge.kind !== 'responses-compatibility' &&
@@ -601,7 +611,7 @@ export const createCodexFramework = ({
     const useLocalResponsesEndpoint = useChatBridge || useNativeCompatibility
     const codexModel = useChatBridge ? CODEX_BRIDGE_MODEL : provider.model
     // A dual-endpoint vendor keeps its Anthropic route in `baseUrl` and its OpenAI Chat base in
-    // `openaiBaseUrl`. Native Responses may use a separate base, so prefer that when supplied.
+    // `chatCompletionsBaseUrl`. Native Responses may use a separate base, so prefer that when supplied.
     // The Chat bridge and the protocol-preserving native compatibility endpoint both expose a local
     // Responses URL.
     const responsesBaseUrl = useLocalResponsesEndpoint
@@ -650,6 +660,13 @@ export const createCodexFramework = ({
         grantedLocalRoots: ctx.grantedLocalRoots
       }),
       ...(useChatBridge ? { features: CODEX_CHAT_BRIDGE_FEATURES } : {}),
+      ...(ctx.skillDiscovery
+        ? {
+            skills: {
+              include_instructions: false
+            }
+          }
+        : {}),
       ...(modelCatalogPath ? { model_catalog_json: modelCatalogPath } : {}),
       ...(persistentSystemPrompt ? { developer_instructions: persistentSystemPrompt } : {})
     }
@@ -695,7 +712,14 @@ export const createCodexFramework = ({
 
   buildSessionSetup(ctx: SessionSetupContext): SessionSetup {
     const runtime = ctx.sessionOptions?.[OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION] as
-      { command?: string; entryPath?: string; root?: string; skillsDirectory?: string } | undefined
+      | {
+          command?: string
+          entryPath?: string
+          root?: string
+          skillsDirectory?: string
+          allowedNames?: string[]
+        }
+      | undefined
     const loaderAvailable =
       ctx.skillRuntimeScope !== undefined &&
       (ctx.skillRuntimeScope === 'all' || ctx.skillRuntimeScope.length > 0) &&

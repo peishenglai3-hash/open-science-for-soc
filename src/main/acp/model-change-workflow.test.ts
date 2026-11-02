@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import type { SessionPermissionProfileState } from '../../shared/permission-profiles'
 import type { AgentModelChangeTarget } from '../agent-framework'
-import { claudeCodeFramework } from '../agent-framework'
+import { claudeCodeFramework, getAgentFramework } from '../agent-framework'
 import type {
   AcpBackendGenerationOwner,
   AcpBackendGenerationView
@@ -58,7 +58,7 @@ type WorkflowHarness = {
   updateReasoningEffort: ReturnType<typeof vi.fn>
   updateAggregateModel: ReturnType<typeof vi.fn>
   setProviderTransportTarget: ReturnType<typeof vi.fn>
-  setAnthropicBridgeTarget: ReturnType<typeof vi.fn>
+  setMessagesBridgeTarget: ReturnType<typeof vi.fn>
   setBridgeReasoningEffort: ReturnType<typeof vi.fn>
   applyLiveEffort: ReturnType<typeof vi.fn>
   clearContext: ReturnType<typeof vi.fn>
@@ -71,7 +71,9 @@ type WorkflowHarness = {
   setReplayableImageHistory: (value: boolean) => void
 }
 
-const createHarness = (): WorkflowHarness => {
+const createHarness = (
+  backendOverrides: Partial<AcpBackendGenerationView> = {}
+): WorkflowHarness => {
   let busy = false
   let connected = true
   let providerReconnectPending = false
@@ -84,7 +86,8 @@ const createHarness = (): WorkflowHarness => {
     session: { model: 'model-a', modelRequired: false },
     prompt: { systemPromptAppends: [] },
     context: { model: 'model-a', supportsImageInput: false },
-    adapter: { nativeMcpEnabled: true, bridgeMcpAliasesEnabled: false }
+    adapter: { nativeMcpEnabled: true, bridgeMcpAliasesEnabled: false },
+    ...backendOverrides
   }
   let options = [modelOption()]
   const request = vi.fn(async (_method: unknown, params: unknown) => {
@@ -153,7 +156,7 @@ const createHarness = (): WorkflowHarness => {
   } as Pick<AcpBackendGenerationOwner, 'current' | 'updateModel' | 'updateReasoningEffort'>
 
   const setProviderTransportTarget = vi.fn(() => true)
-  const setAnthropicBridgeTarget = vi.fn(() => true)
+  const setMessagesBridgeTarget = vi.fn(() => true)
   const setBridgeReasoningEffort = vi.fn()
   const connectionResources = {
     epoch: 1,
@@ -163,7 +166,7 @@ const createHarness = (): WorkflowHarness => {
     get isShuttingDown() {
       return false
     },
-    get anthropicBridgeAvailable() {
+    get messagesBridgeAvailable() {
       return false
     },
     get providerTransportAvailable() {
@@ -171,7 +174,7 @@ const createHarness = (): WorkflowHarness => {
     },
     assertCurrentConnection: vi.fn(),
     setProviderTransportTarget,
-    setAnthropicBridgeTarget,
+    setMessagesBridgeTarget,
     setBridgeModelTarget: vi.fn(() => true),
     setBridgeReasoningEffort
   } as Pick<
@@ -179,11 +182,11 @@ const createHarness = (): WorkflowHarness => {
     | 'epoch'
     | 'connection'
     | 'isShuttingDown'
-    | 'anthropicBridgeAvailable'
+    | 'messagesBridgeAvailable'
     | 'providerTransportAvailable'
     | 'assertCurrentConnection'
     | 'setProviderTransportTarget'
-    | 'setAnthropicBridgeTarget'
+    | 'setMessagesBridgeTarget'
     | 'setBridgeModelTarget'
     | 'setBridgeReasoningEffort'
   >
@@ -226,7 +229,7 @@ const createHarness = (): WorkflowHarness => {
     updateReasoningEffort,
     updateAggregateModel,
     setProviderTransportTarget,
-    setAnthropicBridgeTarget,
+    setMessagesBridgeTarget,
     setBridgeReasoningEffort,
     applyLiveEffort,
     clearContext,
@@ -251,6 +254,60 @@ const createHarness = (): WorkflowHarness => {
 }
 
 describe('ACP model-change workflow', () => {
+  it.each(['codex-responses', 'codex-responses-compatibility', 'codex-bridge'] as const)(
+    'reconnects %s before applying a different context capacity',
+    async (route) => {
+      for (const [previous, next] of [
+        [1_050_000, 400_000],
+        [400_000, 1_050_000],
+        [undefined, 1_050_000],
+        [1_050_000, undefined]
+      ]) {
+        for (const model of ['model-a', 'model-b']) {
+          const harness = createHarness({
+            framework: getAgentFramework('codex'),
+            modelRoute: route,
+            context: { model: 'model-a', window: previous, supportsImageInput: false }
+          })
+          await expect(
+            harness.workflow.apply(
+              target(model, { frameworkId: 'codex', route, contextWindow: next })
+            )
+          ).resolves.toBe(true)
+          expect(harness.requestReconnect).toHaveBeenCalledOnce()
+          expect(harness.request).not.toHaveBeenCalled()
+          expect(harness.updateModel).not.toHaveBeenCalled()
+          expect(harness.clearContext).not.toHaveBeenCalled()
+          expect(harness.workflow.barrier).toBeUndefined()
+        }
+      }
+    }
+  )
+
+  it('keeps live Codex model changes when context capacity is unchanged', async () => {
+    const harness = createHarness({
+      framework: getAgentFramework('codex'),
+      modelRoute: 'codex-responses',
+      context: { model: 'model-a', window: 1_050_000, supportsImageInput: false }
+    })
+    await expect(
+      harness.workflow.apply(
+        target('model-b', {
+          frameworkId: 'codex',
+          route: 'codex-responses',
+          contextWindow: 1_050_000
+        })
+      )
+    ).resolves.toBe(true)
+    expect(harness.requestReconnect).not.toHaveBeenCalled()
+    expect(harness.updateModel).toHaveBeenCalledOnce()
+    expect(harness.clearContext).toHaveBeenCalledOnce()
+    expect(harness.beginContext).toHaveBeenCalledWith(
+      'app-session',
+      expect.objectContaining({ model: 'model-b' })
+    )
+  })
+
   it('rejects an incompatible target without arming admission', async () => {
     const harness = createHarness()
     harness.setConnected(false)
@@ -336,13 +393,13 @@ describe('ACP model-change workflow', () => {
 
   it('reconnects when the current generation lacks a projected Anthropic target', async () => {
     const harness = createHarness()
-    harness.setAnthropicBridgeTarget.mockReturnValue(false)
+    harness.setMessagesBridgeTarget.mockReturnValue(false)
 
     await expect(
-      harness.workflow.apply(target('model-b', { anthropicBridgeTargetId: 'provider/model-b' }))
+      harness.workflow.apply(target('model-b', { messagesBridgeTargetId: 'provider/model-b' }))
     ).resolves.toBe(true)
 
-    expect(harness.setAnthropicBridgeTarget).toHaveBeenCalledWith('provider/model-b')
+    expect(harness.setMessagesBridgeTarget).toHaveBeenCalledWith('provider/model-b')
     expect(harness.requestReconnect).toHaveBeenCalledOnce()
     expect(harness.updateModel).not.toHaveBeenCalled()
   })

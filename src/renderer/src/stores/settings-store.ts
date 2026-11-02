@@ -13,7 +13,8 @@ import {
   configuredModelKey
 } from '../../../shared/configured-model-catalog'
 import type { PackageMirror } from '../../../shared/mirror'
-import type { ChatApiEndpoint, ReasoningEffort } from '../../../shared/model-preference-contract'
+import type { ModelProtocol, OfficialVendorId } from '@aipoch/providers'
+import type { ReasoningEffort } from '../../../shared/model-preference-contract'
 import {
   DEFAULT_NETWORK_PROXY_SETTINGS,
   type NetworkProxySettings
@@ -25,7 +26,7 @@ import {
   getDefaultPermissionProfile,
   type PermissionProfileId
 } from '../../../shared/permission-profiles'
-import type { OfficialVendorId } from '../../../shared/provider-registry'
+
 import type {
   AgentFrameworkId,
   AgentFrameworkView,
@@ -135,6 +136,7 @@ type SettingsStoreData = RuntimeSetupState &
     // Configured package mirror (conda/pip); undefined means automatic mirror selection.
     packageMirror?: PackageMirror
     networkProxy: NetworkProxySettings
+    notebookFolderRestrictionEnabled?: boolean
     notebookNetwork: NotebookNetworkSettings
     // Reasoning-effort preference applied to agent requests; 'default' leaves the agent's own default.
     reasoningEffort: ReasoningEffort
@@ -208,6 +210,7 @@ export const createInitialSettingsState = (): SettingsStoreData => ({
   encryptionAvailable: false,
   packageMirror: undefined,
   networkProxy: DEFAULT_NETWORK_PROXY_SETTINGS,
+  notebookFolderRestrictionEnabled: true,
   notebookNetwork: DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
   reasoningEffort: DEFAULT_REASONING_EFFORT,
   reviewerModel: { mode: 'inherit' },
@@ -238,6 +241,7 @@ const applySnapshot = (snapshot: SettingsSnapshot): Partial<SettingsStoreData> =
   onboardingCompletedAt: snapshot.onboardingCompletedAt,
   packageMirror: isMirrorConfigured(snapshot.packageMirror) ? snapshot.packageMirror : undefined,
   networkProxy: snapshot.networkProxy ?? DEFAULT_NETWORK_PROXY_SETTINGS,
+  notebookFolderRestrictionEnabled: snapshot.notebookFolderRestrictionEnabled !== false,
   notebookNetwork: snapshot.notebookNetwork ?? DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
   reasoningEffort: snapshot.reasoningEffort,
   reviewerModel: snapshot.reviewerModel ?? { mode: 'inherit' },
@@ -291,11 +295,11 @@ const mergeSnapshot = (
 
 // Stable fallback reference so the selector returns the same array identity across renders
 // (a fresh literal would make useSettingsStore re-render every tick and loop).
-const DEFAULT_FRAMEWORK_API_ENDPOINTS: ChatApiEndpoint[] = ['anthropic']
+const DEFAULT_FRAMEWORK_API_ENDPOINTS: ModelProtocol[] = ['messages']
 
 // The chat endpoints the currently-selected agent framework can drive; a provider is only usable when
 // it shares one. Defaults to Anthropic /v1/messages before the framework list has loaded.
-export const selectFrameworkApiEndpoints = (state: SettingsStoreData): ChatApiEndpoint[] =>
+export const selectFrameworkApiEndpoints = (state: SettingsStoreData): ModelProtocol[] =>
   state.agentFrameworks.find((framework) => framework.id === state.agentFrameworkId)
     ?.supportedApiTypes ?? DEFAULT_FRAMEWORK_API_ENDPOINTS
 
@@ -459,7 +463,7 @@ const createSettingsStoreState = (
         await get().detectCodex()
       } else if (id === 'codebuddy') {
         await get().detectCodeBuddy()
-      } else {
+      } else if (id === 'claude-code') {
         await get().detectClaude()
       }
       await get().refreshPreflight()

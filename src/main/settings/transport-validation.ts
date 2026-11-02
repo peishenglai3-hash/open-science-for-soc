@@ -1,4 +1,5 @@
 import type { ReasoningEffort } from '../../shared/model-preference-contract'
+import { isAgentFrameworkId } from '../../shared/agent-framework-id'
 import { isPermissionProfileId, type PermissionProfileId } from '../../shared/permission-profiles'
 import {
   isAppIconVariant,
@@ -18,6 +19,12 @@ const readField = (value: unknown, field: string): unknown =>
   typeof value === 'object' && value !== null
     ? (value as Readonly<Record<string, unknown>>)[field]
     : undefined
+
+const readNotebookFolderRestrictionEnabled = (request: unknown): boolean => {
+  const enabled = readField(request, 'enabled')
+  if (typeof enabled !== 'boolean') throw new Error('Invalid Notebook folder restriction flag.')
+  return enabled
+}
 
 const readNotificationsEnabled = (request: unknown): boolean => {
   const enabled = readField(request, 'enabled')
@@ -89,10 +96,7 @@ const readAgentRouting = (request: unknown): SetAgentRoutingRequest => {
   if (!Object.keys(value).every((key) => ['framework', 'reviewer', 'subagent'].includes(key))) {
     throw new Error('Invalid Agent routing update.')
   }
-  if (
-    value.framework !== undefined &&
-    !['claude-code', 'opencode', 'codex', 'codebuddy'].includes(String(value.framework))
-  ) {
+  if (value.framework !== undefined && !isAgentFrameworkId(value.framework)) {
     throw new Error(`Unknown Agent Framework: ${String(value.framework)}`)
   }
   return {
@@ -254,6 +258,7 @@ export {
   readDefaultPermissionProfile,
   readGitHubToken,
   readIsolatedClaudeToken,
+  readNotebookFolderRestrictionEnabled,
   readNotificationsEnabled,
   readProjectFilesFilter,
   readReasoningEffort,

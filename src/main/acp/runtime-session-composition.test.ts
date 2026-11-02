@@ -1,3 +1,4 @@
+import { SandboxNetworkApprovalOwner } from './sandbox-network-approval-owner'
 import { resolve } from 'node:path'
 
 import { describe, expect, it, vi } from 'vitest'
@@ -9,6 +10,63 @@ import { composeAcpRuntimeBaseOwners } from './runtime-base-composition'
 import { composeAcpRuntimeSessionOwners } from './runtime-session-composition'
 
 describe('ACP Runtime session composition', () => {
+  it('shares the host network approval owner across provider runtimes', () => {
+    const networkApprovalOwner = new SandboxNetworkApprovalOwner()
+    const options = {
+      appVersion: 'test',
+      defaultCwd: '/workspace',
+      permissionWait: {
+        networkApprovalOwner,
+        sessions: {
+          readSessionRuntimeContext: async () => ({ version: 1 as const, revision: 0 }),
+          patchSessionRuntimeContext: async () => ({ version: 1 as const, revision: 0 }),
+          containsMessageOnActiveBranch: async () => false,
+          loadSessionForContinuation: async (): Promise<never> => {
+            throw new Error('Not loaded')
+          }
+        }
+      }
+    }
+    const first = composeAcpRuntimeSessionOwners(options, composeAcpRuntimeBaseOwners(options))
+    const second = composeAcpRuntimeSessionOwners(options, composeAcpRuntimeBaseOwners(options))
+    expect(first.sandboxNetworkApprovalOwner).toBe(networkApprovalOwner)
+    expect(second.sandboxNetworkApprovalOwner).toBe(networkApprovalOwner)
+  })
+
+  it.each([true, false])(
+    'publishes pending native questions and settlement to subscribers (incremental: %s)',
+    async (incremental) => {
+      const onStateChanged = vi.fn()
+      const options = {
+        appVersion: 'test',
+        defaultCwd: '/workspace',
+        callbacks: { onStateChanged, ...(incremental ? { onEvent: vi.fn() } : {}) }
+      }
+      const owners = composeAcpRuntimeSessionOwners(options, composeAcpRuntimeBaseOwners(options))
+      const answer = owners.elicitationOwner.request(
+        {
+          mode: 'form',
+          sessionId: 'provider-session',
+          toolCallId: 'question-tool',
+          message: 'Choose an approach',
+          requestedSchema: {
+            type: 'object',
+            properties: { approach: { type: 'string' } },
+            required: ['approach']
+          }
+        },
+        { sessionId: 'app-session' }
+      )
+      expect(onStateChanged.mock.lastCall?.[0].pendingElicitations).toEqual([
+        expect.objectContaining({ sessionId: 'app-session', toolCallId: 'question-tool' })
+      ])
+      const request = owners.elicitationOwner.getPendingRequests()[0]
+      owners.elicitationOwner.respond({ requestId: request.requestId, action: 'cancel' })
+      await expect(answer).resolves.toEqual({ action: 'cancel' })
+      expect(onStateChanged.mock.lastCall?.[0].pendingElicitations).toEqual([])
+    }
+  )
+
   it.each(['allow-once', 'always-allow', 'deny'])(
     'removes a cancelled network approval before another %s submission',
     async (optionId) => {

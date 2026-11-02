@@ -31,6 +31,8 @@ export type PythonLibraryMethodEffect = {
   callbackKeywords?: string[]
   callbackPositionalKeywords?: Record<number, string>
   callbackContainerKeywords?: string[]
+  // Literal records (or sequences of records) invoke only these named fields.
+  callbackRecordKeywords?: Record<string, readonly string[]>
   callbackStringValues?: Record<string, readonly string[]>
   callbackAllKeywords?: boolean
   possiblyMutatesFirstArgument?: boolean
@@ -942,6 +944,7 @@ const PYTHON_LIBRARY_EFFECTS: PythonLibraryEffects = {
       },
       read_csv: {
         effect: 'read',
+        callbackKeywords: ['converters', 'usecols', 'skiprows', 'on_bad_lines'],
         callbackContainerKeywords: ['converters'],
         returnType: 'pandas.DataFrame',
         possiblyMutatesFirstArgument: true,
@@ -967,6 +970,8 @@ const PYTHON_LIBRARY_EFFECTS: PythonLibraryEffects = {
       },
       read_fwf: {
         effect: 'read',
+        callbackKeywords: ['converters', 'usecols', 'skiprows', 'on_bad_lines'],
+        callbackContainerKeywords: ['converters'],
         returnType: 'pandas.DataFrame',
         possiblyMutatesFirstArgument: true,
         firstArgumentKeyword: 'filepath_or_buffer'
@@ -1038,12 +1043,16 @@ const PYTHON_LIBRARY_EFFECTS: PythonLibraryEffects = {
       },
       read_table: {
         effect: 'read',
+        callbackKeywords: ['converters', 'usecols', 'skiprows', 'on_bad_lines'],
+        callbackContainerKeywords: ['converters'],
         returnType: 'pandas.DataFrame',
         possiblyMutatesFirstArgument: true,
         firstArgumentKeyword: 'filepath_or_buffer'
       },
       read_xml: {
         effect: 'read',
+        callbackKeywords: ['converters'],
+        callbackContainerKeywords: ['converters'],
         returnType: 'pandas.DataFrame',
         possiblyMutatesFirstArgument: true,
         firstArgumentKeyword: 'path_or_buffer'
@@ -1193,7 +1202,9 @@ const PYTHON_LIBRARY_EFFECTS: PythonLibraryEffects = {
       },
       chi2_contingency: { effect: 'read' },
       mannwhitneyu: { effect: 'read' },
-      pearsonr: { effect: 'read' },
+      // Non-default method objects may contain arbitrary sample callbacks.
+      // Call-site specialization closes only the default analytic path.
+      pearsonr: { effect: 'read', callbackKeywords: ['method'] },
       spearmanr: { effect: 'read' },
       ttest_1samp: { effect: 'read' },
       ttest_ind: { effect: 'read' },
@@ -1264,23 +1275,32 @@ const PYTHON_LIBRARY_EFFECTS: PythonLibraryEffects = {
     kind: 'module',
     methods: {
       minimize: {
-        // Objective and gradient callbacks may perform I/O or mutate captures.
-        // Preserve these known dependencies without certifying solver results
-        // or complete coverage of its other callback-capable options.
+        // Objective, derivatives, custom methods and progress callbacks may
+        // perform I/O or mutate captures. Literal constraint records expose
+        // fun/jac callbacks; stored records and constraint objects remain opaque.
         effect: 'unknown',
         scopedOpaque: true,
         externalState: true,
-        callbackKeywords: ['fun', 'jac'],
-        callbackPositionalKeywords: { 0: 'fun', 4: 'jac' }
+        callbackKeywords: ['fun', 'method', 'jac', 'hess', 'hessp', 'callback', 'constraints'],
+        callbackRecordKeywords: { constraints: ['fun', 'jac'] },
+        callbackPositionalKeywords: {
+          0: 'fun',
+          3: 'method',
+          4: 'jac',
+          5: 'hess',
+          6: 'hessp',
+          8: 'constraints',
+          10: 'callback'
+        }
       },
       root_scalar: {
-        // The objective can read files or mutate arguments and captured state.
+        // The objective and derivative callbacks can read files or mutate captures.
         // Preserve known captures without certifying results or complete callback I/O.
         effect: 'unknown',
         scopedOpaque: true,
         externalState: true,
-        callbackKeywords: ['f'],
-        callbackPositionalKeywords: { 0: 'f' }
+        callbackKeywords: ['f', 'fprime', 'fprime2'],
+        callbackPositionalKeywords: { 0: 'f', 4: 'fprime', 5: 'fprime2' }
       },
       curve_fit: {
         // Model and Jacobian callbacks may perform I/O or mutate captures.
@@ -1750,7 +1770,8 @@ const PYTHON_LIBRARY_EFFECTS: PythonLibraryEffects = {
       to_csv: {
         effect: 'read',
         possiblyMutatesFirstArgument: true,
-        possiblyMutatesKeyword: 'path_or_buf'
+        possiblyMutatesKeyword: 'path_or_buf',
+        callbackKeywords: ['float_format']
       },
       to_excel: {
         effect: 'read',
@@ -1765,7 +1786,8 @@ const PYTHON_LIBRARY_EFFECTS: PythonLibraryEffects = {
       to_json: {
         effect: 'read',
         possiblyMutatesFirstArgument: true,
-        possiblyMutatesKeyword: 'path_or_buf'
+        possiblyMutatesKeyword: 'path_or_buf',
+        callbackKeywords: ['default_handler']
       },
       to_html: { effect: 'read' },
       to_latex: { effect: 'read' },
@@ -1911,7 +1933,8 @@ const PYTHON_LIBRARY_EFFECTS: PythonLibraryEffects = {
       to_csv: {
         effect: 'read',
         possiblyMutatesFirstArgument: true,
-        possiblyMutatesKeyword: 'path_or_buf'
+        possiblyMutatesKeyword: 'path_or_buf',
+        callbackKeywords: ['float_format']
       },
       to_dict: {
         effect: 'read',

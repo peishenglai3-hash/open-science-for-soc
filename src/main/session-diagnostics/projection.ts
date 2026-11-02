@@ -1,4 +1,5 @@
 import { diagnosticText, projectDiagnosticError, type DiagnosticTextOptions } from './detail'
+import { AGENT_FRAMEWORK_ID_VALUES, isAgentFrameworkId } from '../../shared/agent-framework-id'
 
 /** Diagnostic projections keep only known evidence fields and bounded redacted error text. */
 type ObjectValue = Record<string, unknown>
@@ -7,7 +8,7 @@ const object = (value: unknown): ObjectValue =>
 const identifier = (value: unknown): value is string =>
   typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$/.test(value)
 const numbers =
-  'endedAt askedAt acceptedAt uncertainAt dispatchStartedAt sequence laneSequence queuedAt callIndex version schemaVersion number revision createdAt updatedAt completedAt failedAt startedAt archivedAt sortIndex index inputTokens cacheTokens cachedReadTokens cachedWriteTokens outputTokens turnCount contextUsedTokens contextWindowSize terminalExitCode computeConcurrencyLimit round maxRounds respondedAt'.split(
+  'settledAt endedAt acceptedAt uncertainAt dispatchStartedAt sequence laneSequence queuedAt callIndex version schemaVersion number revision createdAt updatedAt completedAt failedAt startedAt archivedAt sortIndex index inputTokens cacheTokens cachedReadTokens cachedWriteTokens outputTokens turnCount contextUsedTokens contextWindowSize terminalExitCode computeConcurrencyLimit round maxRounds respondedAt'.split(
     ' '
   )
 const identities =
@@ -62,9 +63,9 @@ const states: Record<string, readonly string[]> = {
   cause: ['app-restart', 'cancelled', 'connection-lost'],
   originBindingState: ['root', 'validated', 'legacy-unavailable'],
   toolDisposition: ['declined', 'permission-closed'],
-  agentFrameworkId: ['claude-code', 'opencode', 'codex', 'codebuddy'],
-  frameworkId: ['claude-code', 'opencode', 'codex', 'codebuddy'],
-  previousFrameworkId: ['claude-code', 'opencode', 'codex', 'codebuddy'],
+  agentFrameworkId: AGENT_FRAMEWORK_ID_VALUES,
+  frameworkId: AGENT_FRAMEWORK_ID_VALUES,
+  previousFrameworkId: AGENT_FRAMEWORK_ID_VALUES,
   reasoningEffort: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
   runtimeTranscriptOwner: ['main'],
   delegationPolicy: ['allow', 'deny'],
@@ -98,9 +99,9 @@ function fields(value: unknown, options: DiagnosticTextOptions): ObjectValue {
     'autoReviewEnabled',
     'memoryEnabled',
     'specialistBindingPending',
-    'errorReportable',
     'branchContextResetRequired',
-    'continuationPending'
+    'continuationPending',
+    'retryable'
   ])
     if (typeof source[key] === 'boolean') result[key] = source[key]
   for (const key of [
@@ -127,6 +128,32 @@ function fields(value: unknown, options: DiagnosticTextOptions): ObjectValue {
     if (source[key] !== undefined) {
       const error = projectDiagnosticError(source[key], options)
       if (error) result[key] = error
+    }
+  }
+  const failure = object(source.failure)
+  if (
+    ['configuration', 'service', 'environment', 'input', 'session', 'internal'].includes(
+      String(failure.category)
+    )
+  ) {
+    const evidence = object(failure.diagnostics)
+    const diagnostics: ObjectValue = {}
+    if (
+      typeof evidence.status === 'number' &&
+      Number.isInteger(evidence.status) &&
+      evidence.status >= 100 &&
+      evidence.status <= 599
+    )
+      diagnostics.status = evidence.status
+    for (const key of ['code', 'provider', 'model', 'requestId', 'raw'])
+      if (typeof evidence[key] === 'string')
+        diagnostics[key] = diagnosticText(evidence[key], options, key === 'raw' ? 4000 : 200)
+    result.failure = {
+      category: failure.category,
+      ...(typeof failure.reason === 'string'
+        ? { reason: diagnosticText(failure.reason, options, 200) }
+        : {}),
+      diagnostics
     }
   }
   // Model routing identifiers are protocol metadata, never arbitrary configuration objects.
@@ -176,6 +203,7 @@ export function projectDiagnosticSession(
     }
     if (depth < 4)
       for (const key of [
+        'turnOutcome',
         'receipt',
         'resolvedAgent',
         'executionModel',
@@ -187,6 +215,7 @@ export function projectDiagnosticSession(
         'relayedFrom',
         'delegatedCallerSource',
         'elicitation',
+        'continuationRecovery',
         'durable',
         'provenanceContext',
         'runtimeTranscriptReviewOwner'
@@ -297,6 +326,7 @@ const permissionLogStates: Record<string, readonly string[]> = {
     'opencode-anthropic',
     'opencode-openai',
     'codebuddy-openai',
+    'pi',
     'codex-responses',
     'codex-responses-compatibility',
     'codex-bridge'
@@ -380,6 +410,22 @@ export function projectDiagnosticLog(
   }
   for (const key of diagnosticStringFields)
     if (typeof data[key] === 'string') diagnostic[key] = diagnosticText(data[key], options, 1_000)
+  if (
+    data.operation === 'specialist-resolution' ||
+    data.operation === 'acp-provider-session-adoption'
+  ) {
+    for (const key of ['specialistId', 'backendId'])
+      if (identifier(data[key])) diagnostic[key] = diagnosticText(data[key], options, 200)
+    if (isAgentFrameworkId(data.frameworkId)) diagnostic.frameworkId = data.frameworkId
+    if (permissionLogStates.modelRoute.includes(data.modelRoute as string))
+      diagnostic.modelRoute = data.modelRoute
+    if (['identity', 'skills'].includes(data.resolver as string))
+      diagnostic.resolver = data.resolver
+    if (['request', 'registry'].includes(data.bindingSource as string))
+      diagnostic.bindingSource = data.bindingSource
+    if (Number.isSafeInteger(data.bindingRevision) && Number(data.bindingRevision) >= 0)
+      diagnostic.bindingRevision = data.bindingRevision
+  }
   if (data.authorityStatus === 'missing' || data.authorityStatus === 'unreadable')
     diagnostic.authorityStatus = data.authorityStatus
   for (const key of ['hydrationAvailable', 'startupCleanupEligible', 'metadataComplete'])

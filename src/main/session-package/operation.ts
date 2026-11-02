@@ -11,9 +11,11 @@ import {
   PACKAGE_MAX_IO_BYTES_PER_SECOND,
   PACKAGE_MIN_IO_BYTES_PER_SECOND,
   PACKAGE_MAX_FILE_BYTES,
-  formatPackageBytes
+  formatPackageBytes,
+  packageImportPercent
 } from '../../shared/session-package'
 import type {
+  BrowserPackageTransfer,
   PackageOperationRequest,
   PackageOperationSnapshot,
   PackageProgress,
@@ -36,10 +38,9 @@ export class SessionPackageOperation {
   private importResponse?: (target?: SessionPackageImportRequest) => void
   private pendingImports: NonNullable<PackageOperationSnapshot['pendingImports']> = []
   private importQueueFull = false
+  private browserTransfers: BrowserPackageTransfer[] = []
   private selection?: (selection: PackageFileSelection) => void
   private lastProgressAt = 0
-  private autoRate = PACKAGE_DEFAULT_IO_BYTES_PER_SECOND
-  private autoAdjustedAt = 0
   private completion: Promise<unknown> = Promise.resolve()
   async close(): Promise<void> {
     this.cancel()
@@ -53,6 +54,7 @@ export class SessionPackageOperation {
     return this.current
       ? structuredClone({
           ...this.current,
+          browserTransfers: this.browserTransfers,
           pendingImports: this.pendingImports,
           importQueueFull: this.importQueueFull
         })
@@ -62,22 +64,34 @@ export class SessionPackageOperation {
     return this.controller !== undefined
   }
 
+  // Stream backpressure already follows slow storage. CPU/validation pauses must not lower
+  // the next I/O stage's budget based on a throttled throughput sample.
   get transferBytesPerSecond(): number {
-    return this.current?.transferBytesPerSecond ?? this.autoRate
+    return this.current?.transferBytesPerSecond ?? PACKAGE_DEFAULT_IO_BYTES_PER_SECOND
+  }
+
+  // Download presentation stays on the originating card until verified bytes are handed to import.
+  reportUseCaseDownload(completedBytes: number, totalBytes: number): void {
+    if (!this.current?.useCaseDownload || !this.controller) return
+    const firstBytes = this.current.useCaseDownload.completedBytes === 0 && completedBytes > 0
+    this.current = {
+      ...this.current,
+      useCaseDownload: { ...this.current.useCaseDownload, completedBytes, totalBytes }
+    }
+    if (firstBytes || completedBytes === totalBytes || Date.now() - this.lastProgressAt >= 150) {
+      this.lastProgressAt = Date.now()
+      this.publish()
+    }
+  }
+
+  finishUseCaseDownload(): void {
+    if (!this.current?.useCaseDownload) return
+    this.current = { ...this.current, useCaseDownload: undefined }
+    this.publish()
   }
 
   reportIo = (ioBytesPerSecond: number): void => {
     if (!this.current || !this.controller) return
-    if (this.current.transferBytesPerSecond === undefined && ioBytesPerSecond > 0) {
-      const now = Date.now()
-      if (now - this.autoAdjustedAt >= 2_000) {
-        if (ioBytesPerSecond >= this.autoRate * 0.85)
-          this.autoRate = Math.min(PACKAGE_MAX_IO_BYTES_PER_SECOND, this.autoRate * 2)
-        else if (ioBytesPerSecond < this.autoRate * 0.6)
-          this.autoRate = Math.max(PACKAGE_DEFAULT_IO_BYTES_PER_SECOND, this.autoRate / 2)
-        this.autoAdjustedAt = now
-      }
-    }
     this.current = { ...this.current, ioBytesPerSecond }
     if (Date.now() - this.lastProgressAt >= 150) {
       this.lastProgressAt = Date.now()
@@ -96,7 +110,15 @@ export class SessionPackageOperation {
   }
   report = (progress: PackageProgress): void => {
     if (!this.current || !this.controller) return
-    const phaseChanged = progress.phase !== this.current.progress.phase
+    const previous = this.current.progress
+    const phaseChanged =
+      progress.phase !== previous.phase || progress.importStage !== previous.importStage
+    if (this.current.kind === 'import' && progress.phase !== 'cleaning') {
+      const percent =
+        progress.overallPercent ?? packageImportPercent(progress) ?? previous.overallPercent
+      if (percent !== undefined)
+        progress = { ...progress, overallPercent: Math.max(previous.overallPercent ?? 0, percent) }
+    }
     this.current = { ...this.current, progress }
     this.observeDiagnostics()
     if (phaseChanged || Date.now() - this.lastProgressAt >= 150) {
@@ -147,6 +169,45 @@ export class SessionPackageOperation {
       presentationRevision: (this.current.presentationRevision ?? 0) + 1
     }
     this.publish()
+  }
+
+  setBrowserTransfers(transfers: BrowserPackageTransfer[]): void {
+    const added = transfers.some((t) => !this.browserTransfers.some((old) => old.id === t.id))
+    const boundary =
+      transfers.length !== this.browserTransfers.length ||
+      transfers.some((t, i) => {
+        const previous = this.browserTransfers[i]
+        return (
+          t.id !== previous?.id ||
+          t.state !== previous.state ||
+          t.cleanupPending !== previous.cleanupPending ||
+          (t.completedBytes === t.totalBytes && previous.completedBytes !== t.completedBytes)
+        )
+      })
+    this.browserTransfers = transfers
+    // Receipt presentation does not acquire the single import/export operation owner.
+    if (!this.current || this.current.browserReceiptOnly) {
+      if (!this.current && !transfers.length) return
+      this.current = {
+        id: this.current?.id ?? randomUUID(),
+        kind: 'import',
+        browserReceiptOnly: true,
+        state: transfers.some(
+          (t) => (t.state !== 'cancelled' && t.state !== 'failed') || t.cleanupPending
+        )
+          ? 'running'
+          : transfers.some((t) => t.state === 'failed')
+            ? 'failed'
+            : 'cancelled',
+        progress: { phase: 'preparing' },
+        presentationRevision: this.current?.presentationRevision ?? 0
+      }
+    }
+    if (added || boundary || Date.now() - this.lastProgressAt >= 150) {
+      this.lastProgressAt = Date.now()
+      if (added) this.present()
+      else this.publish()
+    }
   }
 
   setPendingImports(
@@ -216,7 +277,7 @@ export class SessionPackageOperation {
       importFilename: input.filename ?? this.current.importFilename,
       importPreview: input.preview,
       state: 'awaiting-selection',
-      progress: { phase: input.preview ? 'confirming' : 'selecting' }
+      progress: { ...this.current.progress, phase: input.preview ? 'confirming' : 'selecting' }
     }
     this.publish()
     return pending
@@ -279,10 +340,6 @@ export class SessionPackageOperation {
           request.bytesPerSecond > PACKAGE_MAX_IO_BYTES_PER_SECOND)
       )
         throw new Error('Invalid package transfer rate.')
-      if (request.bytesPerSecond === null) {
-        this.autoRate = PACKAGE_DEFAULT_IO_BYTES_PER_SECOND
-        this.autoAdjustedAt = Date.now()
-      }
       this.current = {
         ...this.current,
         ...(request.bytesPerSecond === null
@@ -401,19 +458,20 @@ export class SessionPackageOperation {
     kind: PackageOperationSnapshot['kind'],
     session: SessionPackageRequest | undefined,
     work: (signal: AbortSignal) => Promise<T>,
-    importTarget?: PackageOperationSnapshot['importTarget']
+    importTarget?: PackageOperationSnapshot['importTarget'],
+    requiresRecovery?: () => boolean,
+    downloadSlug?: string
   ): Promise<T> {
     if (this.controller) throw new Error('A Session package operation is already in progress.')
     const controller = new AbortController()
     this.controller = controller
-    this.autoRate = PACKAGE_DEFAULT_IO_BYTES_PER_SECOND
-    this.autoAdjustedAt = Date.now()
     this.current = {
       id: randomUUID(),
       kind,
       session,
       importTarget,
       state: 'running',
+      ...(downloadSlug ? { useCaseDownload: { slug: downloadSlug, completedBytes: 0 } } : {}),
       progress: { phase: 'preparing' }
     }
     this.diagnostic = startDiagnosticOperation(createLogger('session-package'), {
@@ -438,15 +496,16 @@ export class SessionPackageOperation {
       return result
     } catch (error) {
       const sensitiveContent = this.current?.sensitiveContent
+      // A cancelled transfer can still own a durable import that must remain retryable.
+      const recoveryRequired = this.current?.result?.recovery || requiresRecovery?.()
       this.current = {
         ...this.current!,
-        state:
-          controller.signal.aborted && !this.current?.result?.recovery ? 'cancelled' : 'failed',
+        state: controller.signal.aborted && !recoveryRequired ? 'cancelled' : 'failed',
         files: undefined,
         summary: undefined,
         importPreview: undefined,
         error:
-          controller.signal.aborted && !this.current?.result?.recovery
+          controller.signal.aborted && !recoveryRequired
             ? undefined
             : error instanceof Error
               ? error.message

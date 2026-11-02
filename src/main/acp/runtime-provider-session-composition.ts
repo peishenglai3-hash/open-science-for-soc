@@ -2,6 +2,7 @@ import type { ClientConnection } from '@agentclientprotocol/sdk'
 
 import { DEFAULT_UPLOAD_PROJECT_ID } from '../../shared/uploads'
 import type { AgentFramework } from '../agent-framework/types'
+import { assertMainAgentSessionResumeAllowed } from './main-agent-process-ownership'
 import { AcpProviderSessionAdopter } from './provider-session-adopter'
 import { AcpProviderSessionCreator } from './provider-session-creator'
 import { AcpProviderSessionResumer } from './provider-session-resumer'
@@ -103,6 +104,7 @@ const composeAcpRuntimeProviderSessionOwners = (
     resolveSpecialistIdentity: options.resolveSpecialistIdentity,
     resolveSpecialistSkills: options.resolveSpecialistSkills,
     resolveProjectAgentContext: options.resolveProjectAgentContext,
+    registerSessionSpecialist: options.notebook?.registerSessionSpecialist,
     peekClaudeReplay: (sessionId) => base.handoffContinuity.peekClaudeReplay(sessionId),
     updateCwd,
     emitState,
@@ -120,8 +122,8 @@ const composeAcpRuntimeProviderSessionOwners = (
       reserveIdentity(undefined, [sessionId], publishedAppSessionId),
     adopter: providerSessionAdopter,
     reconfigureSession: (request) => providerSessionResumer.reconfigure(request),
-    assertSkillScopeRefreshSupported: () =>
-      providerSessionResumer.assertSkillScopeRefreshSupported(),
+    assertSkillScopeRefreshSupported: (sessionId) =>
+      providerSessionResumer.assertSkillScopeRefreshSupported(sessionId),
     permission: session.permissionContext,
     elicitation: session.elicitationOwner,
     clearUserChoiceProvenanceForSession: runtime.clearUserChoiceProvenanceForSession,
@@ -161,6 +163,7 @@ const composeAcpRuntimeProviderSessionOwners = (
     currentConnection,
     ensureConnected,
     assertCurrentConnection,
+    assertResumeAllowed: options.spawnAgent ? undefined : assertMainAgentSessionResumeAllowed,
     disconnectTimedOutConnection: async () => {
       if (session.sessionRegistry.entries(true).length === 0) {
         await lifecycle.connectionClose.disconnect(false)
@@ -175,11 +178,14 @@ const composeAcpRuntimeProviderSessionOwners = (
     capabilityPolicy,
     configurator: base.sessionConfigurator,
     adopter: providerSessionAdopter,
-    clearLivePermissionProfile: (sessionId) =>
-      session.permissionContext.clearLivePermissionProfile(sessionId),
+    invalidatePermissionProfile: (sessionId) =>
+      session.permissionContext.invalidatePermissionProfile(sessionId),
+    setLivePermissionProfile: (sessionId, profile) =>
+      session.permissionContext.setLivePermissionProfile(sessionId, profile),
     resolveSpecialistIdentity: options.resolveSpecialistIdentity,
     resolveSpecialistSkills: options.resolveSpecialistSkills,
     resolveProjectAgentContext: options.resolveProjectAgentContext,
+    registerSessionSpecialist: options.notebook?.registerSessionSpecialist,
     updateCwd,
     pushEvent: (event) => session.publication.pushEvent(event),
     emitState,

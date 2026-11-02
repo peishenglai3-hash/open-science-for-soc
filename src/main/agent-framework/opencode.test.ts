@@ -7,6 +7,62 @@ import { buildOpencodeConfig, createOpencodeFramework, opencodeFramework } from 
 
 const fakeChild = {} as ChildProcessWithoutNullStreams
 
+it('generates a 2.x plugin that exposes app MCP identities without changing foreign servers', async () => {
+  const config = opencodeFramework.prepareModelConfig(
+    { type: 'custom', model: 'test', baseUrl: 'http://localhost/v1' },
+    {
+      storageRoot: '/data',
+      executablePath: '/runtime/opencode',
+      nativeVersion: '2.1.4'
+    }
+  )
+  const plugin = config.configFiles?.find((file) =>
+    file.path.endsWith(join('open-science-v2', 'index.ts'))
+  )
+  expect(plugin).toBeDefined()
+  const definition = new Function(
+    'Plugin',
+    plugin!.content.replace(/^import .*\n/, '').replace('export default', 'return')
+  )({ define: (value: unknown) => value })
+  const servers = new Map([
+    ['open_science_notebook', { codemode: true }],
+    ['open_science_host_message', { codemode: true }],
+    ['foreign', { codemode: true }]
+  ])
+  const hooks = new Map<string, () => Promise<void>>()
+  const list = vi
+    .fn()
+    .mockResolvedValueOnce([])
+    .mockResolvedValue([{ options: { namespace: 'open_science_notebook', codemode: false } }])
+  await definition.setup({
+    mcp: {
+      transform: async (apply: (editor: unknown) => void) => apply({ list: () => servers }),
+      list: async () => ({ data: [{ name: 'open_science_notebook' }, { name: 'foreign' }] })
+    },
+    tool: { list },
+    session: {
+      hook: async (name: string, callback: () => Promise<void>) => hooks.set(name, callback)
+    }
+  })
+  expect([...servers.values()].map((server) => server.codemode)).toEqual([false, false, true])
+  await hooks.get('prompt')!()
+  expect(list).toHaveBeenCalledTimes(2)
+  vi.useFakeTimers()
+  try {
+    list.mockResolvedValue([])
+    const blocked = expect(hooks.get('prompt')!()).rejects.toThrow('tools did not become ready')
+    await vi.advanceTimersByTimeAsync(10000)
+    await blocked
+  } finally {
+    vi.useRealTimers()
+  }
+
+  const overlay = JSON.parse(config.env!.OPENCODE_CONFIG_CONTENT)
+  expect(overlay.plugins).toContain(
+    join('/data', 'opencode', 'config', 'opencode', 'open-science-v2')
+  )
+})
+
 describe('opencodeFramework spawn seam', () => {
   it.each([
     {
@@ -53,6 +109,51 @@ describe('opencodeFramework spawn seam', () => {
   })
 })
 
+it.each(['darwin', 'linux', 'win32'] as const)(
+  'ignores inherited OpenCode config and plugin controls on %s while keeping the app configuration',
+  (platform) => {
+    const spawnProcess = vi.fn().mockReturnValue(fakeChild)
+    const sourceEnv = {
+      PATH: '/parent-bin',
+      OPENCODE_CONFIG: '/personal/opencode.json',
+      OPENCODE_CONFIG_DIR: '/personal/plugins',
+      OPENCODE_CONFIG_CONTENT: '{"plugin":["personal-plugin"]}',
+      OPENCODE_TEST_MANAGED_CONFIG_DIR: '/personal/managed',
+      OPENCODE_PLUGIN_META_FILE: '/personal/plugin-metadata.json',
+      OPENCODE_PURE: '1'
+    }
+    const inheritedEnv =
+      platform === 'win32'
+        ? Object.fromEntries(
+            Object.entries(sourceEnv).map(([key, value]) => [key.toLowerCase(), value])
+          )
+        : sourceEnv
+    const framework = createOpencodeFramework({ platform, sourceEnv: inheritedEnv, spawnProcess })
+    const config = framework.prepareModelConfig(
+      { type: 'custom', baseUrl: 'https://gw/v1', model: 'm', key: 'k' },
+      { storageRoot: '/data', executablePath: '/bin/opencode' }
+    )
+    framework.spawn({ executablePath: '/bin/opencode', args: [], env: config.env ?? {} })
+    const env = spawnProcess.mock.calls[0][2].env
+    for (const name of [
+      'OPENCODE_CONFIG',
+      'OPENCODE_CONFIG_DIR',
+      'OPENCODE_TEST_MANAGED_CONFIG_DIR',
+      'OPENCODE_PLUGIN_META_FILE',
+      'OPENCODE_PURE'
+    ]) {
+      expect(env).not.toHaveProperty(name)
+      expect(env).not.toHaveProperty(name.toLowerCase())
+    }
+    expect(inheritedEnv).toHaveProperty(
+      platform === 'win32' ? 'opencode_config' : 'OPENCODE_CONFIG'
+    )
+    expect(env.OPENCODE_CONFIG_CONTENT).toBe(config.env?.OPENCODE_CONFIG_CONTENT)
+    expect(env.OPENCODE_CONFIG_CONTENT).not.toContain('personal-plugin')
+    expect(env.OPENCODE_DISABLE_PROJECT_CONFIG).toBe('true')
+  }
+)
+
 describe('opencodeFramework.prepareModelConfig', () => {
   it('writes connector conventions and wires them into opencode.json instructions', () => {
     const config = opencodeFramework.prepareModelConfig(
@@ -64,12 +165,17 @@ describe('opencodeFramework.prepareModelConfig', () => {
       }
     )
 
-    const instructionsFile = config.configFiles?.find((file) => file.path.endsWith('connectors.md'))
+    const instructionsFile = config.configFiles?.find((file) =>
+      /connectors-[a-f0-9]+\.md$/.test(file.path)
+    )
     expect(instructionsFile?.content).toContain('host.mcp(')
 
     const opencodeJson = config.configFiles?.find((file) => file.path.endsWith('opencode.json'))
     const parsed = JSON.parse(opencodeJson?.content ?? '{}')
-    expect(parsed.instructions).toContain(instructionsFile?.path)
+    expect(parsed.instructions ?? []).toEqual([])
+    expect(JSON.parse(config.env?.OPENCODE_CONFIG_CONTENT ?? '{}').instructions).toContain(
+      instructionsFile?.path
+    )
   })
 
   it('writes stable app guidance to native instructions instead of a user prompt', () => {
@@ -86,13 +192,16 @@ describe('opencodeFramework.prepareModelConfig', () => {
     )
 
     const instructionsFile = config.configFiles?.find((file) =>
-      file.path.endsWith('open-science.md')
+      /open-science-[a-f0-9]+\.md$/.test(file.path)
     )
     expect(instructionsFile?.content).toBe(
       'Use `open_science_notebook_notebook_execute` from `open_science_notebook`.\n\nThen call `open_science_artifacts_write_artifact_file`.'
     )
     const opencodeJson = config.configFiles?.find((file) => file.path.endsWith('opencode.json'))
-    expect(JSON.parse(opencodeJson?.content ?? '{}').instructions).toContain(instructionsFile?.path)
+    expect(JSON.parse(opencodeJson?.content ?? '{}').instructions ?? []).toEqual([])
+    expect(JSON.parse(config.env?.OPENCODE_CONFIG_CONTENT ?? '{}').instructions).toContain(
+      instructionsFile?.path
+    )
     expect(config.persistentSystemPrompt).toBe(instructionsFile?.content)
     expect(
       opencodeFramework.buildSessionSetup({
@@ -102,13 +211,44 @@ describe('opencodeFramework.prepareModelConfig', () => {
     ).toEqual({ promptPrefix: 'turn-only reminder' })
   })
 
+  it('pins independent discovery, reference roots and immutable instructions for parallel scopes', () => {
+    const provider = { type: 'custom' as const, baseUrl: 'https://gw/v1', model: 'm' }
+    const config = (name: string): ReturnType<typeof opencodeFramework.prepareModelConfig> =>
+      opencodeFramework.prepareModelConfig(provider, {
+        storageRoot: '/data',
+        executablePath: '/bin/opencode',
+        instructions: `Scope: ${name}`,
+        skillDiscovery: {
+          allowedNames: [name],
+          allowedPaths: [`/data/opencode/config/opencode/skills/${name}/SKILL.md`]
+        }
+      })
+    const main = config('mcp-genes')
+    const specialist = config('mcp-orphadata')
+    const policy = JSON.parse(main.env!.OPENCODE_CONFIG_CONTENT!)
+    expect(policy.permission.skill).toEqual({ '*': 'deny', 'mcp-genes': 'ask' })
+    expect(policy.permission.external_directory).toEqual({
+      '*': 'deny',
+      [join('/data/opencode/config/opencode/skills/mcp-genes', '*')]: 'allow'
+    })
+    expect(JSON.stringify(policy)).not.toContain('orphadata')
+    const other = JSON.parse(specialist.env!.OPENCODE_CONFIG_CONTENT!)
+    expect(other.instructions).not.toEqual(policy.instructions)
+    expect(main.configFiles!.find(({ path }) => policy.instructions.includes(path))?.content).toBe(
+      'Scope: mcp-genes'
+    )
+    expect(JSON.parse(specialist.configFiles![0].content).instructions ?? []).toEqual([])
+  })
+
   it('omits instructions when none are provided', () => {
     const config = opencodeFramework.prepareModelConfig(
       { type: 'custom', baseUrl: 'https://gw/v1', model: 'm', key: 'k' },
       { storageRoot: '/data', executablePath: '/bin/opencode' }
     )
 
-    expect(config.configFiles?.some((file) => file.path.endsWith('connectors.md'))).toBe(false)
+    expect(config.configFiles?.some((file) => /connectors-[a-f0-9]+\.md$/.test(file.path))).toBe(
+      false
+    )
     const parsed = JSON.parse(
       config.configFiles?.find((file) => file.path.endsWith('opencode.json'))?.content ?? '{}'
     )
@@ -160,7 +300,7 @@ describe('opencodeFramework.prepareModelConfig', () => {
     const writtenConfig = JSON.parse(
       config.configFiles?.find((file) => file.path.endsWith('opencode.json'))?.content ?? '{}'
     )
-    expect(writtenConfig.permission).toEqual(rules)
+    expect(writtenConfig.permission).toEqual({ ...rules, external_directory: 'deny' })
     expect(rules.task).toBe('deny')
     expect(JSON.parse(config.env?.OPENCODE_CONFIG_CONTENT ?? '{}').agent).toEqual({
       general: { disable: true },
@@ -215,7 +355,7 @@ describe('opencodeFramework.prepareModelConfig', () => {
       vendorId: 'opencode-go' as const,
       agentProviderId: 'open-science-go-model',
       baseUrl: 'http://127.0.0.1:41001/v1',
-      apiEndpoints: ['openai' as const],
+      apiEndpoints: ['chat-completions' as const],
       model: 'glm-5.3-flash',
       key: 'local-go-token'
     }
@@ -224,7 +364,7 @@ describe('opencodeFramework.prepareModelConfig', () => {
       vendorId: 'deepseek' as const,
       agentProviderId: 'open-science-deepseek-model',
       baseUrl: 'http://127.0.0.1:41002/v1',
-      apiEndpoints: ['openai' as const],
+      apiEndpoints: ['chat-completions' as const],
       model: 'deepseek-v4-flash',
       key: 'local-deepseek-token'
     }
@@ -250,7 +390,7 @@ describe('opencodeFramework.prepareModelConfig', () => {
         vendorId: 'deepseek',
         agentProviderId: 'open-science-deepseek-model',
         baseUrl: 'http://127.0.0.1:41002/v1',
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['chat-completions'],
         model: 'deepseek-v4-flash',
         key: 'local-deepseek-token'
       },
@@ -299,7 +439,7 @@ describe('opencodeFramework.prepareModelConfig', () => {
       {
         type: 'custom',
         agentProviderId: 'open-science-messages-model',
-        apiEndpoints: ['anthropic'],
+        apiEndpoints: ['messages'],
         baseUrl: 'http://127.0.0.1:41002',
         model: 'claude-sonnet-4-5',
         key: 'local-token'
@@ -416,7 +556,7 @@ describe('opencodeFramework.prepareModelConfig', () => {
         baseUrl: 'https://gw/v1',
         model: 'kimi-k3',
         key: 'k',
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['chat-completions'],
         supportsImageInput: true
       },
       { storageRoot: '/data', executablePath: '/bin/opencode' }
@@ -435,7 +575,7 @@ describe('opencodeFramework.prepareModelConfig', () => {
         baseUrl: 'https://gw/v1',
         model: 'gpt-x',
         key: 'k',
-        apiEndpoints: ['openai']
+        apiEndpoints: ['chat-completions']
       },
       { storageRoot: '/data', executablePath: '/bin/opencode' }
     )
@@ -502,13 +642,14 @@ describe('opencodeFramework.prepareModelConfig', () => {
   it.each([
     ['minimax', 'MiniMax-M3', 'none', { thinking: { type: 'disabled' } }],
     ['minimax', 'MiniMax-M3', 'high', { thinking: { type: 'adaptive' } }],
-    ...(['low', 'medium', 'high', 'xhigh', 'max'] as const).map(
-      (effort) =>
+    // The package owns the full effort matrix; these cases verify both OpenCode config layers.
+    ...(['MiniMax-M3.1-Flash', 'MiniMax-M3.1-Flash-Preview'] as const).map(
+      (model) =>
         [
           'minimax',
-          'MiniMax-M3.1-Flash-Preview',
-          effort,
-          { reasoningEffort: effort, thinking: { type: 'adaptive' } }
+          model,
+          'high',
+          { reasoningEffort: 'high', thinking: { type: 'adaptive' } }
         ] as const
     ),
     ['xiaomimimo', 'mimo-v2.5-pro', 'none', { thinking: { type: 'disabled' } }],
@@ -532,8 +673,8 @@ describe('opencodeFramework.prepareModelConfig', () => {
           type: 'custom',
           vendorId,
           baseUrl: 'https://gw.example/anthropic',
-          openaiBaseUrl: 'https://gw.example/v1',
-          apiEndpoints: ['anthropic', 'openai'],
+          chatCompletionsBaseUrl: 'https://gw.example/v1',
+          apiEndpoints: ['messages', 'chat-completions'],
           model,
           key: 'k'
         },
@@ -555,7 +696,7 @@ describe('opencodeFramework.prepareModelConfig', () => {
       {
         type: 'custom',
         baseUrl: 'https://private-gateway.example/v1',
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['chat-completions'],
         model: 'private-model',
         key: 'k',
         reasoningEffortTransport: 'deepseek'
@@ -590,7 +731,7 @@ describe('opencodeFramework.prepareModelConfig', () => {
       type: 'official' as const,
       vendorId: 'deepseek' as const,
       baseUrl: 'https://api.deepseek.com/v1',
-      apiEndpoints: ['anthropic' as const],
+      apiEndpoints: ['messages' as const],
       model: 'deepseek-v4-pro',
       contextWindow: 128_000,
       key: 'k'
@@ -642,7 +783,7 @@ describe('opencodeFramework.prepareModelConfig', () => {
       type: 'custom' as const,
       agentProviderId: 'open-science-a',
       baseUrl: 'http://127.0.0.1:41001/v1',
-      apiEndpoints: ['openai' as const],
+      apiEndpoints: ['chat-completions' as const],
       model: 'model-a',
       key: 'local-token-a'
     }
@@ -650,7 +791,7 @@ describe('opencodeFramework.prepareModelConfig', () => {
       type: 'custom' as const,
       agentProviderId: 'open-science-b',
       baseUrl: 'http://127.0.0.1:41002/v1',
-      apiEndpoints: ['openai' as const],
+      apiEndpoints: ['chat-completions' as const],
       model: 'model-b',
       key: 'local-token-b'
     }
@@ -856,7 +997,7 @@ describe('buildOpencodeConfig', () => {
         baseUrl: 'https://gw/v1',
         model: 'gpt-x',
         key: 'k',
-        apiEndpoints: ['openai']
+        apiEndpoints: ['chat-completions']
       })
     )
 
@@ -873,7 +1014,7 @@ describe('buildOpencodeConfig', () => {
         type: 'custom',
         baseUrl: 'https://gw/v1',
         model: 'm',
-        apiEndpoints: ['anthropic', 'openai']
+        apiEndpoints: ['messages', 'chat-completions']
       })
     )
     expect(both.model).toBe('openai-compatible/m')
@@ -888,7 +1029,7 @@ describe('buildOpencodeConfig', () => {
         baseUrl: 'https://gw/v1',
         model: 'kimi-k3',
         key: 'k',
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['chat-completions'],
         supportsImageInput: true
       })
     )
@@ -905,7 +1046,7 @@ describe('buildOpencodeConfig', () => {
         baseUrl: 'https://gw/v1',
         model: 'deepseek-v4-flash',
         key: 'k',
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['chat-completions'],
         supportsImageInput: false
       })
     )
@@ -933,10 +1074,10 @@ describe('buildOpencodeConfig', () => {
       buildOpencodeConfig({
         type: 'custom',
         baseUrl: 'https://api.deepseek.com/anthropic',
-        openaiBaseUrl: 'https://api.deepseek.com/v1',
+        chatCompletionsBaseUrl: 'https://api.deepseek.com/v1',
         model: 'deepseek-v4-pro',
         key: 'sk-ds',
-        apiEndpoints: ['anthropic', 'openai']
+        apiEndpoints: ['messages', 'chat-completions']
       })
     )
 
@@ -951,10 +1092,10 @@ describe('buildOpencodeConfig', () => {
       buildOpencodeConfig({
         type: 'custom',
         baseUrl: 'https://api.z.ai/api/anthropic',
-        openaiBaseUrl: 'https://api.z.ai/api/paas/v4',
+        chatCompletionsBaseUrl: 'https://api.z.ai/api/paas/v4',
         model: 'glm-5.2',
         key: 'k',
-        apiEndpoints: ['anthropic', 'openai']
+        apiEndpoints: ['messages', 'chat-completions']
       })
     )
 
@@ -972,7 +1113,7 @@ describe('buildOpencodeConfig', () => {
         type: 'custom',
         baseUrl: 'https://host/proxy',
         model: 'm',
-        apiEndpoints: ['openai']
+        apiEndpoints: ['chat-completions']
       })
     )
 
@@ -985,7 +1126,7 @@ describe('buildOpencodeConfig', () => {
         type: 'custom',
         baseUrl: 'https://gw.example',
         model: 'm',
-        apiEndpoints: ['openai']
+        apiEndpoints: ['chat-completions']
       })
     )
     expect(rooted.provider['openai-compatible'].options.baseURL).toBe('https://gw.example/v1')
@@ -995,7 +1136,7 @@ describe('buildOpencodeConfig', () => {
         type: 'custom',
         baseUrl: 'https://gw.example/v1',
         model: 'm',
-        apiEndpoints: ['openai']
+        apiEndpoints: ['chat-completions']
       })
     )
     expect(withV1.provider['openai-compatible'].options.baseURL).toBe('https://gw.example/v1')

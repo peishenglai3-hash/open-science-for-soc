@@ -5,9 +5,11 @@ import type {
   ClaudeInstallResult,
   DeleteProviderRequest,
   EnvironmentCheckResult,
+  XaiOAuthLoginResult,
   XaiOAuthDeviceAuthorization,
   InstallClaudeRequest,
   InstallCodeBuddyRequest,
+  InstallPiRequest,
   InstallCodexRequest,
   InstallOpencodeRequest,
   Preflight,
@@ -90,6 +92,10 @@ export const settingsInstallClaudeContracts = {
   'settings.installCodeBuddy': callable<
     (request: InstallCodeBuddyRequest) => Promise<ClaudeInstallResult>
   >()('settings', ['settings:install-codebuddy', LOCAL]),
+  'settings.installPi': callable<(request: InstallPiRequest) => Promise<ClaudeInstallResult>>()(
+    'settings',
+    ['settings:install-pi', LOCAL]
+  ),
   'settings.installCodex': callable<
     (request: InstallCodexRequest) => Promise<ClaudeInstallResult>
   >()('settings', ['settings:install-codex', LOCAL]),
@@ -184,6 +190,10 @@ export const settingsSetVisionModelContracts = {
     'settings:uninstall-codebuddy',
     LOCAL
   ]),
+  'settings.uninstallPi': callable<() => Promise<SettingsSnapshot>>()('settings', [
+    'settings:uninstall-pi',
+    LOCAL
+  ]),
   'settings.uninstallCodex': callable<() => Promise<SettingsSnapshot>>()('settings', [
     'settings:uninstall-codex',
     LOCAL
@@ -204,7 +214,7 @@ export const settingsUpsertProviderContracts = {
   'settings.validateProvider': callable<
     (request: ValidateProviderRequest) => Promise<ValidateProviderResult>
   >()('settings', ['settings:validate-provider']),
-  'settings.waitXaiOAuthLogin': callable<() => Promise<{ accountEmail?: string }>>()('settings', [
+  'settings.waitXaiOAuthLogin': callable<() => Promise<XaiOAuthLoginResult>>()('settings', [
     'settings:wait-xai-oauth-login',
     LOCAL
   ])

@@ -1,3 +1,4 @@
+import { persistentContentReferences } from '../storage/prisma-content-references'
 import { randomUUID } from 'node:crypto'
 import { readFile, realpath, rm, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, sep } from 'node:path'
@@ -53,6 +54,8 @@ import {
 } from './provenance-message-finalization'
 import {
   ArtifactProvenanceFinalizationRecovery,
+  isArtifactLinkedToDurableMessage,
+  projectReconciliationHasUnfinishedPublications,
   type ArtifactProjectReconciliationSnapshot
 } from './provenance-finalization-recovery'
 import { ArtifactProvenanceStagingRecovery } from './provenance-staging-recovery'
@@ -181,9 +184,9 @@ type ProjectLogicalFileOwner = {
   logicalFilename: string
 }
 
-const assertSafeSegment = (value: string, label: string): string => {
-  if (!SAFE_SEGMENT_PATTERN.test(value)) {
-    throw new Error(`Invalid ${label}: ${value}`)
+const assertSafeSegment = (value: unknown, label: string): string => {
+  if (typeof value !== 'string' || value.length === 0 || !SAFE_SEGMENT_PATTERN.test(value)) {
+    throw new Error(`Invalid ${label}: ${String(value)}`)
   }
   return value
 }
@@ -258,6 +261,7 @@ class ArtifactProvenanceRepository {
 
   constructor(private readonly options: ArtifactProvenanceRepositoryOptions) {
     this.contentRepository = new ContentRepository({
+      references: persistentContentReferences,
       storageRoot: options.storageRoot,
       getClient: options.getClient
     })
@@ -683,6 +687,7 @@ class ArtifactProvenanceRepository {
               relativeBaseDirs,
               {
                 signal,
+                grantedImportRoots: sourceScope.grantedImportRoots,
                 maxBytes: Math.max(
                   0,
                   LOCAL_RESOURCE_BUDGETS.requestBytes -
@@ -708,6 +713,7 @@ class ArtifactProvenanceRepository {
           },
           {
             allowedImportRoots: sourceScope.allowedImportRoots,
+            grantedImportRoots: sourceScope.grantedImportRoots,
             relativeBaseDirs,
             signal,
             reserveFile: (fileBytes) => this.writeBudgetOwner.reserve({ ...request, fileBytes }),
@@ -1009,6 +1015,31 @@ class ArtifactProvenanceRepository {
     )
   }
 
+  private async hasRecoverableFinalization(
+    projectId: string,
+    appSessionId: string,
+    durableSession: PersistedChatSession | undefined,
+    projectReconciliation?: ArtifactProjectReconciliationSnapshot
+  ): Promise<boolean> {
+    if (projectReconciliation === undefined || durableSession === undefined) return true
+    if (projectReconciliationHasUnfinishedPublications(projectReconciliation)) return true
+    const client = await this.options.getClient()
+    const versions = await client.artifactVersion.findMany({
+      where: {
+        originKind: 'agent_generated',
+        artifact: { is: { projectId, sessionId: appSessionId } },
+        state: { in: ['pending', 'finalized'] }
+      },
+      select: { id: true, messageId: true, state: true }
+    })
+    return versions.some(
+      (version) =>
+        version.state === 'pending' ||
+        version.messageId === null ||
+        !isArtifactLinkedToDurableMessage(durableSession, version.messageId, version.id)
+    )
+  }
+
   private async reconcileSessionWithinSession(
     projectIdInput: string,
     appSessionIdInput: string,
@@ -1033,6 +1064,7 @@ class ArtifactProvenanceRepository {
       nativeFinalizationRunIds: [],
       unresolvedNativeFinalizationRunIds: []
     }
+    // Database rows cannot prove that staging or unindexed immutable storage is empty.
     const unindexedSnapshot = await this.unindexedRecovery.prepareSession(projectId, appSessionId)
     const stagingResult = await this.stagingRecovery.reconcileSession(
       projectId,
@@ -1041,24 +1073,38 @@ class ArtifactProvenanceRepository {
     )
     result.recoveredVersionIds.push(...stagingResult.recoveredVersionIds)
     result.quarantinedVersionIds.push(...stagingResult.quarantinedVersionIds)
-    const finalizationResult = await this.finalizationRecovery.reconcileSession(
-      projectId,
-      appSessionId,
-      durableSession,
-      options?.projectReconciliation,
-      options?.artifactRunIds,
-      options?.artifactVersionIds
-    )
-    result.recoveredVersionIds.push(...finalizationResult.recoveredVersionIds)
-    result.recoveredMessageArtifacts.push(...finalizationResult.recoveredMessageArtifacts)
-    result.nativeFinalizationRunIds.push(...finalizationResult.nativeFinalizationRunIds)
-    result.unresolvedNativeFinalizationRunIds.push(
-      ...finalizationResult.unresolvedNativeFinalizationRunIds
-    )
-    if (finalizationResult.invalidProofNativeFinalizationRunIds?.length) {
-      result.invalidProofNativeFinalizationRunIds = [
-        ...finalizationResult.invalidProofNativeFinalizationRunIds
-      ]
+    const explicitlyScoped =
+      options?.artifactRunIds !== undefined || options?.artifactVersionIds !== undefined
+    const shouldReconcileFinalization =
+      explicitlyScoped ||
+      durableSession === undefined ||
+      durableSession.status !== 'idle' ||
+      (await this.hasRecoverableFinalization(
+        projectId,
+        appSessionId,
+        durableSession,
+        options?.projectReconciliation
+      ))
+    if (shouldReconcileFinalization) {
+      const finalizationResult = await this.finalizationRecovery.reconcileSession(
+        projectId,
+        appSessionId,
+        durableSession,
+        options?.projectReconciliation,
+        options?.artifactRunIds,
+        options?.artifactVersionIds
+      )
+      result.recoveredVersionIds.push(...finalizationResult.recoveredVersionIds)
+      result.recoveredMessageArtifacts.push(...finalizationResult.recoveredMessageArtifacts)
+      result.nativeFinalizationRunIds.push(...finalizationResult.nativeFinalizationRunIds)
+      result.unresolvedNativeFinalizationRunIds.push(
+        ...finalizationResult.unresolvedNativeFinalizationRunIds
+      )
+      if (finalizationResult.invalidProofNativeFinalizationRunIds?.length) {
+        result.invalidProofNativeFinalizationRunIds = [
+          ...finalizationResult.invalidProofNativeFinalizationRunIds
+        ]
+      }
     }
 
     const unindexedResult = await this.unindexedRecovery.reconcileSession(unindexedSnapshot)

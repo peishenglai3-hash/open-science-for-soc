@@ -1,3 +1,4 @@
+import { composeHandoff } from './composition/handoff'
 import { specialistDesktopCommandGroup } from './specialist/desktop-commands'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -39,6 +40,7 @@ import {
   type ApplicationInvocation
 } from './application-command-router'
 import { createCallerContext } from './caller-context'
+import { waitForDataRootWriters } from './storage/migration-state'
 import { ApplicationCallerLeaseRegistry } from './caller-lifecycle'
 import { createManagedPreviewOwnerRegistry } from './managed-preview-ipc'
 import { ManagedPreviewResources } from './managed-preview-resources'
@@ -73,7 +75,7 @@ it('exposes bootstrap only to local Task callers without widening renderer manag
     })
   ).resolves.toEqual({ ok: true })
   expect(bootstrap).toHaveBeenCalledOnce()
-  composition.dispose()
+  await composition.dispose()
 })
 const unexpectedCommand = defineApplicationCommand<'test:unexpected', readonly [], void>(
   'test:unexpected'
@@ -254,6 +256,7 @@ describe('application command composition', () => {
       'literature:add-pdf',
       'literature:cancel-pdf-import',
       'literature:citation-styles',
+      'literature:collect',
       'literature:complete-metadata',
       'literature:export-record',
       'literature:format-document',
@@ -266,8 +269,13 @@ describe('application command composition', () => {
       'literature:jobs',
       'literature:journals',
       'literature:lookup-metadata',
+      'literature:publication-check',
+      'literature:related',
       'literature:search',
       'literature:sources',
+      'literature:supplement-attachment',
+      'literature:supplement-attachment-progress',
+      'literature:supplements',
       'literature:transact',
       'memory:clear-all',
       'memory:create-category',
@@ -306,6 +314,7 @@ describe('application command composition', () => {
       'session-replay:save-view',
       'session-replay:unlink-session',
       'sessions:cancel-diagnostics',
+      'sessions:delete-recovery-file',
       'sessions:delete-session',
       'sessions:edit-details',
       'sessions:export-diagnostics',
@@ -320,6 +329,8 @@ describe('application command composition', () => {
       'sessions:set-delegation-policy',
       'sessions:unlink-pdf-context',
       'sessions:update-archive',
+      'sessions:use-case-catalog',
+      'sessions:use-case-introduction',
       'settings:get-settings',
       'tags:create',
       'tags:delete',
@@ -364,6 +375,96 @@ describe('application command composition', () => {
     ).resolves.toEqual([project('project-1')])
     expect(listProjects).toHaveBeenCalledOnce()
   })
+
+  it('lets remote Web inspect managed files and rejects identity drift', async () => {
+    const inspect = vi.fn(async (request: { projectId: string; fileId: string }) => ({
+      ok: true as const,
+      value: {
+        source: 'artifact',
+        projectId: request.projectId,
+        fileId: request.fileId,
+        sessionId: 'session-1'
+      }
+    }))
+    const composition = createApplicationCommandComposition({
+      ...dependencies(),
+      dataContent: {
+        managedFileVersions: { inspect },
+        projects: { list: vi.fn() },
+        withDataRootWrite: async (operation: () => Promise<unknown>) => operation()
+      } as never
+    })
+    const request = { source: 'artifact', projectId: 'project-1', fileId: 'file-1' }
+
+    expect(composition.remoteWeb.commandNames()).toContain('managed-file-versions:inspect')
+    expect(composition.remoteWeb.rejectedCommandNames()).not.toContain(
+      'managed-file-versions:inspect'
+    )
+    await expect(
+      composition.remoteWeb.invoke('managed-file-versions:inspect', {
+        ...invocation('remote'),
+        args: [request]
+      })
+    ).resolves.toMatchObject({ ok: true, value: { projectId: 'project-1', fileId: 'file-1' } })
+
+    inspect.mockResolvedValueOnce({
+      ok: true,
+      value: {
+        source: 'artifact',
+        projectId: 'project-2',
+        fileId: 'file-1',
+        sessionId: 'session-1'
+      }
+    })
+    await expect(
+      composition.remoteWeb.invoke('managed-file-versions:inspect', {
+        ...invocation('remote'),
+        args: [request]
+      })
+    ).rejects.toThrow('identity')
+    await composition.dispose()
+  })
+
+  it.each([
+    ['localWeb', 'web', 'local'],
+    ['remoteWeb', 'web', 'remote'],
+    ['desktop', 'electron', 'local']
+  ] as const)(
+    'limits managed file inspection capabilities for %s',
+    async (view, surface, location) => {
+      const value = Object.freeze({
+        source: 'artifact',
+        projectId: 'project-1',
+        fileId: 'file-1',
+        sessionId: 'session-1',
+        headVersionId: 'version-2',
+        headVersion: { id: 'version-2', checksum: 'sha256' },
+        text: 'second\n',
+        canEdit: true,
+        canDiff: true
+      })
+      const inspect = vi.fn().mockResolvedValue({ ok: true, value })
+      const composition = createApplicationCommandComposition({
+        ...dependencies(),
+        dataContent: { managedFileVersions: { inspect } } as never
+      })
+      const base = invocation(location)
+      const request = { source: 'artifact', projectId: value.projectId, fileId: value.fileId }
+
+      await expect(
+        composition[view].invoke('managed-file-versions:inspect', {
+          ...base,
+          callerContext: createCallerContext({ ...base.callerContext, surface }),
+          args: [request]
+        })
+      ).resolves.toEqual({
+        ok: true,
+        value: { ...value, canEdit: surface === 'electron', canDiff: surface === 'electron' }
+      })
+      expect(inspect).toHaveBeenCalledWith(request)
+      await composition.dispose()
+    }
+  )
 
   it('exposes only Reviewer run and reads to Task automation', () => {
     const composition = createApplicationCommandComposition(dependencies())
@@ -496,8 +597,8 @@ describe('application command composition', () => {
     )
     expect(replacementSnapshot).not.toHaveBeenCalled()
 
-    composition.dispose()
-    composition.dispose()
+    await composition.dispose()
+    await composition.dispose()
     expect(() => composition.bindRemoteAccess(firstOwner as never)).toThrow(
       'Remote Access command owner slot is disposed.'
     )
@@ -526,7 +627,7 @@ describe('application command composition', () => {
     expect(events.at(-1)).toBe('router:dispose')
   })
 
-  it('installs every command module and stops at a partial failure', () => {
+  it('installs every command module and stops at a partial failure', async () => {
     const source = dependencies()
     const normalEvents: string[] = []
     installInstrumentedRouterFactory(normalEvents)
@@ -542,10 +643,10 @@ describe('application command composition', () => {
     expect(installEvents).toEqual(
       Array.from({ length: installationCount }, (_, index) => `install:${index}`)
     )
-    composition.dispose()
+    await composition.dispose()
     expect(normalEvents).toEqual([...installEvents, ...uninstallEvents, 'router:dispose'])
     const disposedEventCount = normalEvents.length
-    composition.dispose()
+    await composition.dispose()
     expect(normalEvents).toHaveLength(disposedEventCount)
 
     const partialEvents: string[] = []
@@ -612,7 +713,7 @@ describe('application command composition', () => {
     const disposeFailure = createApplicationCommandComposition(source)
     let disposalFailure: unknown
     try {
-      disposeFailure.dispose()
+      await disposeFailure.dispose()
     } catch (error) {
       disposalFailure = error
     }
@@ -628,7 +729,7 @@ describe('application command composition', () => {
       ...uninstallEvents,
       'router:dispose'
     ])
-    expect(() => disposeFailure.dispose()).not.toThrow()
+    await expect(disposeFailure.dispose()).rejects.toBe(disposalFailure)
     expect(() => disposedRemoteAccessHandler?.(invocation('remote'))).toThrow(
       'Remote Access command owner slot is disposed.'
     )
@@ -704,7 +805,7 @@ it('routes Task Connector reads to the existing Settings owner without adding We
   expect(listConnectors).toHaveBeenCalledOnce()
   expect(composition.localWeb.commandNames()).not.toContain('settings:test-custom-server')
   expect(composition.remoteWeb.commandNames()).not.toContain('settings:test-custom-server')
-  composition.dispose()
+  await composition.dispose()
 })
 
 it('routes Task doctor prerequisites to the existing Settings owners', async () => {
@@ -731,7 +832,7 @@ it('routes Task doctor prerequisites to the existing Settings owners', async () 
   await expect(composition.task.invoke('settings:list-skills', invocation())).resolves.toEqual(
     skills
   )
-  composition.dispose()
+  await composition.dispose()
 })
 
 it('validates bounded reference exports through the shared Web command boundary', async () => {
@@ -755,8 +856,189 @@ it('validates bounded reference exports through the shared Web command boundary'
     })
   ).resolves.toEqual(exported)
   expect(exportRecord).toHaveBeenCalledWith({ itemId: 'reference' })
-  composition.dispose()
+  await composition.dispose()
 })
+
+it.each(['electron', 'localWeb', 'remoteWeb'] as const)(
+  'validates publication checks and cancellation through %s',
+  async (surface) => {
+    const result = { itemId: 'paper', metadataRevision: 1 }
+    const publicationCheck = vi.fn(async () => result)
+    const composition = createApplicationCommandComposition({
+      ...dependencies(),
+      literature: { publicationCheck } as never
+    })
+    const call = {
+      ...invocation(surface === 'remoteWeb' ? 'remote' : 'local'),
+      args: [{ mode: 'check', itemId: 'paper', expectedMetadataRevision: 1 }]
+    }
+    try {
+      await expect(
+        composition[surface].invoke('literature:publication-check', call)
+      ).resolves.toEqual(result)
+      expect(publicationCheck).toHaveBeenCalledWith(call.args[0], expect.any(AbortSignal))
+      for (const request of [
+        { ...call.args[0], url: 'http://127.0.0.1' },
+        { ...call.args[0], expectedMetadataRevision: 0 },
+        { ...call.args[0], mode: 'background' }
+      ]) {
+        await expect(
+          composition[surface].invoke('literature:publication-check', {
+            ...call,
+            args: [request]
+          })
+        ).rejects.toThrow()
+      }
+      expect(publicationCheck).toHaveBeenCalledTimes(1)
+    } finally {
+      await composition.dispose()
+    }
+  }
+)
+
+it('aborts publication checks and drains their cleanup before completing disposal', async () => {
+  let signal: AbortSignal | undefined
+  let entered!: () => void
+  let release!: () => void
+  let cleaned = false
+  const started = new Promise<void>((resolve) => {
+    entered = resolve
+  })
+  const cleanup = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const publicationCheck = vi.fn(async (_request, callerSignal: AbortSignal) => {
+    signal = callerSignal
+    entered()
+    await new Promise<void>((_resolve, reject) => {
+      callerSignal.addEventListener('abort', () => reject(callerSignal.reason), { once: true })
+    }).finally(async () => {
+      await cleanup
+      cleaned = true
+    })
+    return { itemId: 'paper', metadataRevision: 1 }
+  })
+  const composition = createApplicationCommandComposition({
+    ...dependencies(),
+    literature: { publicationCheck } as never
+  })
+  const pending = composition.localWeb.invoke('literature:publication-check', {
+    ...invocation(),
+    args: [{ mode: 'check', itemId: 'paper', expectedMetadataRevision: 1 }]
+  })
+  const rejected = expect(pending).rejects.toThrow('uninstalled')
+  await started
+  // A pending network lookup must not keep the data migration writer gate occupied.
+  let writersDrained = false
+  void waitForDataRootWriters().then(() => {
+    writersDrained = true
+  })
+  await Promise.resolve()
+  expect(writersDrained).toBe(true)
+  let disposed = false
+  const shutdown = composition.dispose().then(() => {
+    disposed = true
+  })
+  await Promise.resolve()
+  expect(signal?.aborted).toBe(true)
+  expect(disposed).toBe(false)
+  expect(cleaned).toBe(false)
+  release()
+  await shutdown
+  await rejected
+  expect(cleaned).toBe(true)
+})
+
+it.each(['electron', 'localWeb', 'remoteWeb'] as const)(
+  'validates supplement queries through %s',
+  async (surface) => {
+    const result = {
+      itemId: 'paper',
+      metadataRevision: 1,
+      provider: 'datacite',
+      state: 'complete',
+      records: [],
+      issues: []
+    }
+    const supplements = vi.fn(async () => result)
+    const composition = createApplicationCommandComposition({
+      ...dependencies(),
+      literature: { supplements } as never
+    })
+    const call = {
+      ...invocation(surface === 'remoteWeb' ? 'remote' : 'local'),
+      args: [{ itemId: 'paper', expectedMetadataRevision: 1, provider: 'datacite' }]
+    }
+    try {
+      await expect(composition[surface].invoke('literature:supplements', call)).resolves.toEqual(
+        result
+      )
+      expect(supplements).toHaveBeenCalledWith(call.args[0], expect.any(AbortSignal))
+      await expect(
+        composition[surface].invoke('literature:supplements', {
+          ...call,
+          args: [{ ...call.args[0], url: 'http://127.0.0.1' }]
+        })
+      ).rejects.toThrow()
+      expect(supplements).toHaveBeenCalledTimes(1)
+    } finally {
+      await composition.dispose()
+    }
+  }
+)
+
+it.each(['electron', 'localWeb', 'remoteWeb'] as const)(
+  'validates supplement attachment requests through %s',
+  async (surface) => {
+    const result = {
+      attachmentId: 'attachment',
+      versionId: 'version'
+    }
+    const supplementAttachment = vi.fn(async () => result)
+    const metrics = { phase: 'downloading', receivedBytes: 512, bytesPerSecond: 128 }
+    const supplementAttachmentProgress = vi.fn(() => metrics)
+    const composition = createApplicationCommandComposition({
+      ...dependencies(),
+      literature: { supplementAttachment, supplementAttachmentProgress } as never
+    })
+    const call = {
+      ...invocation(surface === 'remoteWeb' ? 'remote' : 'local'),
+      args: [
+        {
+          itemId: 'paper',
+          expectedMetadataRevision: 1,
+          downloadId: 'd1b720c7-1000-4000-8000-000000000001'
+        }
+      ]
+    }
+    try {
+      await expect(
+        composition[surface].invoke('literature:supplement-attachment', call)
+      ).resolves.toEqual(result)
+      expect(supplementAttachment).toHaveBeenCalledWith(call.args[0], expect.any(AbortSignal))
+      await expect(
+        composition[surface].invoke('literature:supplement-attachment', {
+          ...call,
+          args: [{ ...call.args[0], url: 'http://127.0.0.1' }]
+        })
+      ).rejects.toThrow()
+      expect(supplementAttachment).toHaveBeenCalledTimes(1)
+      await expect(
+        composition[surface].invoke('literature:supplement-attachment-progress', call)
+      ).resolves.toEqual(metrics)
+      expect(supplementAttachmentProgress).toHaveBeenCalledWith(call.args[0])
+      await expect(
+        composition[surface].invoke('literature:supplement-attachment-progress', {
+          ...call,
+          args: [{ ...call.args[0], url: 'http://127.0.0.1' }]
+        })
+      ).rejects.toThrow()
+      expect(supplementAttachmentProgress).toHaveBeenCalledTimes(1)
+    } finally {
+      await composition.dispose()
+    }
+  }
+)
 
 describe('TB-01 remote preview admission', () => {
   it.each([
@@ -831,7 +1113,7 @@ describe('TB-01 remote preview admission', () => {
     } finally {
       if (resource) owners.release(caller.callerLease, { resourceId: resource.id })
       leases.dispose()
-      composition.dispose()
+      await composition.dispose()
       await rm(directory, { recursive: true, force: true })
     }
   })
@@ -865,5 +1147,209 @@ it('keeps PDF translation on the desktop view and passes its document lease to t
   expect(composition.localWeb.commandNames()).not.toContain('pdf-translation:begin')
   expect(composition.remoteWeb.commandNames()).not.toContain('pdf-translation:begin')
   expect(composition.task.commandNames()).not.toContain('pdf-translation:begin')
-  composition.dispose()
+  await composition.dispose()
+})
+
+it.each([false, true])(
+  'waits for admitted Literature import cleanup before disposing the router (cleanup fails: %s)',
+  async (cleanupFails) => {
+    const events: string[] = []
+    installInstrumentedRouterFactory(events)
+    const entered = Promise.withResolvers<void>()
+    const cleaning = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    let signal: AbortSignal | undefined
+    const cleanup = async (): Promise<void> => {
+      cleaning.resolve()
+      await release.promise
+      events.push('import:cleanup')
+      if (cleanupFails) throw new Error('Import cleanup failed')
+    }
+    const importPdf = vi.fn(async (_request: unknown, currentSignal?: AbortSignal) => {
+      signal = currentSignal
+      entered.resolve()
+      try {
+        await new Promise<void>((_resolve, reject) =>
+          currentSignal!.addEventListener('abort', () => reject(currentSignal!.reason), {
+            once: true
+          })
+        )
+        throw new Error('Unexpected completed import')
+      } finally {
+        await cleanup()
+      }
+    })
+    const composition = createApplicationCommandComposition({
+      ...dependencies(),
+      literature: {
+        importPdf
+      } as unknown as ApplicationCommandCompositionDependencies['literature']
+    })
+    const call = {
+      ...invocation(),
+      args: [
+        {
+          itemId: 'item',
+          attachment: {
+            id: 'upload',
+            sessionId: 'session',
+            name: 'paper.pdf',
+            originalName: 'paper.pdf',
+            path: '/managed/paper.pdf',
+            size: 10
+          }
+        }
+      ]
+    }
+    const pending = composition.localWeb.invoke('literature:import-pdf', call)
+    const rejected = expect(pending).rejects.toThrow(
+      cleanupFails ? 'Import cleanup failed' : 'uninstalled'
+    )
+    await entered.promise
+    let disposed = false
+    const shutdown = composition.dispose()
+    void shutdown.then(() => {
+      disposed = true
+    })
+    expect(composition.dispose()).toBe(shutdown)
+    await cleaning.promise
+    try {
+      expect(signal?.aborted).toBe(true)
+      expect(disposed).toBe(false)
+      expect(events).not.toContain('router:dispose')
+      await expect(composition.localWeb.invoke('literature:import-pdf', call)).rejects.toThrow(
+        'Unknown application command'
+      )
+      expect(importPdf).toHaveBeenCalledOnce()
+    } finally {
+      release.resolve()
+      await shutdown
+      await rejected
+    }
+    expect(events.slice(-2)).toEqual(['import:cleanup', 'router:dispose'])
+    expect(disposed).toBe(true)
+  }
+)
+
+it('closes new work across all transports while preserving cancellation and final saves', async () => {
+  const composition = createApplicationCommandComposition(dependencies())
+  composition.beginStopping()
+  for (const view of [
+    composition.desktop,
+    composition.localWeb,
+    composition.remoteWeb,
+    composition.task
+  ]) {
+    await expect(view.invoke('acp:prompt', invocation())).rejects.toMatchObject({
+      code: 'command-unavailable',
+      message: 'The local service is stopping.'
+    })
+  }
+  // The existing owner still receives settlement requests. Missing fixture methods may reject,
+  // but the admission fence must not substitute its stop error for the owner's result.
+  await expect(
+    composition.desktop
+      .invoke('sessions:save-session', invocation())
+      .catch((error) => error.message)
+  ).resolves.not.toBe('The local service is stopping.')
+  for (const command of [
+    'acp:cancel',
+    'acp:get-state',
+    'notebook:background-run',
+    'notebook:abort-code-cell',
+    'sessions:stage-task-completion',
+    'sessions:settle-task-completion',
+    'sessions:fail-task-run',
+    'artifacts:finalize-run'
+  ]) {
+    await expect(
+      composition.desktop.invoke(command, invocation()).catch((error) => error.message)
+    ).resolves.not.toBe('The local service is stopping.')
+  }
+  await composition.dispose()
+})
+
+it('holds update admission through final saves and reopens only after update abort', async () => {
+  const composition = createApplicationCommandComposition(dependencies())
+  const release = composition.holdUpdateAdmission()
+  for (const view of [
+    composition.desktop,
+    composition.localWeb,
+    composition.remoteWeb,
+    composition.task
+  ]) {
+    await expect(view.invoke('acp:prompt', invocation())).rejects.toMatchObject({
+      code: 'command-unavailable'
+    })
+    await expect(view.invoke('notebook:execute', invocation())).rejects.toMatchObject({
+      code: 'command-unavailable'
+    })
+  }
+  await expect(
+    composition.desktop
+      .invoke('sessions:save-session', invocation())
+      .catch((error) => error.message)
+  ).resolves.not.toBe('The local service is stopping.')
+  release()
+  release()
+  await expect(
+    composition.desktop.invoke('acp:prompt', invocation()).catch((error) => error.message)
+  ).resolves.not.toBe('The local service is stopping.')
+  const releaseLater = composition.holdUpdateAdmission()
+  composition.beginStopping()
+  releaseLater()
+  await expect(composition.desktop.invoke('acp:prompt', invocation())).rejects.toMatchObject({
+    code: 'command-unavailable'
+  })
+  await composition.dispose()
+})
+
+it('keeps real handoff admission held after renderer durability and releases it on abort or refusal', async () => {
+  const composition = createApplicationCommandComposition(dependencies())
+  const rootAbort = vi.fn()
+  let durable = true
+  const handoff = await composeHandoff({
+    holdUpdateAdmission: () => composition.holdUpdateAdmission(),
+    declareElectronAdapter: vi.fn(),
+    webSessionPersistenceFlush: {},
+    settingsService: { hasActiveInstall: () => false, holdInstallAdmission: () => vi.fn() },
+    sessionPackageDesktopLifecycle: { isActive: () => false },
+    packageHandoffHeld: { current: false },
+    getActiveDelegatedSessions: () => [],
+    getActiveSideChatSessions: () => [],
+    notebookLifecycle: {
+      shutdownAll: async () => ({ reaped: true }),
+      getActiveNotebookSessions: () => []
+    },
+    runtime: {
+      holdUpdateAdmission: () => rootAbort,
+      shutdownForUpdateGate: async () => ({ reaped: true }),
+      getQuitBlockingPromptSessions: () => []
+    },
+    sideChatRuntime: { suspendAll: async () => ({ reaped: true }), resumeAfterHandoff: vi.fn() },
+    translate: (text: string) => text,
+    confirmRendererDurability: async () => durable,
+    notifyRendererDurabilityAborted: vi.fn(),
+    modules: { add: async () => undefined }
+  } as unknown as Parameters<typeof composeHandoff>[0])
+  await expect(handoff.prepareDesktopUpdate({ force: true })).resolves.toMatchObject({
+    stopAuthorized: true
+  })
+  await expect(composition.localWeb.invoke('acp:prompt', invocation())).rejects.toMatchObject({
+    code: 'command-unavailable'
+  })
+  handoff.abortDesktopUpdate()
+  expect(rootAbort).toHaveBeenCalled()
+  await expect(
+    composition.localWeb.invoke('acp:prompt', invocation()).catch((error) => error.message)
+  ).resolves.not.toBe('The local service is stopping.')
+  durable = false
+  await expect(handoff.prepareDesktopUpdate({ force: true })).resolves.toMatchObject({
+    completed: false,
+    reaped: false
+  })
+  await expect(
+    composition.localWeb.invoke('acp:prompt', invocation()).catch((error) => error.message)
+  ).resolves.not.toBe('The local service is stopping.')
+  await composition.dispose()
 })

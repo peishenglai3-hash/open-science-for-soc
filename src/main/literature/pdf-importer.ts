@@ -1,7 +1,8 @@
 import { literatureItemInputSchema } from '@aipoch/literature-library/item'
 import { createHash } from 'node:crypto'
 import { createReadStream } from 'node:fs'
-import { open, stat } from 'node:fs/promises'
+import { stat } from 'node:fs/promises'
+import { assertPdfHeader, pdfImportParseError } from './pdf-attachment'
 import { basename, extname } from 'node:path'
 import type { PdfAddToLiteratureRequest, PdfAnnotationSource } from '../../shared/pdf-annotations'
 import {
@@ -62,30 +63,6 @@ const verifySharingBytes = async (path: string, checksum: string, size: number):
   }
   if (length !== size || hash.digest('hex') !== checksum)
     throw new Error('PDF contents do not match.')
-}
-
-const assertPdfHeader = async (path: string): Promise<void> => {
-  const handle = await open(path, 'r')
-  try {
-    const header = Buffer.alloc(5)
-    const { bytesRead } = await handle.read(header, 0, header.byteLength, 0)
-    if (bytesRead !== header.byteLength || header.toString('ascii') !== '%PDF-') {
-      throw new Error('Selected file is not a PDF.')
-    }
-  } finally {
-    await handle.close()
-  }
-}
-
-const pdfImportParseError = (error: unknown): Error => {
-  const name = error && typeof error === 'object' && 'name' in error ? error.name : undefined
-  if (name === 'PasswordException')
-    return new Error('[pdf-password] PDF requires a password.', { cause: error })
-  if (name === 'InvalidPDFException')
-    return new Error('[pdf-invalid] PDF is damaged or invalid.', { cause: error })
-  return new Error('[pdf-unreadable] PDF could not be parsed by this application.', {
-    cause: error
-  })
 }
 
 class LiteraturePdfImporter {
@@ -173,9 +150,11 @@ class LiteraturePdfImporter {
     }
 
     const filename = basename(getUploadedAttachmentName(attachment))
-    if (!filename || extname(filename).toLowerCase() !== '.pdf') {
-      throw new Error('Selected file must use the .pdf extension.')
-    }
+    if (!filename) throw new Error('Selected file must have a name.')
+    const isPdf = extname(filename).toLowerCase() === '.pdf'
+    const contentType = isPdf
+      ? 'application/pdf'
+      : attachment.mimeType || 'application/octet-stream'
     const operationId = request.operationId ?? crypto.randomUUID()
     if (this.activeImports.has(operationId))
       throw new Error('PDF import operation is already active.')
@@ -193,23 +172,24 @@ class LiteraturePdfImporter {
         { path: attachment.path },
         { projectId: DEFAULT_UPLOAD_PROJECT_ID, sessionId: PENDING_UPLOAD_SESSION_ID }
       )
-      await assertPdfHeader(sourcePath)
+      if (isPdf) await assertPdfHeader(sourcePath)
       const source = await stat(sourcePath)
       if (!source.isFile() || !Number.isSafeInteger(source.size)) {
-        throw new Error('Selected PDF size is invalid.')
+        throw new Error('Selected file size is invalid.')
       }
 
       return await this.options.content.withPublishedContent(
         {
           sourcePath,
-          contentType: 'application/pdf'
+          contentType
         },
         async (content) => {
           publishedId = content.id
+          if (isPdf) await assertPdfHeader(content.path)
           let pageCount: number | undefined
           let nativeAnnotations: NativePdfAnnotationImportResult | undefined
           let importedCount: number | undefined = 0
-          if (this.options.annotations) {
+          if (isPdf && this.options.annotations) {
             try {
               publish({
                 phase: 'parsing',
@@ -243,7 +223,7 @@ class LiteraturePdfImporter {
                 }
               }
             }
-          } else if (content.sizeBytes <= BigInt(MAX_AUTO_EXTRACT_PDF_BYTES)) {
+          } else if (isPdf && content.sizeBytes <= BigInt(MAX_AUTO_EXTRACT_PDF_BYTES)) {
             try {
               pageCount = await inspectPdfPageCount(content.path)
             } catch (error) {
@@ -253,21 +233,27 @@ class LiteraturePdfImporter {
           combinedSignal.throwIfAborted()
           // Validate the published identity again after parsing, not only the mutable staging path.
           if ((await this.options.content.verify(content.id)).state !== 'available') {
-            throw new Error('[pdf-invalid] PDF content changed during import.')
+            throw new Error(
+              isPdf
+                ? '[pdf-invalid] PDF content changed during import.'
+                : 'Attachment content changed during import.'
+            )
           }
           combinedSignal.throwIfAborted()
-          publish({
-            phase: 'saving',
-            pagesProcessed: pageCount ?? 0,
-            pageCount: pageCount ?? 0,
-            importedCount: 0,
-            unsupportedCount: nativeAnnotations?.unsupportedCount ?? 0
-          })
+          if (isPdf)
+            publish({
+              phase: 'saving',
+              pagesProcessed: pageCount ?? 0,
+              pageCount: pageCount ?? 0,
+              importedCount: 0,
+              unsupportedCount: nativeAnnotations?.unsupportedCount ?? 0
+            })
           const attachedContent = await this.options.catalog.attachContent({
             itemId: request.itemId,
+            kind: isPdf ? 'fullText' : 'supplementary',
             contentBlobId: content.id,
             filename,
-            contentType: 'application/pdf',
+            contentType,
             sizeBytes: Number(content.sizeBytes),
             checksum: content.checksum,
             pageCount
@@ -292,7 +278,7 @@ class LiteraturePdfImporter {
               unsupportedCount: nativeAnnotations.unsupportedCount,
               truncated: nativeAnnotations.truncated
             })
-          } else if (this.options.annotations) {
+          } else if (isPdf && this.options.annotations) {
             publish({
               phase: 'failed',
               pagesProcessed: pageCount ?? 0,
@@ -305,7 +291,8 @@ class LiteraturePdfImporter {
             request.itemId
           )
           combinedSignal.throwIfAborted()
-          if (!item) throw new Error('Literature Item is unavailable after importing its PDF.')
+          if (!item)
+            throw new Error('Literature Item is unavailable after importing its attachment.')
           return {
             item,
             ...(nativeAnnotations && importedCount !== undefined
@@ -332,11 +319,10 @@ class LiteraturePdfImporter {
       }
       throw error
     } finally {
-      if (publishedId && !attached) {
+      if (publishedId && !attached)
         await this.options.content
           .sweep({ contentIds: [publishedId], createdBefore: new Date(Date.now() + 1) })
           .catch(() => undefined)
-      }
       await this.options.uploads.deleteUpload({ path: attachment.path }).catch(() => undefined)
       this.activeImports.delete(operationId)
     }

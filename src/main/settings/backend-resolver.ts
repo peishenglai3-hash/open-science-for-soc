@@ -3,12 +3,14 @@ import { join } from 'node:path'
 
 import type { GrantedLocalRoot } from '../../shared/local-fs'
 import type { ReasoningEffort } from '../../shared/model-preference-contract'
-import type { ReasoningEffortProfile, ResolvedReasoningEffort } from '../../shared/reasoning-effort'
+import type { ReasoningEffortProfile } from '../../shared/reasoning-effort'
+import type { ResolvedReasoningEffort } from '@aipoch/providers'
+
 import {
   buildActiveModelIncompatibleMessage,
   CODEX_BRIDGE_UNSUPPORTED_MESSAGE,
   NO_ACTIVE_PROVIDER_MESSAGE
-} from '../../shared/run-error-classification'
+} from '../../shared/failure/messages'
 import type { CodexSubscriptionTransport } from '../../shared/settings'
 import {
   DEFAULT_CONVERSATION_SKILL_IMPORT_ENABLED,
@@ -64,6 +66,7 @@ export type AdmittedAgentBackendTarget = ExplicitAgentBackendTarget &
 
 export type AgentBackendResolutionContext = {
   forcedSkillIds?: string[]
+  skillWhitelist?: string[]
   systemPromptAppends?: string[]
   grantedLocalRoots?: readonly Pick<GrantedLocalRoot, 'path' | 'access'>[]
   includeSkillAndConnectorContext?: boolean
@@ -92,15 +95,16 @@ export type AgentBackendRuntimePort = Pick<
   AgentRuntimeManager,
   | 'resolveClaudeExecutable'
   | 'resolveOpencodeExecutable'
+  | 'probeOpencodeVersion'
   | 'resolveCodeBuddyExecutable'
   | 'resolveCodexExecutable'
   | 'probeCodexNativeVersion'
   | 'provisionClaudeRuntimeConfig'
-  | 'materializeAgentSkills'
+  | 'prepareAgentSkillDiscovery'
   | 'materializeAgentConfigFiles'
   | 'reserveOpenCodeUsagePort'
   | 'resolveCodexProxyEnvironment'
->
+> & { resolvePiExecutable?: () => Promise<string> }
 
 export type AgentBackendProviderPort = Pick<
   ProviderAccountsModule,
@@ -183,7 +187,8 @@ export class AgentBackendResolver {
       new Set(context.forcedSkillIds ?? []),
       executablePath,
       plan.claudeModelConfig,
-      context.includeSkillAndConnectorContext !== false
+      context.includeSkillAndConnectorContext !== false,
+      context.skillWhitelist
     )
   }
 
@@ -337,7 +342,7 @@ export class AgentBackendResolver {
     const forceNativeResponsesCompatibility =
       context.forceCodexNativeResponsesCompatibility === true &&
       framework.id === 'codex' &&
-      !target.needsChatResponsesBridge &&
+      !target.needsChatResponsesToChatCompletionsBridge &&
       !target.needsNativeResponsesCompatibility
     if (forceNativeResponsesCompatibility && isCodexSubscriptionProvider(target.provider.type)) {
       throw new Error(
@@ -347,6 +352,7 @@ export class AgentBackendResolver {
     const forcedSkillIds = new Set(context.forcedSkillIds ?? [])
     const includeSkillAndConnectorContext = context.includeSkillAndConnectorContext !== false
     const codeBuddySkillRuntimeRoot = join(codeBuddyStorageDir(this.storageRoot), 'skill-runtime')
+    const piSkillRuntimeRoot = join(this.storageRoot, 'pi', 'skill-runtime')
     const codexSkillRuntimeRoot = isCodexSubscriptionProvider(target.provider.type)
       ? codexSubscriptionStorageDir(this.storageRoot)
       : codexStorageDir(this.storageRoot)
@@ -356,7 +362,7 @@ export class AgentBackendResolver {
         : undefined
     let connectorInstructions =
       includeSkillAndConnectorContext && framework.id === 'claude-code'
-        ? renderConnectorInstructions(this.connectors.connectorSkillNames(settings.connectors))
+        ? renderConnectorInstructions()
         : ''
     const executablePath =
       framework.id === 'claude-code'
@@ -368,11 +374,24 @@ export class AgentBackendResolver {
             )
           : framework.id === 'codebuddy'
             ? await this.runtime.resolveCodeBuddyExecutable(settings.codebuddyPath)
-            : await this.runtime.resolveOpencodeExecutable(settings.opencodePath)
+            : framework.id === 'pi'
+              ? await this.runtime.resolvePiExecutable?.()
+              : await this.runtime.resolveOpencodeExecutable(settings.opencodePath)
+    if (!executablePath) throw new Error('The selected agent executable is unavailable.')
     const codexNativeVersion =
       framework.id === 'codex'
         ? await this.runtime.probeCodexNativeVersion(settings.codex?.nativePath)
         : undefined
+    const opencodeVersion =
+      framework.id === 'opencode'
+        ? await this.runtime.probeOpencodeVersion(executablePath)
+        : undefined
+    const opencodeMajorVersion = opencodeVersion?.startsWith('2.') ? 2 : 1
+    if (framework.id === 'opencode' && !/^[12]\.\d+\./.test(opencodeVersion ?? '')) {
+      throw new Error(
+        'Could not identify a supported OpenCode CLI version. Re-detect OpenCode in Settings.'
+      )
+    }
     if (
       framework.id === 'claude-code' &&
       target.providerType === 'claude-shared' &&
@@ -405,7 +424,8 @@ export class AgentBackendResolver {
         forcedSkillIds,
         executablePath,
         plan.claudeModelConfig,
-        includeSkillAndConnectorContext
+        includeSkillAndConnectorContext,
+        context.skillWhitelist
       )
       const transport = await this.transports.acquire({ activeTarget: target, plan })
       return {
@@ -424,8 +444,8 @@ export class AgentBackendResolver {
         systemPromptAppends: [userSkillDirectoryGuidance, connectorInstructions].filter(
           (append): append is string => Boolean(append)
         ),
-        ...(transport.anthropicBridgeLease
-          ? { anthropicBridgeLease: transport.anthropicBridgeLease }
+        ...(transport.messagesBridgeLease
+          ? { messagesBridgeLease: transport.messagesBridgeLease }
           : {})
       }
     }
@@ -438,34 +458,41 @@ export class AgentBackendResolver {
       await this.ensureCodexSubscriptionHome(codexSubscriptionTransport)
     }
     const backendProviderId = plan.backendProviderId
+    let skillDiscovery: Awaited<ReturnType<AgentRuntimeManager['prepareAgentSkillDiscovery']>> = {
+      connectorSkillNames: [],
+      allowedNames: [],
+      mainAllowedNames: [],
+      allowedPaths: []
+    }
     if (framework.supportsSkills || framework.id === 'codebuddy') {
       const skillsRoot =
         framework.id === 'codebuddy'
           ? join(codeBuddySkillRuntimeRoot, '.claude')
           : framework.id === 'codex'
             ? codexSkillRuntimeRoot
-            : opencodeConfigDir(this.storageRoot)
-      const materializedConnectorSkillNames = includeSkillAndConnectorContext
-        ? await this.runtime.materializeAgentSkills(
+            : framework.id === 'pi'
+              ? piSkillRuntimeRoot
+              : opencodeConfigDir(this.storageRoot)
+      skillDiscovery = includeSkillAndConnectorContext
+        ? await this.runtime.prepareAgentSkillDiscovery(
             settings,
             skillsRoot,
             forcedSkillIds,
+            context.skillWhitelist,
             ...(framework.id === 'codebuddy' ? [{ directoryLayout: 'agent-facing' as const }] : [])
           )
-        : []
-      connectorInstructions = includeSkillAndConnectorContext
-        ? renderConnectorInstructions(materializedConnectorSkillNames)
-        : ''
+        : skillDiscovery
+      connectorInstructions = includeSkillAndConnectorContext ? renderConnectorInstructions() : ''
     } else if (includeSkillAndConnectorContext) {
       connectorInstructions = renderConnectorInstructions(
-        this.connectors.connectorSkillNames(settings.connectors)
+        this.connectors.connectorSkillNames(settings.connectors, context.skillWhitelist)
       )
     }
 
     const transport = await this.transports.acquire({ activeTarget: target, plan })
     const provider = transport.provider ?? target.provider
     const providerModelCatalog = transport.providerModelCatalog ?? plan.providerModelCatalog
-    const responsesBridge = transport.responsesBridge
+    const responsesConnection = transport.responsesConnection
     const persistentSystemPromptAppends = [
       ...(context.systemPromptAppends ?? []),
       ...(userSkillDirectoryGuidance ? [userSkillDirectoryGuidance] : []),
@@ -473,14 +500,21 @@ export class AgentBackendResolver {
     ]
 
     try {
+      if (framework.id === 'pi' && !transport.piModelBridge) {
+        throw new Error('The Pi model bridge is unavailable.')
+      }
       const modelConfig = framework.prepareModelConfig(provider, {
         storageRoot: this.storageRoot,
         executablePath,
+        ...(skillDiscovery ? { skillDiscovery } : {}),
         ...(context.grantedLocalRoots?.length
           ? { grantedLocalRoots: context.grantedLocalRoots }
           : {}),
-        ...(codexNativeVersion ? { nativeVersion: codexNativeVersion } : {}),
-        responsesBridge,
+        ...(codexNativeVersion || opencodeVersion
+          ? { nativeVersion: codexNativeVersion ?? opencodeVersion }
+          : {}),
+        responsesConnection,
+        ...(transport.piModelBridge ? { piModelBridge: transport.piModelBridge } : {}),
         reasoningEffort: sessionEffort,
         reasoningEfforts: supportedReasoningEfforts,
         providerModelCatalog,
@@ -491,7 +525,9 @@ export class AgentBackendResolver {
       })
       await this.runtime.materializeAgentConfigFiles(modelConfig.configFiles)
       const opencodeUsagePort =
-        framework.id === 'opencode' ? await this.runtime.reserveOpenCodeUsagePort() : undefined
+        framework.id === 'opencode' && opencodeMajorVersion === 1
+          ? await this.runtime.reserveOpenCodeUsagePort()
+          : undefined
       const opencodeUsagePassword = opencodeUsagePort === undefined ? undefined : randomUUID()
       const usesCodexSystemProxy =
         framework.id === 'codex' && isCodexSubscriptionProvider(provider.type)
@@ -506,12 +542,15 @@ export class AgentBackendResolver {
         ...(codexSubscriptionTransport ? { codexSubscriptionTransport } : {}),
         backendId: `${framework.id}:${backendProviderId}`,
         modelRoute,
-        ...(modelRoute === 'codex-bridge' && responsesBridge?.continuityToken
-          ? { providerContinuityToken: responsesBridge.continuityToken }
+        ...(modelRoute === 'codex-bridge' && responsesConnection?.continuityToken
+          ? { providerContinuityToken: responsesConnection.continuityToken }
           : {}),
         executablePath,
         ...(framework.id === 'opencode'
-          ? { opencodeConfigFiles: modelConfig.configFiles?.map((file) => ({ ...file })) }
+          ? {
+              opencodeMajorVersion,
+              opencodeConfigFiles: modelConfig.configFiles?.map((file) => ({ ...file }))
+            }
           : {}),
         env: {
           ...(modelConfig.env ?? {}),
@@ -536,23 +575,36 @@ export class AgentBackendResolver {
           ? { proxyEnvironmentMode: proxyEnv === undefined ? 'inherit' : 'replace' }
           : {}),
         sessionModel,
-        ...(framework.id === 'codex' && isCodexSubscriptionProvider(provider.type) && sessionModel
+        ...((framework.id === 'pi' ||
+          (framework.id === 'codex' && isCodexSubscriptionProvider(provider.type))) &&
+        sessionModel
           ? { sessionModelRequired: true }
           : {}),
         sessionEffort,
-        ...((framework.id === 'codebuddy' || framework.id === 'codex') &&
-        includeSkillAndConnectorContext
+        ...(includeSkillAndConnectorContext
           ? {
               sessionOptions: {
                 [OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION]: {
-                  command: process.execPath,
-                  entryPath: this.skillRuntimeMcpEntryPath,
+                  mainAllowedNames: skillDiscovery.mainAllowedNames,
+                  ...(framework.id === 'opencode'
+                    ? { nativeAllowedNames: skillDiscovery.allowedNames }
+                    : {
+                        command: process.execPath,
+                        entryPath: this.skillRuntimeMcpEntryPath
+                      }),
                   ...(framework.id === 'codebuddy'
                     ? { root: codeBuddySkillRuntimeRoot }
-                    : {
-                        root: codexSkillRuntimeRoot,
-                        skillsDirectory: join(codexSkillRuntimeRoot, 'skills')
-                      })
+                    : framework.id === 'codex'
+                      ? {
+                          root: codexSkillRuntimeRoot,
+                          skillsDirectory: join(codexSkillRuntimeRoot, 'skills')
+                        }
+                      : framework.id === 'pi'
+                        ? {
+                            root: piSkillRuntimeRoot,
+                            skillsDirectory: join(piSkillRuntimeRoot, 'skills')
+                          }
+                        : {})
                 }
               }
             }
@@ -571,7 +623,7 @@ export class AgentBackendResolver {
                 authorization: `Basic ${Buffer.from(`opencode:${opencodeUsagePassword}`).toString('base64')}`
               }
             }),
-        responsesBridgeLease: responsesBridge?.lease,
+        responsesTransportLease: responsesConnection?.lease,
         providerTransportLease: transport.providerTransportLease
       }
     } catch (error) {
@@ -586,7 +638,8 @@ export class AgentBackendResolver {
     forcedSkillIds: ReadonlySet<string>,
     resolvedExecutablePath?: string,
     modelConfig?: ClaudeRuntimeModelConfig,
-    includeSkillAndConnectorContext = true
+    includeSkillAndConnectorContext = true,
+    allowedNames?: readonly string[]
   ): Promise<AgentSpawnConfig> {
     const executablePath =
       resolvedExecutablePath ??
@@ -599,7 +652,8 @@ export class AgentBackendResolver {
       settings,
       forcedSkillIds,
       modelConfig ?? null,
-      includeSkillAndConnectorContext
+      includeSkillAndConnectorContext,
+      allowedNames
     )
     const envOverrides = buildProviderEnv(provider, {
       storageRoot: this.storageRoot,
@@ -620,7 +674,8 @@ export class AgentBackendResolver {
       [OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION]: {
         command: process.execPath,
         entryPath: this.skillRuntimeMcpEntryPath,
-        root: runtimeConfig.skillProjection.root
+        root: runtimeConfig.skillProjection.root,
+        mainAllowedNames: runtimeConfig.mainAllowedNames
       }
     }
     const sessionOptions =

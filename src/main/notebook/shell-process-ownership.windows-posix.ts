@@ -65,8 +65,11 @@ const RECEIPT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f
 class ShellProcessRecoveryBlockedError extends Error {
   readonly code = 'SHELL_PROCESS_RECOVERY_BLOCKED'
 
-  constructor(runId: string) {
-    super(`SHELL_PROCESS_RECOVERY_BLOCKED: the old process tree for ${runId} was not reaped.`)
+  constructor(runId: string, options?: ErrorOptions) {
+    super(
+      `SHELL_PROCESS_RECOVERY_BLOCKED: the old process tree for ${runId} was not reaped.`,
+      options
+    )
     this.name = 'ShellProcessRecoveryBlockedError'
   }
 }
@@ -426,12 +429,22 @@ class ShellProcessOwnershipRegistry {
           '-NoProfile',
           '-NonInteractive',
           '-Command',
-          `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`
+          // Load the in-box identity provider directly, without discovering host module trees.
+          'Import-Module "$PSHOME\\Modules\\CimCmdlets\\CimCmdlets.psd1" -ErrorAction Stop; ' +
+            `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" -ErrorAction Stop).CommandLine`
         ],
         { encoding: 'utf8', windowsHide: true, timeout: 5000 }
       )
       if (result.status !== 0 || !result.stdout?.includes(record.receiptId)) {
-        if (exists(pid)) throw new ShellProcessRecoveryBlockedError(record.runId)
+        if (exists(pid)) {
+          const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code
+          // Command lines and stderr can contain secrets; retain only query outcome diagnostics.
+          throw new ShellProcessRecoveryBlockedError(record.runId, {
+            cause: new Error(
+              `Windows host identity query failed: status=${result.status}, code=${errorCode ?? 'none'}, receiptMatched=${Boolean(result.stdout?.includes(record.receiptId))}`
+            )
+          })
+        }
       } else {
         const stopped = await terminateProcessTree(recoveryHandle({ pid, platform: 'win32' }))
         if (!stopped.reaped) throw new ShellProcessRecoveryBlockedError(record.runId)

@@ -1,5 +1,7 @@
 {
   "ownerPaths": [
+    "src/renderer/src/pages/workspace/AuthorizedDirectoriesList.test.tsx",
+    "src/renderer/src/pages/workspace/AuthorizedDirectoriesList.tsx",
     "src/renderer/src/pages/workspace/LiteratureCandidateStatus.test.tsx",
     "src/renderer/src/pages/workspace/LiteratureCandidateStatus.tsx",
     "src/renderer/src/pages/workspace/WorkspaceContextCompactionActivityRow.render.test.tsx",
@@ -16,9 +18,11 @@
     "src/renderer/src/pages/workspace/WorkspaceWebSearchActivityRow.tsx",
     "src/renderer/src/pages/workspace/literature-candidate-session-context.ts",
     "src/renderer/src/pages/workspace/LiteratureToolReferenceList.tsx",
-    "src/renderer/src/pages/workspace/LiteratureToolReferenceList.test.tsx"
+    "src/renderer/src/pages/workspace/LiteratureToolReferenceList.test.tsx",
+    "src/renderer/src/pages/workspace/pdf-text-coverage.test.tsx"
   ],
   "interfacePaths": [
+    "src/renderer/src/pages/workspace/AuthorizedDirectoriesList.tsx",
     "src/renderer/src/pages/workspace/LiteratureCandidateStatus.tsx",
     "src/renderer/src/pages/workspace/WorkspaceContextCompactionActivityRow.tsx",
     "src/renderer/src/pages/workspace/WorkspaceLiteratureToolCard.tsx",
@@ -32,14 +36,16 @@
   ],
   "testFiles": {
     "owner": [
+      "src/renderer/src/pages/workspace/AuthorizedDirectoriesList.test.tsx",
       "src/renderer/src/pages/workspace/LiteratureCandidateStatus.test.tsx",
       "src/renderer/src/pages/workspace/WorkspaceContextCompactionActivityRow.render.test.tsx",
       "src/renderer/src/pages/workspace/WorkspacePlanActivityRecord.test.tsx",
       "src/renderer/src/pages/workspace/WorkspaceSkillLoadRow.render.test.tsx",
       "src/renderer/src/pages/workspace/WorkspaceToolDetailsRow.render.test.tsx",
-      "src/renderer/src/pages/workspace/LiteratureToolReferenceList.test.tsx"
+      "src/renderer/src/pages/workspace/LiteratureToolReferenceList.test.tsx",
+      "src/renderer/src/pages/workspace/pdf-text-coverage.test.tsx"
     ],
-    "contract": [],
+    "contract": ["src/main/host-layer-dependencies.architecture.test.ts"],
     "consumer": [
       "src/main/literature/library-tool-contracts.test.ts",
       "src/main/literature/scale-regressions.test.ts",

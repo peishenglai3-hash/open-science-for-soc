@@ -1,5 +1,6 @@
-import type { ChatMessage, ChatSession, ToolActivity } from '@/stores/session-store'
+import type { ChatMessage, ChatSession, ToolActivity } from '@/stores/session-store-contract'
 import { ACP_CONTEXT_COMPACTION_ACTIVITY_TOOL_NAME } from '../../../../shared/acp'
+import { isAgentFrameworkId } from '../../../../shared/agent-framework-id'
 import type { HandoffLifecycleEvent } from '../../../../shared/handoff-lifecycle'
 import {
   isHiddenControlMessage,
@@ -19,6 +20,7 @@ import {
 import { isNotebookExecutionActivity, type ToolExecutionPhase } from './tool-execution-phase'
 import {
   getNotebookMemoryToolDisplayName,
+  isAuthorizedDirectoryTool,
   NOTEBOOK_MEMORY_TOOL_SUFFIXES
 } from './notebook-tool-names'
 
@@ -175,6 +177,8 @@ const formatActivityToolName = (
   const providerToolName = trimDetail(activity.providerToolName)
   const title = trimDetail(activity.title)
 
+  if (isAuthorizedDirectoryTool(providerToolName, title)) return t('List authorized directories')
+
   const notebookToolName =
     (providerToolName && formatNotebookToolName(providerToolName)) ??
     (title && formatNotebookToolName(title))
@@ -306,7 +310,7 @@ const createSessionConfigChangeItems = (
           : undefined
     const segment = outputSegmentId && segments.get(outputSegmentId)
     const runtimeTarget: PersistedMessageAgentTarget | undefined =
-      segment && ['claude-code', 'codex', 'opencode', 'codebuddy'].includes(segment.frameworkId)
+      segment && isAgentFrameworkId(segment.frameworkId)
         ? {
             frameworkId: segment.frameworkId as PersistedMessageAgentTarget['frameworkId'],
             backendId: segment.backendId,

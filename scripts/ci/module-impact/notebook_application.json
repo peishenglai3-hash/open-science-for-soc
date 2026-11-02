@@ -131,7 +131,8 @@
     "src/main/notebook/kernel-epoch-contract.ts",
     "src/main/notebook/runtime-service.architecture.test.ts",
     "src/main/notebook/runtime-service.ts",
-    "src/main/notebook-payload.integration.test.ts"
+    "src/main/notebook-payload.integration.test.ts",
+    "src/main/notebook/authorized-directories.integration.test.ts"
   ],
   "interfacePaths": [
     "src/main/notebook/application-commands.ts",
@@ -335,7 +336,8 @@
       "src/main/notebook/environment-restoration-sandbox.contract.test.ts",
       "src/main/notebook/environment-runner.test.ts",
       "src/main/notebook/environment-startup.contract.test.ts",
-      "src/main/notebook/windows-runtime-download.contract.test.ts"
+      "src/main/notebook/windows-runtime-download.contract.test.ts",
+      "src/main/notebook/authorized-directories.integration.test.ts"
     ],
     "consumer": [
       "src/main/application-command-wiring.test.ts",
@@ -802,7 +804,7 @@
       "src/main/settings/provider-auth-lifecycle.test.ts",
       "src/main/settings/provider-completion-races.test.ts",
       "src/main/settings/repository.test.ts",
-      "src/main/settings/responses-bridge.integration.test.ts",
+      "src/main/settings/responses-to-chat-completions-bridge.integration.test.ts",
       "src/main/settings/xai-provider-account-owner.test.ts",
       "src/main/skill-marketplace/installation.test.ts",
       "src/main/skills/catalog.python-availability.test.ts",
@@ -828,7 +830,8 @@
       "src/renderer/src/stores/runtime-settings-store.test.ts",
       "src/main/node-entry.test.ts",
       "src/main/desktop-runtime-session-size.integration.test.ts",
-      "src/main/web-service/session-payload.integration.test.ts"
+      "src/main/web-service/session-payload.integration.test.ts",
+      "src/main/composition/session-packages.test.ts"
     ]
   },
   "capabilityOverlays": ["notebook_network_sandbox", "windows_sensitive"],

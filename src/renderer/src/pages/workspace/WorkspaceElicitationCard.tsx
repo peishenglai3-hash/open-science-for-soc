@@ -1,14 +1,5 @@
 /* Hallmark · pre-emit critique: P5 H5 E5 S5 R5 V4 */
-import {
-  useId,
-  useEffectEvent,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-  type FormEvent
-} from 'react'
+import { useId, useEffectEvent, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Bot,
@@ -23,6 +14,7 @@ import {
 } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
+import { ErrorNotice } from '@/components/error-notice'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
@@ -31,6 +23,7 @@ import {
   MAX_ELICITATION_MESSAGE_CHARS,
   isValidElicitationValue,
   resolveAgentUserChoiceQuestions,
+  normalizeAgentUserChoiceAnswers,
   type AgentUserChoiceQuestion,
   type ElicitationAnswer,
   type ElicitationField,
@@ -39,9 +32,14 @@ import {
   type ElicitationValue,
   type PendingElicitationRequest
 } from '../../../../shared/acp'
-import type { ElicitationEditDraft } from '@/stores/session-store'
+import type { ElicitationEditDraft } from '@/stores/session-store-contract'
 import type { AnnotationPort } from './annotations/annotation-port'
 import { TextAnnotationSurface } from './annotations/TextAnnotationSurface'
+import { ChoiceKindChip } from './ChoiceKindChip'
+import { QuestionSkipButton } from './QuestionSkipButton'
+
+type FormValues = ElicitationEditDraft['values']
+type FormValue = FormValues[string]
 
 const displayValue = (
   value: ElicitationValue,
@@ -59,8 +57,8 @@ const displayValue = (
 const initialValues = (
   fields: ElicitationField[],
   answers: ElicitationAnswer[] = []
-): Record<string, ElicitationValue | undefined> => {
-  const values = Object.fromEntries(
+): FormValues => {
+  const values: FormValues = Object.fromEntries(
     fields.map((field) => [
       field.id,
       field.defaultValue ??
@@ -72,8 +70,10 @@ const initialValues = (
     ])
   )
   const fieldIds = new Set(fields.map((field) => field.id))
-  for (const answer of answers) {
-    if (fieldIds.has(answer.fieldId)) values[answer.fieldId] = answer.value
+  for (const answer of normalizeAgentUserChoiceAnswers(fields, answers)) {
+    if (fieldIds.has(answer.fieldId)) {
+      values[answer.fieldId] = answer.status === 'skipped' ? { status: 'skipped' } : answer.value
+    }
   }
   return values
 }
@@ -104,8 +104,9 @@ const normalizeLocalDateTime = (value: string): string | undefined => {
 
 const valueForSubmission = (
   field: ElicitationField,
-  value: ElicitationValue | undefined
+  value: FormValue
 ): ElicitationValue | undefined => {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return undefined
   if (value === '' || (Array.isArray(value) && value.length === 0)) return undefined
   if (field.format !== 'date-time' || typeof value !== 'string') return value
   const normalized = normalizeLocalDateTime(value)
@@ -114,10 +115,7 @@ const valueForSubmission = (
   return compact.length >= (field.minLength ?? 0) ? compact : normalized
 }
 
-const valueForTextInput = (
-  field: ElicitationField,
-  value: ElicitationValue | undefined
-): string => {
+const valueForTextInput = (field: ElicitationField, value: FormValue): string => {
   if (typeof value !== 'string' || field.format !== 'date-time') {
     return typeof value === 'string' ? value : ''
   }
@@ -131,17 +129,14 @@ const valueForTextInput = (
   return `${pad(date.getFullYear(), 4)}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}${fraction}`
 }
 
-const hasValidValue = (field: ElicitationField, value: ElicitationValue | undefined): boolean => {
+const hasValidValue = (field: ElicitationField, value: FormValue): boolean => {
   value = valueForSubmission(field, value)
   if (value === undefined) return !field.required
   if (field.required && typeof value === 'string' && value.trim().length === 0) return false
   return isValidElicitationValue(field, value)
 }
 
-const submittedAnswers = (
-  fields: ElicitationField[],
-  values: Record<string, ElicitationValue | undefined>
-): ElicitationAnswer[] =>
+const submittedAnswers = (fields: ElicitationField[], values: FormValues): ElicitationAnswer[] =>
   fields.flatMap((field) => {
     const value = valueForSubmission(field, values[field.id])
     return value === undefined ? [] : [{ fieldId: field.id, value }]
@@ -164,13 +159,16 @@ type WorkspaceElicitationCardProps = {
 
 const answerForChoiceQuestion = (
   question: AgentUserChoiceQuestion,
-  values: Record<string, ElicitationValue | undefined>
+  values: FormValues
 ): ElicitationAnswer | undefined => {
   const customValue = values[question.customField.id]
   if (typeof customValue === 'string' && customValue.trim()) {
-    return { fieldId: question.customField.id, value: customValue.trim() }
+    return { fieldId: question.customField.id, status: 'answered', value: customValue.trim() }
   }
   const selectedValue = values[question.choiceField.id]
+  if (selectedValue && typeof selectedValue === 'object' && !Array.isArray(selectedValue)) {
+    return { fieldId: question.choiceField.id, status: 'skipped' }
+  }
   return selectedValue === undefined || (Array.isArray(selectedValue) && selectedValue.length === 0)
     ? undefined
     : { fieldId: question.choiceField.id, value: selectedValue }
@@ -178,7 +176,7 @@ const answerForChoiceQuestion = (
 
 const choiceAnswers = (
   questions: AgentUserChoiceQuestion[],
-  values: Record<string, ElicitationValue | undefined>
+  values: FormValues
 ): ElicitationAnswer[] =>
   questions.flatMap((question) => {
     const answer = answerForChoiceQuestion(question, values)
@@ -187,7 +185,7 @@ const choiceAnswers = (
 
 const firstUnansweredQuestionIndex = (
   questions: AgentUserChoiceQuestion[],
-  values: Record<string, ElicitationValue | undefined>
+  values: FormValues
 ): number => {
   const index = questions.findIndex((question) => !answerForChoiceQuestion(question, values))
   return index === -1 ? Math.max(questions.length - 1, 0) : index
@@ -195,7 +193,7 @@ const firstUnansweredQuestionIndex = (
 
 const isChoiceOptionSelected = (
   question: AgentUserChoiceQuestion,
-  values: Record<string, ElicitationValue | undefined>,
+  values: FormValues,
   optionValue: string
 ): boolean => {
   const value = values[question.choiceField.id]
@@ -213,23 +211,23 @@ const WorkspaceElicitationCard = ({
   editDraft,
   onEditDraftChange,
   annotationPort,
-  annotationItemId,
-  revealRequest
+  annotationItemId
 }: WorkspaceElicitationCardProps): React.JSX.Element => {
   const { t } = useTranslation()
   const fieldStatusId = useId()
-  const choiceQuestions = request ? resolveAgentUserChoiceQuestions(request.fields) : undefined
+  const questionTitleId = useId()
+  // Historical surfaces have saved fields but no pending request.
+  const questionFields = request?.fields ?? elicitation.fields
+  const choiceQuestions = resolveAgentUserChoiceQuestions(questionFields)
   const restoredValues = initialValues(
-    request?.fields ?? [],
+    questionFields,
     elicitation.state === 'pending' ? (elicitation.draftAnswers ?? []) : []
   )
   const restoredEdit =
     elicitation.state === 'pending' && editDraft?.requestId === request?.requestId
       ? editDraft
       : undefined
-  const [values, setValues] = useState<Record<string, ElicitationValue | undefined>>(
-    () => restoredEdit?.values ?? restoredValues
-  )
+  const [values, setValues] = useState<FormValues>(() => restoredEdit?.values ?? restoredValues)
   const [confirmedValues, setConfirmedValues] = useState(() => restoredValues)
   const [activeChoiceIndex, setActiveChoiceIndex] = useState(
     () =>
@@ -240,8 +238,8 @@ const WorkspaceElicitationCard = ({
   const [error, setError] = useState<string>()
   // Accordion review: indexes of the questions whose original content is expanded in place.
   const [expandedQuestions, setExpandedQuestions] = useState<ReadonlySet<number>>(new Set())
-  const appliedRevealRequestIdRef = useRef<number | undefined>(undefined)
   const customAnswerRef = useRef<HTMLTextAreaElement>(null)
+  const optionsRef = useRef<HTMLDivElement>(null)
 
   const canSubmit = useMemo(
     () =>
@@ -249,37 +247,38 @@ const WorkspaceElicitationCard = ({
     [request, values]
   )
   const choiceQuestion = choiceQuestions?.[activeChoiceIndex]
-  const answers = elicitation.answers ?? []
+  const answers = normalizeAgentUserChoiceAnswers(questionFields, elicitation.answers ?? [])
   const fieldsById = new Map(elicitation.fields.map((field) => [field.id, field]))
   // Review selections come straight from the recorded answers — form state stays untouched.
   const reviewValues = useMemo(
     () =>
       initialValues(
         readOnly
-          ? (request?.fields ?? []).map((field) => ({
+          ? questionFields.map((field) => ({
               ...field,
               defaultValue: undefined,
               required: false
             }))
-          : (request?.fields ?? []),
+          : questionFields,
         elicitation.answers ?? []
       ),
-    [request, elicitation.answers, readOnly]
+    [questionFields, elicitation.answers, readOnly]
   )
   const terminalLabel =
     elicitation.state === 'declined'
-      ? t('Skipped')
+      ? t(choiceQuestions ? 'User skipped' : 'Skipped')
       : elicitation.state === 'cancelled'
         ? t('Cancelled')
         : undefined
   const currentChoiceAnswer = choiceQuestion
     ? answerForChoiceQuestion(choiceQuestion, values)
     : undefined
+  const currentQuestionSkipped = currentChoiceAnswer?.status === 'skipped'
   const completedChoiceAnswers = choiceQuestions ? choiceAnswers(choiceQuestions, values) : []
   // The footer tally sits under the current question's options, so it counts only what is
   // selected there — a multi-select answer is an array, other answers count as one.
   const selectedChoiceCount =
-    currentChoiceAnswer === undefined
+    currentChoiceAnswer === undefined || currentQuestionSkipped
       ? 0
       : Array.isArray(currentChoiceAnswer.value)
         ? currentChoiceAnswer.value.length
@@ -295,6 +294,14 @@ const WorkspaceElicitationCard = ({
     currentChoiceAnswer?.fieldId === choiceQuestion?.customField.id &&
     currentChoiceAnswer?.value === 'Let the agent decide'
   )
+  // Translate the app-owned sentinel only in a choice's custom field, not arbitrary answer text.
+  const displayAnswer = (answer: ElicitationAnswer): string => {
+    if (answer.status === 'skipped') return t('User skipped')
+    if (choiceQuestions?.some((question) => question.customField.id === answer.fieldId)) {
+      if (answer.value === 'Let the agent decide') return t('Let the agent decide')
+    }
+    return displayValue(answer.value, fieldsById.get(answer.fieldId), t)
+  }
   const canReviewAnswer = Boolean(elicitation.state === 'answered' && choiceQuestions)
   const isPendingPlaceholder = variant === 'pending-placeholder' && elicitation.state === 'pending'
   const choiceTitle =
@@ -314,12 +321,6 @@ const WorkspaceElicitationCard = ({
   const isAnsweredSummary = elicitation.state === 'answered' && answers.length > 0
   // Terminal choice cards render their own summary-style header, so the top title hides too.
   const isTerminalChoiceSummary = Boolean(terminalLabel && choiceQuestions)
-  // The summary is titled by the first question itself — the agent's generic prompt message
-  // carries no information. Multi-question cards append a count suffix in the header.
-  const summaryTitle = choiceQuestions?.length
-    ? choiceQuestions[0].choiceField.description || choiceQuestions[0].choiceField.label
-    : elicitation.message
-
   const toggleQuestionReview = (questionIndex: number): void => {
     setExpandedQuestions((current) => {
       const next = new Set(current)
@@ -329,46 +330,22 @@ const WorkspaceElicitationCard = ({
     })
   }
 
-  // Terminal cards put their status (skipped/cancelled) on the title line, right after the icon.
-  const summaryHeader = (statusPrefix?: string): React.JSX.Element => (
-    <div className="flex items-center gap-2">
+  const summaryHeader = (): React.JSX.Element => (
+    <div className="flex items-start gap-2">
       <span className="grid size-[22px] shrink-0 place-items-center text-primary">
         <CircleHelp className="size-3.5" strokeWidth={2} aria-hidden="true" />
       </span>
       <h3 className="min-w-0 flex-1 whitespace-pre-wrap break-words text-sm font-semibold leading-5">
-        {statusPrefix ? (
-          <span className="text-xs font-normal text-text-300">{`${statusPrefix} · `}</span>
-        ) : null}
-        {summaryTitle}
-        {choiceQuestions && choiceQuestions.length > 1 ? (
-          <span className="font-normal text-text-300">
-            {' · '}
-            {t('{{count}} questions', {
-              count: choiceQuestions.length,
-              defaultValue_one: '{{count}} question'
-            })}
-          </span>
-        ) : null}
+        {elicitation.message}
       </h3>
     </div>
   )
 
-  // Read-only rendering of one question's original content — shared by answered rows and
-  // skipped/cancelled cards so every question stays reviewable. Selections come from the
-  // recorded answers via reviewValues (empty for terminal cards, so nothing reads as selected).
-  const renderQuestionReview = (question: AgentUserChoiceQuestion): React.JSX.Element => {
-    const questionAnswer = answerForChoiceQuestion(question, reviewValues)
-    const questionAgentDecides = Boolean(
-      questionAnswer?.fieldId === question.customField.id &&
-      questionAnswer?.value === 'Let the agent decide'
-    )
-    const questionCustomSelected = Boolean(
-      questionAnswer?.fieldId === question.customField.id && !questionAgentDecides
-    )
-    return (
-      // Translucent white panel: a different material from the gray summary rows,
-      // scaled to the summary rows (size-5 badges, 13px text).
-      <div className="mb-1.5 mt-1 rounded-[10px] bg-bg-000/60 p-2">
+  // Keep each question visible once, outside the answer disclosure and annotation-free chip.
+  const renderQuestionHeading = (question: AgentUserChoiceQuestion): React.JSX.Element => (
+    <div className="flex items-start gap-2">
+      <ChoiceKindChip kind={question.choiceField.kind} />
+      <div className="min-w-0 flex-1">
         {annotationPort && annotationItemId ? (
           <TextAnnotationSurface
             source={{
@@ -384,16 +361,48 @@ const WorkspaceElicitationCard = ({
             onRemove={annotationPort.onRemove}
             onError={annotationPort.onError}
           >
-            <p className="whitespace-pre-wrap break-words text-[13px] font-semibold leading-[18px]">
+            <h3
+              id={`${fieldStatusId}-${question.choiceField.id}-title`}
+              className="whitespace-pre-wrap break-words text-sm font-semibold leading-5"
+            >
               {question.choiceField.description || question.choiceField.label}
-            </p>
+            </h3>
           </TextAnnotationSurface>
         ) : (
-          <p className="whitespace-pre-wrap break-words text-[13px] font-semibold leading-[18px]">
+          <h3
+            id={`${fieldStatusId}-${question.choiceField.id}-title`}
+            className="whitespace-pre-wrap break-words text-sm font-semibold leading-5"
+          >
             {question.choiceField.description || question.choiceField.label}
-          </p>
+          </h3>
         )}
-        <div className="mt-1" data-testid="elicitation-choice-review">
+      </div>
+    </div>
+  )
+
+  // Read-only rendering of one question's original content — shared by answered rows and
+  // skipped/cancelled cards so every question stays reviewable. Selections come from the
+  // recorded answers via reviewValues (empty for terminal cards, so nothing reads as selected).
+  const renderQuestionReview = (question: AgentUserChoiceQuestion): React.JSX.Element => {
+    const questionAnswer = answerForChoiceQuestion(question, reviewValues)
+    const questionAgentDecides = Boolean(
+      questionAnswer?.fieldId === question.customField.id &&
+      questionAnswer?.value === 'Let the agent decide'
+    )
+    const questionCustomSelected = Boolean(
+      questionAnswer?.fieldId === question.customField.id &&
+      !questionAgentDecides &&
+      questionAnswer?.status !== 'skipped'
+    )
+    return (
+      // Translucent white panel: a different material from the gray summary rows,
+      // scaled to the summary rows (size-5 badges, 13px text).
+      <div
+        id={`${fieldStatusId}-${question.choiceField.id}-options`}
+        className="mt-1 rounded-[10px] bg-bg-000/60 p-2"
+      >
+        <div data-testid="elicitation-choice-review">
+          {questionAnswer?.status === 'skipped' ? <p>{displayAnswer(questionAnswer)}</p> : null}
           {question.choiceField.options?.map((option, index) => {
             const selected = isChoiceOptionSelected(question, reviewValues, option.value)
             return (
@@ -403,7 +412,7 @@ const WorkspaceElicitationCard = ({
                 data-selected={selected ? 'true' : 'false'}
                 className={cn(
                   'flex w-full items-start gap-2 px-1 py-1.5 text-left',
-                  selected && 'bg-bg-200'
+                  selected && 'rounded-md bg-primary/10'
                 )}
               >
                 <span
@@ -465,11 +474,7 @@ const WorkspaceElicitationCard = ({
                 <Check className="size-3" strokeWidth={2} aria-label={t('Selected')} />
               </span>
               <span className="min-h-4 min-w-0 flex-1 whitespace-pre-wrap break-words">
-                {displayValue(
-                  questionAnswer?.value ?? '',
-                  fieldsById.get(question.customField.id),
-                  t
-                )}
+                {questionAnswer ? displayAnswer(questionAnswer) : ''}
               </span>
             </div>
           ) : null}
@@ -477,40 +482,6 @@ const WorkspaceElicitationCard = ({
       </div>
     )
   }
-
-  useLayoutEffect(() => {
-    if (
-      !request ||
-      !revealRequest ||
-      elicitation.state !== 'answered' ||
-      revealRequest.itemId !== annotationItemId ||
-      appliedRevealRequestIdRef.current === revealRequest.requestId
-    ) {
-      return
-    }
-    const fieldMatch = /^field:([^:]+):(description|label)$/u.exec(revealRequest.sectionId ?? '')
-    if (!fieldMatch) return
-    const questions = resolveAgentUserChoiceQuestions(request.fields)
-    if (!questions) return
-    const questionIndex = questions.findIndex(
-      (question) => question.choiceField.id === fieldMatch[1]
-    )
-    if (questionIndex < 0) return
-    let cancelled = false
-    queueMicrotask(() => {
-      if (cancelled) return
-      appliedRevealRequestIdRef.current = revealRequest.requestId
-      setExpandedQuestions((current) => {
-        if (current.has(questionIndex)) return current
-        const next = new Set(current)
-        next.add(questionIndex)
-        return next
-      })
-    })
-    return () => {
-      cancelled = true
-    }
-  }, [annotationItemId, elicitation.answers, elicitation.state, request, revealRequest])
 
   // Capture edits without confirming a question or emitting an Agent response. The callback can
   // change on store updates; only local input/navigation changes should publish another snapshot.
@@ -559,15 +530,20 @@ const WorkspaceElicitationCard = ({
     })
   }
 
-  const handleChoiceSubmit = (event: FormEvent<HTMLFormElement>): void => {
-    event.preventDefault()
-    if (!request || !choiceQuestions || !choiceQuestion || !currentChoiceAnswer) return
+  const confirmChoice = (nextValues: FormValues): void => {
+    if (
+      !request ||
+      !choiceQuestions ||
+      !choiceQuestion ||
+      !answerForChoiceQuestion(choiceQuestion, nextValues)
+    )
+      return
 
     if (!isFinalChoiceQuestion) {
       const nextConfirmedValues = {
         ...confirmedValues,
-        [choiceQuestion.choiceField.id]: values[choiceQuestion.choiceField.id],
-        [choiceQuestion.customField.id]: values[choiceQuestion.customField.id]
+        [choiceQuestion.choiceField.id]: nextValues[choiceQuestion.choiceField.id],
+        [choiceQuestion.customField.id]: nextValues[choiceQuestion.customField.id]
       }
       setConfirmedValues(nextConfirmedValues)
       onDraftChange?.(choiceAnswers(choiceQuestions, nextConfirmedValues))
@@ -575,14 +551,35 @@ const WorkspaceElicitationCard = ({
       setError(undefined)
       return
     }
-    if (!canFinishChoiceSet) return
+    const answers = choiceAnswers(choiceQuestions, nextValues)
+    if (answers.length !== choiceQuestions.length) return
 
     void respond({
       requestId: request.requestId,
       action: 'accept',
-      answers: completedChoiceAnswers
+      answers
     })
   }
+
+  const handleChoiceSubmit = (event: FormEvent<HTMLFormElement>): void => {
+    event.preventDefault()
+    confirmChoice(values)
+  }
+
+  const skipQuestion = (): void => {
+    if (!choiceQuestion || isSubmitting) return
+    const nextValues = {
+      ...values,
+      [choiceQuestion.choiceField.id]: { status: 'skipped' as const },
+      [choiceQuestion.customField.id]: undefined
+    }
+    setValues(nextValues)
+    confirmChoice(nextValues)
+  }
+
+  useEffect(() => {
+    if (optionsRef.current) optionsRef.current.scrollTop = 0
+  }, [activeChoiceIndex])
 
   useEffect(() => {
     const textarea = customAnswerRef.current
@@ -631,6 +628,11 @@ const WorkspaceElicitationCard = ({
       data-testid="elicitation-card"
       className={cn(
         'rounded-2xl p-3 text-text-000 sm:p-4',
+        elicitation.state === 'pending' &&
+          choiceQuestion &&
+          !isPendingPlaceholder &&
+          'flex min-h-0 flex-col overflow-hidden [&>div]:shrink-0',
+        embedded && elicitation.state === 'pending' && choiceQuestion && 'flex-1',
         // Answered and terminal cards read as activity records: match the tool-group surface
         // (gray, no chrome).
         elicitation.state !== 'pending' ? 'bg-bg-200/70' : 'bg-bg-000',
@@ -638,7 +640,7 @@ const WorkspaceElicitationCard = ({
       )}
     >
       {showChoiceProgress && choiceQuestions ? (
-        <div className="pointer-events-none sticky top-3 z-10 -mb-5 flex h-5 justify-end sm:top-4">
+        <div className="pointer-events-none mb-2 flex h-5 justify-end">
           <span
             data-testid="elicitation-question-progress"
             role="status"
@@ -672,7 +674,21 @@ const WorkspaceElicitationCard = ({
       ) : null}
 
       {isAnsweredSummary || isTerminalChoiceSummary ? null : (
-        <div className="flex items-start">
+        <div
+          data-testid="elicitation-question-title"
+          role={elicitation.state === 'pending' && choiceQuestion ? 'region' : undefined}
+          aria-labelledby={
+            elicitation.state === 'pending' && choiceQuestion ? questionTitleId : undefined
+          }
+          tabIndex={elicitation.state === 'pending' && choiceQuestion ? 0 : undefined}
+          className={cn(
+            'flex items-start gap-2',
+            elicitation.state === 'pending' &&
+              choiceQuestion &&
+              'scrollbar-auto-hide max-h-[min(9rem,12dvh)] overflow-y-auto overscroll-contain focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/40'
+          )}
+        >
+          {choiceQuestion ? <ChoiceKindChip kind={choiceQuestion.choiceField.kind} /> : null}
           {annotationPort && annotationItemId ? (
             <div className="min-w-0 flex-1">
               <TextAnnotationSurface
@@ -691,10 +707,8 @@ const WorkspaceElicitationCard = ({
                 onError={annotationPort.onError}
               >
                 <h3
-                  className={cn(
-                    'min-w-0 flex-1 whitespace-pre-wrap break-words text-base font-semibold leading-6',
-                    showChoiceProgress && 'pr-36'
-                  )}
+                  id={questionTitleId}
+                  className="min-w-0 flex-1 whitespace-pre-wrap break-words text-base font-semibold leading-6"
                 >
                   {choiceTitle ?? elicitation.message}
                 </h3>
@@ -702,10 +716,8 @@ const WorkspaceElicitationCard = ({
             </div>
           ) : (
             <h3
-              className={cn(
-                'min-w-0 flex-1 whitespace-pre-wrap break-words text-base font-semibold leading-6',
-                showChoiceProgress && 'pr-36'
-              )}
+              id={questionTitleId}
+              className="min-w-0 flex-1 whitespace-pre-wrap break-words text-base font-semibold leading-6"
             >
               {choiceTitle ?? elicitation.message}
             </h3>
@@ -718,7 +730,12 @@ const WorkspaceElicitationCard = ({
           <p className="text-xs text-text-300">{t('No submitted answer recorded.')}</p>
           {elicitation.fields.map((field) => (
             <div key={field.id} className="text-sm">
-              <p className="font-medium">{field.description || field.label}</p>
+              <div className="flex items-start gap-2">
+                <ChoiceKindChip kind={field.kind} />
+                <p className="min-w-0 flex-1 break-words font-medium">
+                  {field.description || field.label}
+                </p>
+              </div>
               {field.options?.map((option) => (
                 <p key={option.value} className="text-text-300">
                   {option.label}
@@ -730,9 +747,7 @@ const WorkspaceElicitationCard = ({
             <div className="text-sm">
               <p className="text-xs text-text-300">{t('Saved draft answers')}</p>
               {elicitation.draftAnswers.map((answer) => (
-                <p key={answer.fieldId}>
-                  {displayValue(answer.value, fieldsById.get(answer.fieldId), t)}
-                </p>
+                <p key={answer.fieldId}>{displayAnswer(answer)}</p>
               ))}
             </div>
           ) : null}
@@ -745,11 +760,19 @@ const WorkspaceElicitationCard = ({
           {t('Awaiting your answer…')}
         </p>
       ) : elicitation.state === 'pending' && request && choiceQuestion ? (
-        <form className="mt-2" data-testid="elicitation-choice-mode" onSubmit={handleChoiceSubmit}>
-          {choiceQuestion.choiceField.kind === 'multi-select' ? (
-            <p className="mb-1 text-xs text-text-300">{t('Select one or more options')}</p>
-          ) : null}
-          <div className="max-h-[min(24rem,50vh)] space-y-0.5 overflow-y-auto">
+        <form
+          className="mt-2 flex min-h-0 flex-1 flex-col"
+          data-testid="elicitation-choice-mode"
+          onSubmit={handleChoiceSubmit}
+        >
+          <div
+            ref={optionsRef}
+            data-testid="elicitation-options"
+            className={cn(
+              'scrollbar-auto-hide min-h-0 space-y-0.5 overflow-y-auto overscroll-contain',
+              embedded ? 'flex-1' : 'max-h-[min(24rem,50vh)]'
+            )}
+          >
             {choiceQuestion.choiceField.options?.map((option, index) => {
               const selected = isChoiceOptionSelected(choiceQuestion, values, option.value)
               return (
@@ -832,7 +855,7 @@ const WorkspaceElicitationCard = ({
             </button>
           </div>
 
-          <div className="mt-1.5 flex items-start gap-2 px-2 py-1.5">
+          <div className="mt-1.5 flex shrink-0 items-start gap-2 px-2 py-1.5">
             <span className="mt-0.5 grid size-6 shrink-0 place-items-center rounded-md bg-bg-100 text-text-100">
               <Pencil className="size-3.5" strokeWidth={1.75} aria-hidden="true" />
             </span>
@@ -841,7 +864,13 @@ const WorkspaceElicitationCard = ({
               aria-label={t('Type your own answer')}
               placeholder={t('Or type your own answer…')}
               rows={1}
-              value={typeof customChoiceValue === 'string' ? customChoiceValue : ''}
+              value={
+                !agentDecidesSelected &&
+                !currentQuestionSkipped &&
+                typeof customChoiceValue === 'string'
+                  ? customChoiceValue
+                  : ''
+              }
               disabled={isSubmitting}
               maxLength={Math.min(
                 choiceQuestion.customField.maxLength ?? MAX_ELICITATION_MESSAGE_CHARS,
@@ -860,18 +889,20 @@ const WorkspaceElicitationCard = ({
           </div>
 
           {choiceQuestions ? (
-            <div className="mt-2 flex items-center justify-between gap-3">
-              <span className="truncate text-sm text-text-300">
-                {t('{{count}} selected', { count: selectedChoiceCount })}
+            <div className="mt-2 flex shrink-0 flex-wrap items-center justify-between gap-2">
+              <span className="min-w-0 truncate text-sm text-text-300">
+                {currentQuestionSkipped
+                  ? t('User skipped')
+                  : t('{{count}} selected', { count: selectedChoiceCount })}
               </span>
-              <div className="flex shrink-0 items-center justify-end gap-2">
+              <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
                 {activeChoiceIndex > 0 ? (
                   <Button
                     type="button"
                     variant="secondary"
                     aria-label={t('Previous question')}
                     disabled={isSubmitting}
-                    className="px-3"
+                    className="px-3 hover:bg-surface-control-hover hover:text-text-000"
                     onClick={() => setActiveChoiceIndex((index) => Math.max(index - 1, 0))}
                   >
                     <ChevronLeft className="size-4" strokeWidth={1.75} aria-hidden="true" />
@@ -895,20 +926,13 @@ const WorkspaceElicitationCard = ({
                     <ChevronRight className="size-4" strokeWidth={1.75} aria-hidden="true" />
                   </Button>
                 ) : null}
-                {/* Skipping declines the whole request, so multi-question cards say "Skip all". */}
-                <Button
-                  className="px-3 bg-status-warning-surface text-status-warning-foreground hover:bg-status-warning-surface/70 dark:bg-status-warning-dark-surface dark:text-status-warning-dark-foreground dark:hover:bg-status-warning-dark-surface/70"
-                  type="button"
+                <QuestionSkipButton
                   disabled={isSubmitting}
-                  onClick={() =>
-                    void respond({
-                      requestId: request.requestId,
-                      action: 'decline'
-                    })
+                  onSkip={skipQuestion}
+                  onSkipAll={() =>
+                    void respond({ requestId: request.requestId, action: 'decline' })
                   }
-                >
-                  {choiceQuestions.length > 1 ? t('Skip all') : t('Skip')}
-                </Button>
+                />
               </div>
             </div>
           ) : null}
@@ -1158,8 +1182,8 @@ const WorkspaceElicitationCard = ({
         </form>
       ) : answers.length > 0 ? (
         <div data-testid="elicitation-answer-summary">
-          {summaryHeader()}
-          <div className="mt-1.5 flex flex-col">
+          {!choiceQuestions ? summaryHeader() : null}
+          <div className={cn('flex flex-col gap-4', !choiceQuestions && 'mt-1.5')}>
             {answers.map((answer) => {
               const field = fieldsById.get(answer.fieldId)
               const questionIndex =
@@ -1171,15 +1195,28 @@ const WorkspaceElicitationCard = ({
               const expandable = canReviewAnswer && questionIndex >= 0
               const expanded = expandable && expandedQuestions.has(questionIndex)
               const question = expandable ? choiceQuestions?.[questionIndex] : undefined
+              const skipped = answer.status === 'skipped'
               return (
-                <div key={answer.fieldId}>
+                <div
+                  key={answer.fieldId}
+                  data-testid={question ? 'elicitation-question-record' : undefined}
+                >
+                  {question ? renderQuestionHeading(question) : null}
                   <button
                     type="button"
                     data-testid="elicitation-answer-row"
                     aria-expanded={expandable ? expanded : undefined}
+                    aria-describedby={
+                      question ? `${fieldStatusId}-${question.choiceField.id}-title` : undefined
+                    }
+                    aria-controls={
+                      expanded && question
+                        ? `${fieldStatusId}-${question.choiceField.id}-options`
+                        : undefined
+                    }
                     disabled={!expandable}
                     className={cn(
-                      'group flex w-full items-start gap-2 rounded-lg px-1 py-1.5 text-left',
+                      'group mt-1 flex w-full items-start gap-2 rounded-lg px-1 py-1.5 text-left',
                       expandable
                         ? 'transition-colors duration-200 hover:bg-bg-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 motion-reduce:transition-none'
                         : 'cursor-default'
@@ -1188,21 +1225,31 @@ const WorkspaceElicitationCard = ({
                       if (expandable) toggleQuestionReview(questionIndex)
                     }}
                   >
-                    <span className="mt-px grid size-5 shrink-0 place-items-center rounded-md bg-primary text-primary-foreground">
-                      <Check className="size-3" strokeWidth={3} aria-hidden="true" />
+                    <span
+                      className={cn(
+                        'mt-px grid size-5 shrink-0 place-items-center rounded-md',
+                        skipped ? 'bg-bg-200 text-text-300' : 'bg-primary text-primary-foreground'
+                      )}
+                    >
+                      {skipped ? (
+                        <Minus className="size-3" strokeWidth={2.5} aria-hidden="true" />
+                      ) : (
+                        <Check className="size-3" strokeWidth={3} aria-hidden="true" />
+                      )}
                     </span>
                     <span className="min-w-0 flex-1">
-                      {answers.length > 1 ? (
-                        <span className="block text-xs leading-4 text-text-100">
-                          {/* Custom/agent-decide answers live on the `question_N_custom` field
-                              labeled "Other" — surface the owning question's label instead. */}
-                          {choiceQuestions?.[questionIndex]?.choiceField.label ??
-                            field?.label ??
-                            answer.fieldId}
+                      {!question && answers.length > 1 ? (
+                        <span className="block text-xs leading-5 text-text-100">
+                          {field?.label ?? answer.fieldId}
                         </span>
                       ) : null}
-                      <span className="block whitespace-pre-wrap break-words text-[13px] font-medium leading-[18px]">
-                        {displayValue(answer.value, field, t)}
+                      <span
+                        className={cn(
+                          'block text-[13px] leading-[18px]',
+                          skipped ? 'text-text-300' : 'whitespace-pre-wrap break-words font-medium'
+                        )}
+                      >
+                        {displayAnswer(answer)}
                       </span>
                     </span>
                     {expandable ? (
@@ -1224,31 +1271,31 @@ const WorkspaceElicitationCard = ({
         </div>
       ) : terminalLabel ? (
         choiceQuestions ? (
-          // Terminal choice cards share the summary surface: same header, one expandable row
-          // per question so the original prompt stays reviewable.
+          // Terminal records use the same independent question layout, with status as the trigger.
           <div data-testid="elicitation-answer-summary">
-            {summaryHeader(terminalLabel)}
-            <div className="mt-1.5 flex flex-col">
+            <div className="flex flex-col gap-4">
               {choiceQuestions.map((question, questionIndex) => {
                 const expanded = expandedQuestions.has(questionIndex)
                 return (
-                  <div key={question.choiceField.id}>
+                  <div key={question.choiceField.id} data-testid="elicitation-question-record">
+                    {renderQuestionHeading(question)}
                     <button
                       type="button"
                       data-testid="elicitation-answer-row"
                       aria-expanded={expanded}
-                      className="group flex w-full items-start gap-2 rounded-lg px-1 py-1.5 text-left transition-colors duration-200 hover:bg-bg-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 motion-reduce:transition-none"
+                      aria-describedby={`${fieldStatusId}-${question.choiceField.id}-title`}
+                      aria-controls={
+                        expanded ? `${fieldStatusId}-${question.choiceField.id}-options` : undefined
+                      }
+                      className="group mt-1 flex w-full items-start gap-2 rounded-lg px-1 py-1.5 text-left transition-colors duration-200 hover:bg-bg-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 motion-reduce:transition-none"
                       onClick={() => toggleQuestionReview(questionIndex)}
                     >
                       <span className="mt-px grid size-5 shrink-0 place-items-center rounded-md bg-bg-200 text-text-300">
                         <Minus className="size-3" strokeWidth={2.5} aria-hidden="true" />
                       </span>
                       <span className="min-w-0 flex-1">
-                        <span className="block text-xs leading-4 text-text-100">
-                          {question.choiceField.label}
-                        </span>
-                        <span className="block whitespace-pre-wrap break-words text-[13px] font-medium leading-[18px]">
-                          {question.choiceField.description || question.choiceField.label}
+                        <span className="block text-[13px] leading-[18px] text-text-300">
+                          {terminalLabel}
                         </span>
                       </span>
                       <span className="mt-0.5 grid size-5 shrink-0 place-items-center rounded-md text-text-300 transition-colors duration-150 group-hover:text-text-100">
@@ -1275,4 +1322,69 @@ const WorkspaceElicitationCard = ({
   )
 }
 
-export { WorkspaceElicitationCard }
+const WorkspaceElicitationRecovery = ({
+  elicitation,
+  request,
+  onRespond
+}: Pick<
+  WorkspaceElicitationCardProps,
+  'elicitation' | 'request' | 'onRespond'
+>): React.JSX.Element => {
+  const { t } = useTranslation()
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string>()
+  const responding = useRef(false)
+  const [retryAttempted, setRetryAttempted] = useState(false)
+  const respond = async (retry: boolean): Promise<void> => {
+    if (responding.current || !request || !onRespond || (retry && retryAttempted)) return
+    responding.current = true
+    if (retry) setRetryAttempted(true)
+    setBusy(true)
+    setError(undefined)
+    try {
+      await onRespond({
+        requestId: request.requestId,
+        request,
+        action: retry ? (elicitation.state === 'declined' ? 'decline' : 'accept') : 'cancel',
+        ...(retry ? { answers: elicitation.answers, retryContinuation: true } : {})
+      })
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      responding.current = false
+      setBusy(false)
+    }
+  }
+  return (
+    <div data-testid="elicitation-recovery" className="rounded-2xl bg-bg-000 p-4 shadow-sm">
+      <ErrorNotice
+        title={t('Could not continue the task')}
+        description={t(
+          'Your conversation is preserved. End this wait to return to the conversation.'
+        )}
+        primaryButton={{
+          label: t('End this wait'),
+          onClick: () => void respond(false),
+          loading: busy
+        }}
+        secondaryButton={
+          elicitation.continuationRecovery?.retryable && !retryAttempted
+            ? {
+                label: t('Retry continuation'),
+                onClick: () => void respond(true),
+                disabled: busy
+              }
+            : undefined
+        }
+      >
+        <details className="max-h-40 overflow-auto whitespace-pre-wrap break-words text-xs">
+          <summary>{t('Error details')}</summary>
+          {error ?? elicitation.continuationRecovery?.error}
+        </details>
+        {error ? <p role="alert">{error}</p> : null}
+      </ErrorNotice>
+    </div>
+  )
+}
+
+export { WorkspaceElicitationCard, WorkspaceElicitationRecovery }

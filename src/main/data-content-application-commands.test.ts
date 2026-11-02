@@ -195,6 +195,7 @@ const createDependencies = () => {
     messages: []
   }
   const sessions = {
+    deleteRecoveryFile: vi.fn(async () => undefined),
     listRuntimeTerminalFailures: vi.fn(async () => []),
     retryRuntimeTerminalCommit: vi.fn(async () => undefined),
     searchMessages: vi.fn(),
@@ -267,6 +268,8 @@ const createDependencies = () => {
       dispose: vi.fn()
     },
     fileSaveCommands: {
+      'file:artifact-save-progress': vi.fn(),
+      'file:cancel-artifact-save': vi.fn(),
       'file:save-blob': vi.fn(),
       'file:save-managed': vi.fn(),
       'file:save-session-artifacts': vi.fn(),
@@ -316,12 +319,15 @@ const WRAPPED_COMMAND_KEYS = [
   'projectUpdate',
   'projectUpdateSessionDefaults',
   'sessionDelete',
+  'sessionDeleteRecoveryFile',
   'sessionEditDetails',
   'sessionExportConversation',
   'sessionFork',
   'sessionExportPackage',
   'sessionImportPackage',
   'sessionPackageOperation',
+  'useCaseCatalog',
+  'useCaseIntroduction',
   'sessionInspectDiagnostics',
   'sessionExportDiagnostics',
   'sessionCancelDiagnostics',
@@ -370,6 +376,46 @@ const dispatchCommand = (
 }
 
 describe('Data and content application commands', () => {
+  it('routes manual catalog reloads to a fresh fetch and rejects remote callers', async () => {
+    const deps = createDependencies()
+    const refresh = vi.fn(async () => [])
+    const router = createApplicationCommandRouter()
+    registerDataContentApplicationCommands(router.registrar, {
+      ...deps.dependencies,
+      useCaseCatalog: {
+        refresh
+      } as unknown as DataContentApplicationCommandDependencies['useCaseCatalog']
+    })
+    await expect(dispatchCommand(router, 'useCaseCatalog', ['reload']).result).resolves.toEqual([])
+    expect(refresh).toHaveBeenCalledExactlyOnceWith(true)
+    await expect(
+      dispatchCommand(router, 'useCaseCatalog', ['reload'], remoteCaller).result
+    ).rejects.toThrow()
+    expect(refresh).toHaveBeenCalledOnce()
+  })
+
+  it('routes introduction reads by validated slug and rejects remote callers', async () => {
+    const deps = createDependencies()
+    const introduction = vi.fn(async () => '# Research')
+    const router = createApplicationCommandRouter()
+    registerDataContentApplicationCommands(router.registrar, {
+      ...deps.dependencies,
+      useCaseCatalog: {
+        introduction
+      } as unknown as DataContentApplicationCommandDependencies['useCaseCatalog']
+    })
+    await expect(dispatchCommand(router, 'useCaseIntroduction', ['research']).result).resolves.toBe(
+      '# Research'
+    )
+    expect(introduction).toHaveBeenCalledExactlyOnceWith('research')
+    await expect(
+      dispatchCommand(router, 'useCaseIntroduction', ['../private']).result
+    ).rejects.toThrow()
+    await expect(
+      dispatchCommand(router, 'useCaseIntroduction', ['research'], remoteCaller).result
+    ).rejects.toThrow()
+    expect(introduction).toHaveBeenCalledOnce()
+  })
   it('routes explicit terminal retries to their exact Main execution and rejects malformed identity', async () => {
     const deps = createDependencies()
     const router = createApplicationCommandRouter()
@@ -443,6 +489,7 @@ describe('Data and content application commands', () => {
         'projects:update-session-defaults',
         'sessions:open-recovery-folder',
         'sessions:delete-session',
+        'sessions:delete-recovery-file',
         'sessions:edit-details',
         'sessions:export-conversation',
         'sessions:inspect-diagnostics',
@@ -452,6 +499,8 @@ describe('Data and content application commands', () => {
         'sessions:export-package',
         'sessions:import-package',
         'sessions:package-operation',
+        'sessions:use-case-catalog',
+        'sessions:use-case-introduction',
         'sessions:filter-pdf-context-candidates',
         'sessions:link-pdf-context',
         'sessions:list',
@@ -502,6 +551,8 @@ describe('Data and content application commands', () => {
         'artifacts:list-reproducibility-receipts',
         'artifacts:start-reproducibility-check',
         'artifacts:cancel-reproducibility-check',
+        'file:artifact-save-progress',
+        'file:cancel-artifact-save',
         'file:save-blob',
         'file:save-managed',
         'file:save-session-artifacts',
@@ -568,6 +619,18 @@ describe('Data and content application commands', () => {
         key: 'officePreviewReportState',
         args: ['session-1', { sessionId: 'session-1', phase: 'ready' }],
         owner: deps.dependencies.officePreviewCommands.reportState,
+        passInvocation: true
+      },
+      {
+        key: 'artifactSaveProgress',
+        args: [{ operationId: 'download' }],
+        owner: deps.dependencies.fileSaveCommands['file:artifact-save-progress'],
+        passInvocation: true
+      },
+      {
+        key: 'cancelArtifactSave',
+        args: [{ operationId: 'download' }],
+        owner: deps.dependencies.fileSaveCommands['file:cancel-artifact-save'],
         passInvocation: true
       },
       {
@@ -2469,4 +2532,32 @@ describe('Data and content application commands', () => {
       }
     })
   })
+})
+
+it('validates recovery-file deletion and holds the data-root lease for the mutation', async () => {
+  const deps = createDependencies()
+  const router = createApplicationCommandRouter()
+  registerDataContentApplicationCommands(router.registrar, deps.dependencies)
+  const request = { projectId: 'project-a', fileName: 'session-1.json' }
+  await expect(
+    router.dispatcher.invoke(
+      dataContentApplicationCommands.sessionDeleteRecoveryFile,
+      invocation([request])
+    )
+  ).resolves.toBeUndefined()
+  expect(deps.sessions.deleteRecoveryFile).toHaveBeenCalledExactlyOnceWith(request)
+  expect(deps.dependencies.withDataRootWrite).toHaveBeenCalledOnce()
+  for (const invalid of [
+    { ...request, fileName: '../session-1.json' },
+    { ...request, projectId: 'C:foo' },
+    { ...request, path: '/tmp/file' }
+  ]) {
+    await expect(
+      router.dispatcher.invoke(
+        dataContentApplicationCommands.sessionDeleteRecoveryFile,
+        invocation([invalid] as never)
+      )
+    ).rejects.toThrow()
+  }
+  expect(deps.sessions.deleteRecoveryFile).toHaveBeenCalledOnce()
 })

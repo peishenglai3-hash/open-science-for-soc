@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { useCaseSourceSchema } from './use-cases'
 import { PROJECT_NAME_MAX_LENGTH } from './projects'
 import { defineApplicationCommandContract, validationCodec } from './application-command-contract'
 
@@ -22,14 +23,13 @@ export const PACKAGE_RO_CRATE_METADATA = 'ro-crate-metadata.json'
 export const PACKAGE_MAX_FILE_BYTES = 32 * 1024 ** 3
 export const PACKAGE_MAX_BYTES = 256 * 1024 ** 3
 export const PACKAGE_MIN_IO_BYTES_PER_SECOND = 1024 ** 2
-export const PACKAGE_DEFAULT_IO_BYTES_PER_SECOND = 16 * 1024 ** 2
-export const PACKAGE_MAX_IO_BYTES_PER_SECOND = 256 * 1024 ** 2
+export const PACKAGE_DEFAULT_IO_BYTES_PER_SECOND = 1024 ** 3
+export const PACKAGE_MAX_IO_BYTES_PER_SECOND = 1024 ** 3
 export const PACKAGE_IO_RATE_OPTIONS = [
-  4 * 1024 ** 2,
-  16 * 1024 ** 2,
-  64 * 1024 ** 2,
   128 * 1024 ** 2,
-  256 * 1024 ** 2
+  256 * 1024 ** 2,
+  512 * 1024 ** 2,
+  1024 ** 3
 ] as const
 const transferRateSchema = z
   .number()
@@ -65,6 +65,7 @@ export type PackageSelectableFile = PackageExcludedFile & {
   groupId: string
   source: 'artifact' | 'upload' | 'reproducibility' | 'literature'
   versionNumber: number
+  checksum?: string
   requiredForEvidence?: boolean
   dependentFiles: string[]
 }
@@ -76,11 +77,58 @@ export type PackageFileSelection = {
 
 export type PackageSelectionSummary = {
   pdfNotesAvailable?: boolean
-  retainedFiles: PackageExcludedFile[]
+  retainedFiles: Array<PackageExcludedFile & { checksum?: string }>
   metadataBytes: number
 }
 
+export const packageContentIdentity = (file: {
+  storageKey: string
+  sizeBytes: number
+  checksum?: string
+}): string =>
+  file.checksum && /^[a-f0-9]{64}$/.test(file.checksum)
+    ? `${file.sizeBytes}:${file.checksum}`
+    : `path:${file.storageKey}`
+
+export const packageContentBytes = (
+  files: readonly { storageKey: string; sizeBytes: number; checksum?: string }[]
+): number =>
+  [...new Map(files.map((file) => [packageContentIdentity(file), file.sizeBytes])).values()].reduce(
+    (sum, size) => sum + size,
+    0
+  )
+
+// Weights approximate measured local import time; progress advances only with completed work.
+export const PACKAGE_IMPORT_STAGES = {
+  'read-archive': [0, 8],
+  'verify-archive': [8, 12],
+  'prepare-preview': [12, 30],
+  'validate-preview': [30, 40],
+  'import-files': [40, 60],
+  'verify-files': [60, 67],
+  'prepare-validation': [67, 85],
+  'validate-import': [85, 97],
+  publish: [97, 100]
+} as const
+export type PackageImportStage = keyof typeof PACKAGE_IMPORT_STAGES
+
+export const packageImportPercent = (progress: PackageProgress): number | undefined => {
+  if (!progress.importStage) return undefined
+  const [start, end] = PACKAGE_IMPORT_STAGES[progress.importStage]
+  const fraction =
+    progress.stageProgress ??
+    (progress.totalBytes && progress.completedBytes !== undefined
+      ? progress.completedBytes / progress.totalBytes
+      : progress.totalFiles && progress.completedFiles !== undefined
+        ? progress.completedFiles / progress.totalFiles
+        : 0)
+  return Math.min(99, start + (end - start) * Math.max(0, Math.min(1, fraction)))
+}
+
 export type PackageProgress = {
+  importStage?: PackageImportStage
+  stageProgress?: number
+  overallPercent?: number
   phase:
     | 'preparing'
     | 'selecting'
@@ -99,6 +147,16 @@ export type PackageProgress = {
   currentFile?: string
 }
 
+export type BrowserPackageTransfer = {
+  id: string
+  filename: string
+  state: 'preparing' | 'waiting' | 'receiving' | 'cancelling' | 'cancelled' | 'failed'
+  cleanupPending?: boolean
+  // Received payload high-water mark for display, not the authenticated/written resume offset.
+  completedBytes: number
+  totalBytes: number
+}
+
 export type PackageOperationSnapshot = {
   id: string
   kind: 'export' | 'import' | 'fork'
@@ -106,10 +164,13 @@ export type PackageOperationSnapshot = {
   importTarget?: SessionPackageImportRequest
   presentationRevision?: number
   importRequestId?: string
+  useCaseDownload?: { slug: string; completedBytes: number; totalBytes?: number }
   importFilename?: string
   importPreview?: SessionPackagePreview
   pendingImports?: { id: string; filename: string }[]
   importQueueFull?: boolean
+  browserTransfers?: BrowserPackageTransfer[]
+  browserReceiptOnly?: boolean
   state: 'running' | 'awaiting-selection' | 'cancelling' | 'succeeded' | 'cancelled' | 'failed'
   progress: PackageProgress
   files?: PackageSelectableFile[]
@@ -129,6 +190,13 @@ export type PackageOperationSnapshot = {
 export const packageOperationRequestSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('snapshot') }).strict(),
   z.object({ action: z.literal('cancel'), operationId: identity }).strict(),
+  z
+    .object({
+      action: z.literal('cancel-browser-transfer'),
+      operationId: identity,
+      transferId: identity
+    })
+    .strict(),
   z
     .object({
       action: z.literal('select-project'),
@@ -283,6 +351,14 @@ const packageOperationSnapshotSchema: z.ZodType<PackageOperationSnapshot> = z
     importTarget: sessionPackageImportRequestSchema.optional(),
     presentationRevision: z.number().int().nonnegative().optional(),
     importRequestId: identity.optional(),
+    useCaseDownload: z
+      .object({
+        slug: useCaseSourceSchema.shape.useCase,
+        completedBytes: z.number().int().nonnegative(),
+        totalBytes: z.number().int().positive().optional()
+      })
+      .strict()
+      .optional(),
     importFilename: z.string().optional(),
     importPreview: sessionPackagePreviewSchema.optional(),
     pendingImports: z
@@ -290,6 +366,29 @@ const packageOperationSnapshotSchema: z.ZodType<PackageOperationSnapshot> = z
       .max(16)
       .optional(),
     importQueueFull: z.boolean().optional(),
+    browserReceiptOnly: z.boolean().optional(),
+    browserTransfers: z
+      .array(
+        z
+          .object({
+            id: identity,
+            filename: z.string(),
+            state: z.enum([
+              'preparing',
+              'waiting',
+              'receiving',
+              'cancelling',
+              'cancelled',
+              'failed'
+            ]),
+            cleanupPending: z.boolean().optional(),
+            completedBytes: z.number().int().nonnegative(),
+            totalBytes: z.number().int().positive()
+          })
+          .strict()
+      )
+      .max(16)
+      .optional(),
     state: z.enum([
       'running',
       'awaiting-selection',
@@ -312,6 +411,11 @@ const packageOperationSnapshotSchema: z.ZodType<PackageOperationSnapshot> = z
           'confirming',
           'cleaning'
         ]),
+        importStage: z
+          .enum(Object.keys(PACKAGE_IMPORT_STAGES) as [PackageImportStage, ...PackageImportStage[]])
+          .optional(),
+        stageProgress: z.number().min(0).max(1).optional(),
+        overallPercent: z.number().min(0).max(100).optional(),
         completedBytes: z.number().nonnegative().optional(),
         totalBytes: z.number().nonnegative().optional(),
         completedFiles: z.number().int().nonnegative().optional(),
@@ -322,6 +426,7 @@ const packageOperationSnapshotSchema: z.ZodType<PackageOperationSnapshot> = z
     files: z
       .array(
         packageExcludedFileSchema.extend({
+          checksum: checksum.optional(),
           groupId: z.string(),
           source: z.enum(['artifact', 'upload', 'reproducibility', 'literature']),
           versionNumber: z.number().int().positive(),
@@ -333,7 +438,9 @@ const packageOperationSnapshotSchema: z.ZodType<PackageOperationSnapshot> = z
       .optional(),
     summary: z
       .object({
-        retainedFiles: z.array(packageExcludedFileSchema).max(10000),
+        retainedFiles: z
+          .array(packageExcludedFileSchema.extend({ checksum: checksum.optional() }))
+          .max(10000),
         metadataBytes: z.number().nonnegative(),
         pdfNotesAvailable: z.boolean().optional()
       })
@@ -401,7 +508,19 @@ export const sessionPackageCommandContracts = {
     validationCodec(packageOperationSnapshotSchema.nullable())
   ),
   export: defineApplicationCommandContract(
-    validationCodec(z.tuple([sessionPackageRequestSchema])),
+    validationCodec(
+      z.tuple([
+        sessionPackageRequestSchema,
+        // Headless callers (CLI / local Web RPC) name the destination explicitly; desktop
+        // renderers omit it and keep the native save dialog.
+        z
+          .string()
+          .min(1)
+          .max(32768)
+          .regex(/\.science$/i)
+          .optional()
+      ])
+    ),
     validationCodec(exportResultSchema)
   ),
   import: defineApplicationCommandContract(
@@ -410,17 +529,29 @@ export const sessionPackageCommandContracts = {
         .tuple([
           sessionPackageImportRequestSchema.optional(),
           z
-            .string()
-            .min(1)
-            .max(32768)
-            .regex(/\.science$/i)
+            .union([
+              z
+                .string()
+                .min(1)
+                .max(32768)
+                .regex(/\.science$/i),
+              useCaseSourceSchema
+            ])
+            .optional(),
+          z
+            .object({ nonInteractive: z.literal(true) })
+            .strict()
             .optional()
         ])
         .refine(
-          ([target, sourcePath]) => !sourcePath || !target?.projectName,
+          ([target, sourcePath, options]) =>
+            !sourcePath || !target?.projectName || options?.nonInteractive === true,
           'Dropped packages require an existing Project or destination selection.'
         )
     ),
     validationCodec(sessionPackageRequestSchema.nullable())
   )
 }
+
+export const packageOperationActive = (operation: PackageOperationSnapshot | null): boolean =>
+  operation !== null && ['running', 'awaiting-selection', 'cancelling'].includes(operation.state)

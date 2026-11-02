@@ -1,7 +1,7 @@
 import type { ActiveSession, ClientConnection, McpServer } from '@agentclientprotocol/sdk'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const loggerSpies = vi.hoisted(() => ({ info: vi.fn(), error: vi.fn() }))
+const loggerSpies = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }))
 vi.mock('@aipoch/diagnostics/node', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@aipoch/diagnostics/node')>()
   return {
@@ -9,7 +9,7 @@ vi.mock('@aipoch/diagnostics/node', async (importOriginal) => {
     createLogger: () => ({
       debug: vi.fn(),
       info: loggerSpies.info,
-      warn: vi.fn(),
+      warn: loggerSpies.warn,
       error: loggerSpies.error
     })
   }
@@ -53,6 +53,7 @@ type AdopterHarness = {
     specialistBindingPending?: true
   ) => Promise<AcpCreateSessionResponse>
   commit: ReturnType<typeof vi.fn>
+  registerSessionSpecialist: ReturnType<typeof vi.fn>
   configure: ReturnType<typeof vi.fn>
   connection: ClientConnection
   order: string[]
@@ -136,6 +137,7 @@ const createHarness = (
     blockStartup: false
   })
   if (reservation.collision) throw reservation.collision
+  const registerSessionSpecialist = vi.fn()
   const commit = vi.fn(() => order.push('capability commit'))
   const release = vi.fn(() => {
     order.push('capability release')
@@ -191,6 +193,7 @@ const createHarness = (
     resolveSpecialistSkills: options.specialistSkills
       ? vi.fn(async () => options.specialistSkills as EffectiveSpecialistSkills)
       : undefined,
+    registerSessionSpecialist,
     resolveProjectAgentContext: options.projectAgentContextError
       ? vi.fn(async () => {
           throw options.projectAgentContextError
@@ -221,6 +224,7 @@ const createHarness = (
   return {
     adopt,
     commit,
+    registerSessionSpecialist,
     configure,
     connection,
     order,
@@ -506,6 +510,14 @@ describe('AcpProviderSessionAdopter', () => {
 
     await harness.adopt('specialist-1')
 
+    expect(harness.registerSessionSpecialist).toHaveBeenCalledWith(
+      'stable-app-session',
+      'specialist-1'
+    )
+    expect(harness.registerSessionSpecialist.mock.invocationCallOrder[0]).toBeGreaterThan(
+      harness.commit.mock.invocationCallOrder[0]
+    )
+
     expect(harness.sessionSetupAppends.flat()).toEqual(
       expect.arrayContaining(['specialist identity append', 'staged handoff continuity'])
     )
@@ -526,6 +538,17 @@ describe('AcpProviderSessionAdopter', () => {
     expect(harness.connection.agent.buildSession).not.toHaveBeenCalled()
     expect(harness.commit).not.toHaveBeenCalled()
     expect(harness.release).toHaveBeenCalledWith({ ownsStableIdentity: true })
+    expect(loggerSpies.warn).toHaveBeenCalledWith(
+      'bound specialist identity resolution failed',
+      expect.objectContaining({
+        operation: 'specialist-resolution',
+        mode: 'adopt',
+        phase: 'identity',
+        sessionId: 'stable-app-session',
+        specialistId: 'specialist-1',
+        reason: 'resolver-missing'
+      })
+    )
   })
 
   it('clears detached Specialist affinity when a pending binding explicitly selects Main', async () => {

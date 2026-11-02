@@ -4,24 +4,23 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { WorkspaceAgentRuntime } from '@/lib/acp/useWorkspaceAgentRuntime'
 import {
   projectSessionActionability,
-  type ChatMessage,
-  type ChatSession,
   type SessionActionabilityProjection
-} from '@/stores/session-store'
+} from '@/stores/session-actionability'
+import type { ChatMessage, ChatSession } from '@/stores/session-store-contract'
 import type { Annotation } from '../../../../shared/annotation-contract'
 import {
   annotationRequiresImageInput,
   sideChatAnnotationText
 } from '../../../../shared/annotations'
 import type { PermissionProfileId } from '../../../../shared/permission-profiles'
-import { VISION_MODEL_NOT_CONFIGURED_MESSAGE } from '../../../../shared/run-error-classification'
+import { VISION_MODEL_NOT_CONFIGURED_MESSAGE } from '../../../../shared/failure/messages'
 import {
   normalizeDelegationPolicy,
   type DelegationPolicy
 } from '../../../../shared/session-persistence'
 import type { ActivePlanProjection } from '../../../../shared/session-plan/contract'
 import type { SessionAgentConfiguration } from '../../../../shared/settings'
-import { imageAttachmentMimeType } from '../../../../shared/uploads'
+import { imageAttachmentMimeType, type UploadedAttachment } from '../../../../shared/uploads'
 
 import {
   docIsEmpty,
@@ -380,6 +379,7 @@ const canBranch = (options: WorkspaceConversationControllerOptions): boolean =>
   )
 
 const canStartSideChat = (options: WorkspaceConversationControllerOptions): boolean =>
+  !options.isTurnAdmissionBlocked &&
   Boolean(options.sideChat) &&
   !sideChatBlock({
     action: 'send',
@@ -422,7 +422,7 @@ const useWorkspaceConversationController = (
     isPresentationRevealing: isWorkspacePresentationRevealing,
     isSpecialistReady: (sessionId) => {
       const current = optionsRef.current
-      return current.session.lifecycle.canStartSend(sessionId)
+      return !current.isTurnAdmissionBlocked && current.session.lifecycle.canStartSend(sessionId)
     },
     isPersistenceBlocked: (sessionId) =>
       optionsRef.current.persistenceBlockedSessionIds.includes(sessionId),
@@ -574,6 +574,44 @@ const useWorkspaceConversationController = (
         if (sessionId && optimisticMessage) {
           setOptimisticMessages((current) => ({ ...current, [sessionId]: optimisticMessage }))
         }
+        const restorePreparation = (
+          rejectedSessionId?: string,
+          finalizedAttachments?: UploadedAttachment[],
+          message?: string
+        ): void => {
+          preparationRejected = true
+          clearOptimisticMessage()
+          // Rejection is asynchronous: act on the composer as it is now, not as it was at submit.
+          const latest = optionsRef.current
+          const targetDraftKey =
+            wasNewConversation || branchInNewSession
+              ? (rejectedSessionId ?? snapshot.draftKey)
+              : snapshot.draftKey
+          if (message && latest.currentDraftKey === targetDraftKey)
+            latest.composer.actions.setError(message)
+          const rejectedOwner = rejectedSessionId ? latest.getSession(rejectedSessionId) : undefined
+          const retrySessionOwner =
+            rejectedOwner && !rejectedOwner.isPending
+              ? { sessionId: rejectedOwner.id, projectId: rejectedOwner.projectId }
+              : snapshot.retrySessionOwner
+          const byId = new Map(
+            finalizedAttachments?.map((attachment) => [attachment.id, attachment])
+          )
+          latest.composer.lifecycle.restoreFailedSend(
+            {
+              ...snapshot,
+              retrySessionOwner,
+              // Native setup authority has already been bound to the retry Session.
+              ...(retrySessionOwner ? { setupSessionToken: undefined } : {}),
+              attachments: snapshot.attachments.map(
+                (attachment) => byId.get(attachment.id) ?? attachment
+              )
+            },
+            true,
+            wasNewConversation || branchInNewSession ? rejectedSessionId : undefined,
+            true
+          )
+        }
         void runtime
           .sendMessage({
             sessionId,
@@ -585,42 +623,10 @@ const useWorkspaceConversationController = (
                 current.onNewSessionAppended?.(message)
               }
             },
-            onPreparationRejected: (message, rejectedSessionId, finalizedAttachments) => {
-              preparationRejected = true
-              clearOptimisticMessage()
-              // Rejection is asynchronous: act on the composer as it is now, not as it was at submit.
-              const latest = optionsRef.current
-              const targetDraftKey =
-                wasNewConversation || branchInNewSession
-                  ? (rejectedSessionId ?? snapshot.draftKey)
-                  : snapshot.draftKey
-              if (latest.currentDraftKey === targetDraftKey)
-                latest.composer.actions.setError(message)
-              const rejectedOwner = rejectedSessionId
-                ? latest.getSession(rejectedSessionId)
-                : undefined
-              const retrySessionOwner =
-                rejectedOwner && !rejectedOwner.isPending
-                  ? { sessionId: rejectedOwner.id, projectId: rejectedOwner.projectId }
-                  : snapshot.retrySessionOwner
-              const byId = new Map(
-                finalizedAttachments?.map((attachment) => [attachment.id, attachment])
-              )
-              latest.composer.lifecycle.restoreFailedSend(
-                {
-                  ...snapshot,
-                  retrySessionOwner,
-                  // Native setup authority has already been bound to the retry Session.
-                  ...(retrySessionOwner ? { setupSessionToken: undefined } : {}),
-                  attachments: snapshot.attachments.map(
-                    (attachment) => byId.get(attachment.id) ?? attachment
-                  )
-                },
-                true,
-                wasNewConversation || branchInNewSession ? rejectedSessionId : undefined,
-                true
-              )
-            },
+            onPreparationRejected: (message, rejectedSessionId, finalizedAttachments) =>
+              restorePreparation(rejectedSessionId, finalizedAttachments, message),
+            onPreparationCancelled: (cancelledSessionId, finalizedAttachments) =>
+              restorePreparation(cancelledSessionId, finalizedAttachments),
             ...(branchInNewSession && activeSession
               ? { branchSourceSessionId: activeSession.id }
               : {}),
@@ -727,7 +733,13 @@ const useWorkspaceConversationController = (
       revise: async (messageId, doc, annotations = []): Promise<EditedMessageSendResult> => {
         const current = optionsRef.current
         const sessionId = current.activeSession?.id
-        if (!sessionId || (docIsEmpty(doc) && annotations.length === 0)) return { ok: false }
+        if (
+          !sessionId ||
+          (docIsEmpty(doc) &&
+            annotations.length === 0 &&
+            !current.activeSession?.messages.find(({ id }) => id === messageId)?.uploads?.length)
+        )
+          return { ok: false }
         if (current.supportsImageInput !== true && annotations.some(annotationRequiresImageInput)) {
           current.composer.actions.setError(VISION_MODEL_NOT_CONFIGURED_MESSAGE)
           return { ok: false, displayMessage: VISION_MODEL_NOT_CONFIGURED_MESSAGE }

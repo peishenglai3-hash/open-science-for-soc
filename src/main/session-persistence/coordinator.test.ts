@@ -895,7 +895,7 @@ describe('SessionPersistenceCoordinator', () => {
       createSession({
         revision: 3,
         status: 'running',
-        errorReportable: false,
+        failure: { category: 'service' as const, diagnostics: {} },
         agentFrameworkId: 'codex',
         activeRun: { promptMessageId: prompt.id, startedAt: 1 },
         runtimeContext: { version: 1, revision: 2 },
@@ -986,7 +986,7 @@ describe('SessionPersistenceCoordinator', () => {
       activeRun: undefined,
       taskRunCommitId: 'task-run'
     })
-    expect(durable.errorReportable).toBeUndefined()
+    expect(durable.failure).toBeUndefined()
     expect(durable.runtimeContext).toEqual({ version: 1, revision: 2 })
     expect(durable.messages.map(({ id }) => id)).toEqual([
       prompt.id,
@@ -1163,7 +1163,7 @@ describe('SessionPersistenceCoordinator', () => {
       messageId: taskMessage.id,
       artifacts: [{ id: 'partial-artifact', kind: 'workspace-file', path: '/partial.txt' }],
       error: 'Provider failed',
-      errorReportable: false,
+      failure: { category: 'service' as const, diagnostics: {} },
       updatedAt: 9
     })
 
@@ -1172,7 +1172,7 @@ describe('SessionPersistenceCoordinator', () => {
       status: 'error',
       activeRun: undefined,
       error: 'Provider failed',
-      errorReportable: false,
+      failure: { category: 'service' as const, diagnostics: {} },
       taskRunCommitId: 'task-run',
       runtimeContext: { version: 1, revision: 4 }
     })
@@ -7113,6 +7113,36 @@ describe('SessionPersistenceCoordinator', () => {
     expect(fileIndex.reconcileActiveSessions).toHaveBeenCalledWith([survivor])
   })
 
+  it.each(['session-2', undefined])(
+    'reloads manifest selection %s after a cached authority scan',
+    async (lastSessionId) => {
+      const root = await mkdtemp(join(tmpdir(), 'open-science-manifest-cache-'))
+      try {
+        initDataRoot(root)
+        const repository = new SessionRepository(root)
+        await repository.saveSession(createSession())
+        await repository.saveSession(createSession({ id: 'session-2' }))
+        await repository.saveManifest({ lastSessionId: 'session-1' })
+        const scan = vi.spyOn(repository, 'loadAllWithDiagnostics')
+        const coordinator = new SessionPersistenceCoordinator(repository, createFileIndex())
+        expect((await coordinator.loadAll()).manifest.lastSessionId).toBe('session-1')
+        await coordinator.loadAll()
+        expect(scan).toHaveBeenCalledTimes(1)
+
+        const saving = coordinator.saveManifest({ lastSessionId })
+        const loading = coordinator.loadAll()
+        await saving
+        expect((await repository.loadManifest()).lastSessionId).toBe(lastSessionId)
+        expect((await loading).manifest.lastSessionId).toBe(lastSessionId)
+        expect(scan).toHaveBeenCalledTimes(2)
+        await coordinator.loadAll()
+        expect(scan).toHaveBeenCalledTimes(2)
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    }
+  )
+
   it('routes manifest writes through the same mutation queue', async () => {
     const repository = createSessionRepository()
     const coordinator = new SessionPersistenceCoordinator(repository, createFileIndex())
@@ -7891,3 +7921,76 @@ const createTestLogger = (): TestLogger =>
   }) satisfies Logger
 
 configureTestRuntimeMetadata()
+
+describe('discarding damaged Session recovery authority', () => {
+  it('rechecks disk and restores a complete catalog without deleting project research', async () => {
+    const storage = await mkdtemp(join(tmpdir(), 'session-recovery-delete-'))
+    initDataRoot(storage)
+    try {
+      const directory = join(storage, 'sessions', 'project-1')
+      await mkdir(directory, { recursive: true })
+      await writeFile(join(directory, 'session-1.json.invalid-100-1'), 'broken')
+      const repository = new SessionRepository(storage, { hasComputeJobs: async () => false })
+      const fileIndex = createFileIndex()
+      const coordinator = new SessionPersistenceCoordinator(repository, fileIndex)
+      const before = await coordinator.loadAll()
+      expect(before.diagnostics?.warnings).toContainEqual(
+        expect.objectContaining({ kind: 'corrupt' })
+      )
+      expect((await coordinator.sessionMetadataSnapshot()).isComplete).toBe(false)
+      await coordinator.deleteRecoveryFile({ projectId: 'project-1', fileName: 'session-1.json' })
+      const after = await coordinator.loadAll()
+      expect(after.diagnostics?.warnings).toEqual([])
+      expect((await coordinator.sessionMetadataSnapshot()).isComplete).toBe(true)
+      expect(fileIndex.softDeleteProject).not.toHaveBeenCalled()
+    } finally {
+      await rm(storage, { recursive: true, force: true })
+    }
+  })
+
+  it.each([false, true])(
+    'invalidates a cached catalog even when removal fails: %s',
+    async (fails) => {
+      const repository = createSessionRepository({
+        deleteRecoveryFile: vi.fn(async () => {
+          if (fails) throw new Error('partial failure')
+        })
+      })
+      const coordinator = new SessionPersistenceCoordinator(repository, createFileIndex())
+      await coordinator.loadAll()
+      await coordinator.loadAll()
+      expect(repository.loadAllWithDiagnostics).toHaveBeenCalledOnce()
+      const deletion = coordinator.deleteRecoveryFile({
+        projectId: 'project-1',
+        fileName: 'session-1.json'
+      })
+      if (fails) await expect(deletion).rejects.toThrow('partial failure')
+      else await deletion
+      await coordinator.loadAll()
+      expect(repository.loadAllWithDiagnostics).toHaveBeenCalledTimes(2)
+    }
+  )
+
+  it('orders catalog rechecks behind a pending recovery deletion', async () => {
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const repository = createSessionRepository({
+      deleteRecoveryFile: vi.fn(async () => {
+        entered.resolve()
+        await release.promise
+      })
+    })
+    const coordinator = new SessionPersistenceCoordinator(repository, createFileIndex())
+    const deletion = coordinator.deleteRecoveryFile({
+      projectId: 'project-1',
+      fileName: 'session-1.json'
+    })
+    await entered.promise
+    const recheck = coordinator.loadAll()
+    await Promise.resolve()
+    expect(repository.loadAllWithDiagnostics).not.toHaveBeenCalled()
+    release.resolve()
+    await Promise.all([deletion, recheck])
+    expect(repository.loadAllWithDiagnostics).toHaveBeenCalledOnce()
+  })
+})

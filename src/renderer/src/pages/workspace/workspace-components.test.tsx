@@ -543,12 +543,15 @@ describe('conversation message scroller integration', () => {
     expect(workspaceMessageScrollerSource).not.toContain('renderWebSearchDetails(')
     expect(workspaceMessageScrollerSource).not.toContain('formatActivityDetails(activity)')
     expect(workspaceMessageScrollerSource).toContain(
-      'transcriptWindow.entries.map(({ item, itemIndex })'
+      'const transcriptEntries = transcriptWindow.entries.flatMap((entry) =>'
+    )
+    expect(workspaceMessageScrollerSource).toContain(
+      'transcriptEntries.map(({ item, itemIndex, processHeader }, entryIndex) =>'
     )
     expect(workspaceMessageScrollerSource).toMatch(/import \{[^}]*\buseState\b[^}]*\} from 'react'/)
     expect(workspaceMessageScrollerSource).toContain('const currentSessionId = activeSession?.id')
     expect(workspaceMessageScrollerSource).toContain(
-      'collapsedActivityGroupState.sessionId === currentSessionId'
+      'expandedActivityGroupState.sessionId === currentSessionId'
     )
     expect(workspaceMessageScrollerSource).toContain(
       'activityExpansionOverrideState.sessionId === currentSessionId'
@@ -691,8 +694,8 @@ describe('conversation message scroller integration', () => {
     expect(workspaceMessageScrollerSource).toContain(
       "import { getAgentLoadingPhase } from './agent-loading-message'"
     )
-    expect(workspaceMessageScrollerSource).toContain(
-      'const agentLoadingPhase = getAgentLoadingPhase(activeSession, { credentialPending })'
+    expect(workspaceMessageScrollerSource).toMatch(
+      /getAgentLoadingPhase\(activeSession,\s*\{\s*credentialPending,\s*sendPreparing\s*\}\)/
     )
     expect(workspaceMessageScrollerSource).toContain('<WorkspaceAgentLoadingRow')
     expect(workspaceAgentLoadingRowSource).toContain('role="status"')

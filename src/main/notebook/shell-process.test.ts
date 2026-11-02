@@ -1,14 +1,14 @@
 import type { ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import * as processTree from '../process-tree'
-import * as powerShellParser from './powershell-search-parser'
 import * as windowsRuntime from './windows-notebook-runtime'
 import { ShellProcessOwnershipRegistry } from './shell-process-ownership.windows-posix'
 import { mkdir, mkdtemp, readFile, rm, symlink } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
 import { EventEmitter } from 'node:events'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
+import { EXTRA_PATH_DIRS } from '../settings/shell-path'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -148,9 +148,6 @@ describe('notebook shell process behavior', () => {
         node: join(nodeRoot, 'node.exe'),
         powershell: join(root, 'powershell', 'pwsh.exe')
       })
-      const parser = vi
-        .spyOn(powerShellParser, 'parsePowerShellSearchCommands')
-        .mockResolvedValue([])
       const admission = vi
         .spyOn(processTree, 'assertProcessTreeSupport')
         .mockImplementation(() => {})
@@ -177,6 +174,8 @@ describe('notebook shell process behavior', () => {
         })
         expect(result.stderr).toBe('stop-before-spawn')
         expect(wrap).toHaveBeenCalledOnce()
+        expect(wrap.mock.calls[0][0].windowsProtectionRequired).toBeUndefined()
+        expect(wrap.mock.calls[0][0].superviseProcessTree).toBe(true)
         const { filesystem, env } = wrap.mock.calls[0][0]
         if (version === '7.6') {
           expect(env.NPM_CONFIG_PREFIX).toBe(
@@ -190,7 +189,6 @@ describe('notebook shell process behavior', () => {
         expect(filesystem.optionalReadOnlyRoots).toContain(hostTools)
       } finally {
         resolver.mockRestore()
-        parser.mockRestore()
         admission.mockRestore()
       }
     }
@@ -664,10 +662,6 @@ describe('notebook shell process behavior', () => {
     })
 
     it('normalizes CLIXML only for the PowerShell binding on a Windows host', async () => {
-      // This test exercises stderr projection, not the Windows-only AST parser executable.
-      const parser = vi
-        .spyOn(powerShellParser, 'parsePowerShellSearchCommands')
-        .mockResolvedValue([{ name: 'emit', arguments: ['stderr'] }])
       vi.stubEnv('OPEN_SCIENCE_ENABLE_WSL2_BASH', '1')
       vi.stubEnv('SystemRoot', 'C:\\Windows')
       const runtimeRoot = await mkdtemp(join(tmpdir(), 'os-shell-binding-stderr-'))
@@ -721,15 +715,11 @@ describe('notebook shell process behavior', () => {
         ).resolves.toBe(completedProgressClixml)
         await expect(execute({ kind: 'powershell', version: '5.1' })).resolves.toBe('')
       } finally {
-        parser.mockRestore()
         await rm(runtimeRoot, { recursive: true, force: true })
       }
     })
 
     it('annotates redirected JSON filesystem errors while preserving Shell stdout', async () => {
-      const parser = vi
-        .spyOn(powerShellParser, 'parsePowerShellSearchCommands')
-        .mockResolvedValue([])
       vi.stubEnv('SystemRoot', 'C:\\Windows')
       const path = String.raw`C:\Users\fixture\.config\sample-tool\access-token.txt`
       const stdout = `Access is denied.\n${JSON.stringify(
@@ -741,38 +731,66 @@ describe('notebook shell process behavior', () => {
         2
       )}\n`
       const log = new ViolationLog()
-      try {
-        const result = await runShellCommand({
-          command: 'sample-command 2>&1',
-          cwd: process.cwd(),
-          handoffDir: process.cwd(),
-          runtimeRoot: portableRuntimeRoot,
-          sessionId: 'session-1',
-          projectId: 'project-1',
-          platform: 'win32',
-          runtimeBinding: { kind: 'powershell', version: '5.1' },
-          processSandbox: {
-            wrap: async (invocation) => ({
-              executable: process.execPath,
-              args: ['-e', `process.stdout.write(${JSON.stringify(stdout)})`],
-              env: invocation.env,
-              confirmProcessTreeTermination: async () => true,
-              annotateStderr: (stderr, output) => log.attach('command', stderr, undefined, output),
-              cleanup: async () => ({
-                processesTerminated: true,
-                networkClosed: true,
-                temporaryResourcesRemoved: true
-              })
+      const result = await runShellCommand({
+        command: 'sample-command 2>&1',
+        cwd: process.cwd(),
+        handoffDir: process.cwd(),
+        runtimeRoot: portableRuntimeRoot,
+        sessionId: 'session-1',
+        projectId: 'project-1',
+        platform: 'win32',
+        runtimeBinding: { kind: 'powershell', version: '5.1' },
+        processSandbox: {
+          wrap: async (invocation) => ({
+            executable: process.execPath,
+            args: ['-e', `process.stdout.write(${JSON.stringify(stdout)})`],
+            env: invocation.env,
+            confirmProcessTreeTermination: async () => true,
+            annotateStderr: (stderr, output) => log.attach('command', stderr, undefined, output),
+            cleanup: async () => ({
+              processesTerminated: true,
+              networkClosed: true,
+              temporaryResourcesRemoved: true
             })
-          },
-          terminateTree: async () => ({ reaped: true })
+          })
+        },
+        terminateTree: async () => ({ reaped: true })
+      })
+      expect(result.stdout).toBe(stdout)
+      expect(result.stderr).toContain(`OPEN_SCIENCE_FILESYSTEM_ACCESS_BLOCKED: ${path} `)
+      expect(result.stderr).not.toContain('"ok"')
+    })
+
+    it.skipIf(process.platform !== 'darwin')(
+      'appends macOS tool directories without overriding the selected Node or leaking secrets',
+      () => {
+        const source = { PATH: '/custom/node/bin:/usr/bin:/usr/local/bin', SECRET: 'private' }
+        const env = buildShellEnv('/handoff', 'darwin', source)
+        const dirs = env.PATH!.split(delimiter)
+        expect(dirs.slice(0, 3)).toEqual(source.PATH.split(delimiter))
+        expect(dirs).toContain('/opt/homebrew/bin')
+        expect(dirs).toContain('/usr/local/bin')
+        for (const dir of EXTRA_PATH_DIRS)
+          expect(dirs.filter((value) => value === dir)).toHaveLength(1)
+        expect(env.SECRET).toBeUndefined()
+        expect(source).toEqual({
+          PATH: '/custom/node/bin:/usr/bin:/usr/local/bin',
+          SECRET: 'private'
         })
-        expect(result.stdout).toBe(stdout)
-        expect(result.stderr).toContain(`OPEN_SCIENCE_FILESYSTEM_ACCESS_BLOCKED: ${path} `)
-        expect(result.stderr).not.toContain('"ok"')
-      } finally {
-        parser.mockRestore()
       }
+    )
+
+    it('preserves Linux and WSL PATH without appending host tool directories', () => {
+      const source = { PATH: '/custom/node/bin:/usr/bin' }
+      expect(buildShellEnv('/handoff', 'linux', source).PATH).toBe(source.PATH)
+      expect(
+        buildShellEnv('/handoff', 'linux', source, undefined, undefined, {
+          kind: 'wsl2-bash',
+          profileId: 'profile',
+          distro: 'Ubuntu',
+          user: 'user'
+        }).PATH
+      ).toBe(source.PATH)
     })
 
     it('keeps Windows shell runtime variables while excluding host secrets', () => {

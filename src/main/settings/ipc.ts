@@ -1,3 +1,5 @@
+import type { AddSkillSourceRequest, RemoveSkillSourceRequest } from '../../shared/skill-sources'
+import type { SetSemanticScholarCredentialRequest } from '../../shared/settings'
 import type { SettingsFileCommands } from './file-commands'
 import { callerContextForEvent } from '../caller-context'
 import { callerLeaseForEvent } from '../caller-lifecycle'
@@ -22,6 +24,7 @@ import {
   type ScanRepoRequest,
   type InstallClaudeRequest,
   type InstallCodeBuddyRequest,
+  type InstallPiRequest,
   type InstallCodexRequest,
   type InstallOpencodeRequest,
   type ClaudeInstallEvent,
@@ -91,6 +94,7 @@ import {
   readGitHubToken,
   readConversationSkillImportEnabled,
   readIsolatedClaudeToken,
+  readNotebookFolderRestrictionEnabled,
   readNotificationsEnabled,
   readShowNotificationContent,
   readProjectFilesFilter,
@@ -155,6 +159,9 @@ const registerSettingsIpcHandlers = ({
   ipcMainHandle('settings:install-codebuddy', (_event, request: InstallCodeBuddyRequest) =>
     snapshotCommits.projectAfter(service.installCodeBuddy(request, broadcastInstallEvent))
   )
+  ipcMainHandle('settings:install-pi', (_event, request: InstallPiRequest) =>
+    snapshotCommits.projectAfter(service.installPi(request, broadcastInstallEvent))
+  )
   ipcMainHandle('settings:install-codex', (_event, request: InstallCodexRequest) =>
     snapshotCommits.projectAfter(service.installCodex(request, broadcastInstallEvent))
   )
@@ -179,6 +186,9 @@ const registerSettingsIpcHandlers = ({
     snapshotCommits.currentSnapshotAfter(
       workflows.runtime.uninstallRuntime('uninstallCodeBuddy', 'codebuddy')
     )
+  )
+  ipcMainHandle('settings:uninstall-pi', () =>
+    snapshotCommits.currentSnapshotAfter(workflows.runtime.uninstallRuntime('uninstallPi', 'pi'))
   )
 
   ipcMainHandle('settings:uninstall-codex', () =>
@@ -241,6 +251,13 @@ const registerSettingsIpcHandlers = ({
       log.info('set notifications enabled requested', { enabled })
       return snapshotCommits.currentSnapshotAfter(service.setNotificationsEnabled(enabled))
     }
+  )
+  ipcMainHandle(
+    'settings:set-notebook-folder-restriction-enabled',
+    async (_event, request: { enabled: boolean }) =>
+      snapshotCommits.currentSnapshotAfter(
+        service.setNotebookFolderRestrictionEnabled(readNotebookFolderRestrictionEnabled(request))
+      )
   )
   ipcMainHandle(
     'settings:set-show-notification-content',
@@ -393,6 +410,13 @@ const registerSettingsIpcHandlers = ({
   )
   ipcMainHandle('settings:remove-notebook-network', () => service.removeNotebookNetwork())
 
+  ipcMainHandle('settings:list-skill-sources', () => service.listSkillSources())
+  ipcMainHandle('settings:add-skill-source', (_event, request: AddSkillSourceRequest) =>
+    service.addSkillSource(request)
+  )
+  ipcMainHandle('settings:remove-skill-source', (_event, request: RemoveSkillSourceRequest) =>
+    service.removeSkillSource(request)
+  )
   ipcMainHandle('settings:list-skills', () => service.listSkills())
   ipcMainHandle(
     'settings:list-skill-marketplace',
@@ -562,6 +586,11 @@ const registerSettingsIpcHandlers = ({
     'settings:disconnect-device-credential',
     (_event, request: DeviceCredentialAuthenticationRequest) =>
       workflows.connectors.disconnectDeviceCredential(request)
+  )
+  ipcMainHandle(
+    'settings:set-semantic-scholar-credential',
+    (_event, request: SetSemanticScholarCredentialRequest) =>
+      workflows.connectors.setSemanticScholarCredential(request)
   )
   ipcMainHandle(
     'settings:set-openalex-credential',

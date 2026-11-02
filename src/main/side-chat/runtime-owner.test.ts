@@ -226,7 +226,8 @@ describe('Side chat OpenCode instruction isolation', () => {
       }
       const assertMainInstructions = async (): Promise<void> => {
         const configFile = main!.configFiles!.find((file) => file.path.endsWith('opencode.json'))!
-        const paths = JSON.parse(configFile.content).instructions as string[]
+        expect(JSON.parse(configFile.content).instructions ?? []).toEqual([])
+        const paths = JSON.parse(main!.env!.OPENCODE_CONFIG_CONTENT!).instructions as string[]
         expect(paths).toHaveLength(1)
         const delivered = (await Promise.all(paths.map((path) => readFile(path, 'utf8')))).join(
           '\n\n'
@@ -490,7 +491,7 @@ describe('SideChatRuntimeOwner lifecycle', () => {
       const resolved: ResolvedAgentBackend = {
         ...backend(framework),
         ...(subscription ? { providerId: 'builtin-codex-subscription' } : {}),
-        responsesBridgeLease: subscription
+        responsesTransportLease: subscription
           ? undefined
           : {
               selectSkills: vi.fn(async () => []),
@@ -1347,7 +1348,7 @@ describe('SideChatRuntimeOwner lifecycle', () => {
       resolveTarget: vi.fn(async () => ({
         ...backend(codexFramework),
         backendId: 'codex:provider-a',
-        responsesBridgeLease: bridges[Math.min(resolution++, bridges.length - 1)]
+        responsesTransportLease: bridges[Math.min(resolution++, bridges.length - 1)]
       })),
       relay: createRelayOwner(),
       persistence: createPersistence(),
@@ -1760,7 +1761,7 @@ describe('SideChatRuntimeOwner lifecycle', () => {
       return capturedTarget.frameworkId === 'opencode'
         ? {
             ...resolved,
-            responsesBridgeLease: {
+            responsesTransportLease: {
               selectSkills: vi.fn(async () => []),
               registerReviewerSession: vi.fn(),
               unregisterReviewerSession: vi.fn(() => false),

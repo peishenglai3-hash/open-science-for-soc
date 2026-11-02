@@ -4,6 +4,9 @@ import { analyzeNotebookSourceFileAccess } from './source-file-access-analysis'
 import cells from './reported-venn-rds.fixture.json'
 import type { NotebookSerializedValue } from './dependency-analysis-types'
 
+// Owned keys can still dispatch xtfrm; unproven ordering keeps effects partial.
+// Known paths and producer/consumer evidence remain checked independently.
+
 const context = {
   staticStrings: [],
   staticCollections: [],
@@ -24,13 +27,16 @@ it.each([0, 1, 3, 5, 6, 7])('captures reported Venn RDS cell %s', async (index) 
       files,
       facts: index === 0 ? undefined : (await analyzeRNotebookSource(cells[index], context)).facts
     })
-  ).toMatchObject({ readState: 'complete', writeState: 'complete', externalState: 'complete' })
+  ).toMatchObject({
+    readState: [1, 6].includes(index) ? 'partial' : 'complete',
+    writeState: [1, 6].includes(index) ? 'partial' : 'complete',
+    externalState: [1, 6].includes(index) ? 'partial' : 'complete'
+  })
 })
-it('records ordinary serialized sets at the producer', async () => {
+it('withholds distinct-result ownership but retains an independently owned RDS write', async () => {
   const { facts } = await analyzeRNotebookSource(cells[1])
   expect(facts.serializedValueWrites).toEqual([
-    { path: 'sets.rds', format: 'rds', valueType: 'r-value' },
-    { path: 'all_elements.rds', format: 'rds', valueType: 'r-value' }
+    { path: 'sets.rds', format: 'rds', valueType: 'r-value' }
   ])
 })
 it.each([

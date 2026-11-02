@@ -3,6 +3,7 @@ import { union, intersection, lineRect } from './literature-pdf-page-geometry.mj
 import { OPS, Util } from 'pdfjs-dist/legacy/build/pdf.mjs'
 import { tableTextToken } from './literature-pdf-orientation.mjs'
 import { collectClosedFigureFrames } from './literature-pdf-graphics.mjs'
+import { nativePageTextPacketInventory } from './literature-pdf-figure-native-plot-labels.mjs'
 
 // A fused panel key band belongs to its repeated raster row only with a unique caption owner.
 export function ownedRasterKeyBand(line, page, captions) {
@@ -747,8 +748,29 @@ export function nativeContiguousRasterStack(page, caption, captions, tables, con
     )
       return
     for (const im of images) {
-      const g = recorded.find((g) => g.operationIndex === im.operationIndex),
-        r = g?.normalizedRect?.map((n, i) => n * (i % 2 ? page.height : page.width)),
+      const g = recorded.find((g) => g.operationIndex === im.operationIndex)
+      let domain = g?.normalizedRect
+      // Association may narrow an image to its painted pixels. The native
+      // image transform instead describes its complete sampling domain.
+      if (g?.paintedNormalizedRect) {
+        const originals = context.graphicsBounds?.filter(
+          (original) => original.operationIndex === im.operationIndex
+        )
+        if (
+          originals?.length !== 1 ||
+          originals[0].kind !== 'image' ||
+          !valid(originals[0].normalizedRect) ||
+          !valid(originals[0].paintedNormalizedRect) ||
+          !valid(g.normalizedRect) ||
+          !valid(g.paintedNormalizedRect) ||
+          !contains(originals[0].normalizedRect, g.paintedNormalizedRect, 0) ||
+          !originals[0].paintedNormalizedRect?.every((n, i) => n === g.paintedNormalizedRect[i]) ||
+          !g.normalizedRect.every((n, i) => n === g.paintedNormalizedRect[i])
+        )
+          return
+        domain = originals[0].normalizedRect
+      }
+      const r = domain?.map((n, i) => n * (i % 2 ? page.height : page.width)),
         paint = o.argsArray[im.operationIndex]
       if (
         !valid(im.rect) ||
@@ -1425,6 +1447,7 @@ export function nativeRasterFormEnvelope(page, figure, captions, tables, tokens,
         'setLineJoin',
         'setLineCap',
         'setLineWidth',
+        'setMiterLimit',
         'setDash',
         'constructPath',
         'clip',
@@ -1465,6 +1488,10 @@ export function nativeRasterFormEnvelope(page, figure, captions, tables, tokens,
       const op = o.fnArray[i],
         a = o.argsArray[i]
       if (!allowed.has(op)) return
+      // PDF.js initializes the canvas miter limit to 10. Only an exact no-op
+      // is supported: the complete stream rejects any other setter or GState
+      // miter change, including changes later hidden by save/restore.
+      if (op === OPS.setMiterLimit && (!finite(a, 1) || a[0] !== 10)) return
       owners.set(i, owner)
       if (op === OPS.save) {
         if (text) return
@@ -2425,6 +2452,85 @@ export function nativeCaptionedLabeledRasterStack(
     const labelDomains = labels.map((l) => JSON.stringify(l.rect)).sort()
     if (JSON.stringify(domainsInColumn) !== JSON.stringify(labelDomains)) return
     return { ...nearest, rect, graphicsCount: images.length, issue: undefined }
+  } catch {
+    return
+  }
+}
+
+// Two complete raster panels can have different widths and keys in a shared
+// left column. Their empty native envelope proves the pair independently of
+// the nearby-image heuristics and the equal-width right-key stack above.
+export function nativeCaptionedSideKeyRasterPair(page, figure, captions, tables, tokens, context) {
+  try {
+    const valid = (r) =>
+      Array.isArray(r) && r.length === 4 && r.every(Number.isFinite) && r[2] > r[0] && r[3] > r[1]
+    const contains = (a, b) => b.every((v, i) => (i < 2 ? v >= a[i] - 0.02 : v <= a[i] + 0.02))
+    const caption = figure?.caption
+    if (
+      !valid(figure?.rect) ||
+      figure.graphicsCount !== 1 ||
+      figure.sourceItems?.length ||
+      !valid(caption?.rect) ||
+      caption.page !== page.pageNumber ||
+      !captions.includes(caption) ||
+      !/\(a\)[\s\S]*\(b\)/u.test(caption.lines.join(' ')) ||
+      page.graphicsBounds?.length !== 2 ||
+      page.graphicsBounds.some((g) => g.kind !== 'image')
+    )
+      return
+    const raster = nativeRasterImageInventory(page, context)
+    if (raster?.images.length !== 2) return
+    const inventory = nativePageTextPacketInventory(page, tokens, context, true)
+    if (!inventory || inventory.evidence.paths.size || inventory.evidence.images.length !== 2)
+      return
+    const images = [...raster.images].sort((a, b) => a.rect[1] - b.rect[1])
+    if (
+      images[0].rect[3] >= images[1].rect[1] ||
+      images[1].rect[3] >= caption.rect[1] ||
+      !contains(images[1].rect, figure.rect) ||
+      images[0].operationIndex >= images[1].operationIndex ||
+      images.some(
+        (im) =>
+          !inventory.evidence.images.some(
+            (native) =>
+              native.operationIndex === im.operationIndex &&
+              native.rect.every((v, n) => v === im.rect[n])
+          )
+      )
+    )
+      return
+    const labels = inventory.records.filter((r) => /^\([ab]\)$/u.test(r.r.str))
+    if (
+      labels.length !== 2 ||
+      labels[0].r.str !== '(a)' ||
+      labels[1].r.str !== '(b)' ||
+      labels[0].r.fontName !== labels[1].r.fontName ||
+      labels[0].r.transform.slice(0, 4).some((v, i) => v !== labels[1].r.transform[i])
+    )
+      return
+    const bounds = labels.map((r) => union([r.rect, ...r.part.map((p) => p.g.ink)]))
+    if (
+      Math.max(...bounds.map((r) => r[0])) >= Math.min(...bounds.map((r) => r[2])) ||
+      bounds.some(
+        (r, i) => r[2] >= images[i].rect[0] || r[1] < images[i].rect[1] || r[3] > images[i].rect[3]
+      )
+    )
+      return
+    const rect = union([...images.map((im) => im.rect), ...bounds])
+    const glyphs = new Set(labels.flatMap((r) => r.part.map((p) => p.g)))
+    const corridor = [rect[0], rect[1], rect[2], caption.rect[1]]
+    if (
+      tables.some((r) => !valid(r) || intersection(r, corridor) > 0) ||
+      captions.some(
+        (c) =>
+          c.page === page.pageNumber &&
+          (c !== caption || captions.filter((p) => p === caption).length !== 1) &&
+          (!valid(c.rect) || intersection(c.rect, corridor) > 0)
+      ) ||
+      inventory.glyphs.some((g) => !glyphs.has(g) && intersection(g.ink, corridor) > 0)
+    )
+      return
+    return { ...figure, rect, graphicsCount: 2 }
   } catch {
     return
   }

@@ -33,6 +33,21 @@ function reportFor(
 }
 
 describe('module impact shadow', () => {
+  it('retains Linux sandbox certification when the PDF corpus test itself changes', () => {
+    const report = reportFor([
+      { path: 'scripts/pdf-translation-corpus.test.ts', status: 'modified' }
+    ])
+    expect(report.shadow.mode).toBe('full')
+    // Multiple modules register this corpus test. The first full-validation owner may change;
+    // the contract is that its full reason retains every lane, including Linux certification.
+    expect(report.shadow.reasonChains).toContainEqual(
+      expect.stringMatching(/^[a-z][a-z0-9_]* -> .+ -> full$/)
+    )
+    expect(report.resolved.mode).toBe('full')
+    expect(report.resolved.lanes).toEqual(changeImpactManifest.laneOrder)
+    expect(report.resolved.lanes).toContain('linux_runtime')
+  })
+
   it.each([
     [
       'project defaults recovery',
@@ -98,7 +113,9 @@ describe('module impact shadow', () => {
       { path: 'src/main/session-persistence/coordinator.ts', status: 'modified' }
     ])
 
-    expect(report.resolved.reasonChains).toContain('session_persistence -> project_lifecycle')
+    expect(report.resolved.reasonChains).toContain(
+      'session_persistence -> project_lifecycle -> capability routing only'
+    )
     expect(report.shadow.testFiles).toContain('src/main/projects/deletion-coordinator.test.ts')
     expect(report.shadow.testFiles).toContain('src/main/session-persistence/ipc.test.ts')
   })
@@ -142,15 +159,7 @@ describe('module impact shadow', () => {
     expect(report.shadow).toMatchObject({
       mode: 'selective',
       graphStatus: 'unavailable-manifest-only',
-      modules: [
-        'compute_service',
-        'project_files_view',
-        'session_renderer',
-        'workspace_conversation',
-        'workspace_file_presentation',
-        'workspace_page',
-        'workspace_runtime'
-      ]
+      modules: ['session_renderer']
     })
     expect(report.shadow.testFiles).toEqual([...report.shadow.testFiles].sort())
     expect(report.shadow.capabilityOverlays).toEqual([
@@ -366,6 +375,7 @@ describe('module impact shadow', () => {
         modules: ['i18n_catalog']
       })
       expect(report.shadow.testFiles).toEqual([
+        'scripts/build-backend.integration.test.ts',
         'src/main/locale/owner.test.ts',
         'src/renderer/src/i18n/resources.test.ts'
       ])

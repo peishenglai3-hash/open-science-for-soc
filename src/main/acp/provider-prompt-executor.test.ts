@@ -138,6 +138,43 @@ const setup = (
 }
 
 describe('AcpProviderPromptExecutor', () => {
+  it('counts Pi model calls once per message while keeping only the latest input as context', async () => {
+    const usage = (id: string, input: number): NextUpdate => {
+      const update = {
+        sessionUpdate: 'agent_message_chunk' as const,
+        content: { type: 'text' as const, text: '' },
+        messageId: id,
+        _meta: {
+          pi: {
+            event: 'assistant_message',
+            usage: { input, output: 10, cacheRead: 20, cacheWrite: 5 }
+          }
+        }
+      }
+      return { kind: 'session_update', update, notification: { sessionId: 'provider-1', update } }
+    }
+    const fixture = setup([
+      usage('first', 100),
+      usage('first', 100),
+      usage('second', 200),
+      stop({ stopReason: 'end_turn' } as PromptResponse)
+    ])
+    await expect(
+      fixture.executor.execute({ ...fixture.input, frameworkId: 'pi' })
+    ).resolves.toMatchObject({
+      kind: 'stopped',
+      facts: {
+        modelTurnCount: 2,
+        turnUsage: { inputTokens: 300, cacheTokens: 50, outputTokens: 20 },
+        contextUsedTokens: 225,
+        modelCalls: [
+          { sourceInvocationId: 'first', inputTokens: 100 },
+          { sourceInvocationId: 'second', inputTokens: 200 }
+        ]
+      }
+    })
+  })
+
   it.each(['claude-code', 'opencode', 'codex', 'codebuddy'] as const)(
     'P03 does not requeue accepted output after a receipt revision conflict on %s',
     async (frameworkId) => {
@@ -335,6 +372,73 @@ describe('AcpProviderPromptExecutor', () => {
       }
     })
   })
+
+  it.each([true, false])(
+    'keeps compaction usage unknown without inventing a partial total (ACP aggregate: %s)',
+    async (aggregateAvailable) => {
+      const response: PromptResponse = {
+        stopReason: 'end_turn',
+        ...(aggregateAvailable
+          ? { usage: { inputTokens: 30, outputTokens: 9, totalTokens: 39 } }
+          : {})
+      }
+      const fetchImpl = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(new Response(JSON.stringify({ data: [] })))
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              data: [
+                { id: 'assistant-1', type: 'assistant', tokens: { input: 4, output: 2 } },
+                {
+                  id: 'compaction-1',
+                  type: 'compaction',
+                  status: 'failed',
+                  error: { message: 'provider stopped' }
+                }
+              ]
+            })
+          )
+        )
+      const executor = new AcpProviderPromptExecutor({
+        backendGeneration: {
+          openCodeUsageApi: () => ({
+            baseUrl: 'http://127.0.0.1:4242',
+            authorization: 'Basic fixture',
+            version: 2
+          }),
+          current: { adapter: { nativeMcpEnabled: true, bridgeMcpAliasesEnabled: false } }
+        },
+        opencodeUsageFetch: fetchImpl
+      })
+      const outcome = await executor.execute({
+        session: {
+          sessionId: 'provider-1',
+          prompt: vi.fn(async () => undefined),
+          nextUpdate: vi.fn(async () => stop(response))
+        } as unknown as ProviderPromptExecutionInput['session'],
+        content: 'prompt',
+        cwd: '/workspace',
+        frameworkId: 'opencode',
+        isCurrent: () => true,
+        beforeDispatch: async () => 'active',
+        captureStop: () => true,
+        onAccepted: () => undefined,
+        routeNotification: () => undefined
+      })
+      expect(fetchImpl).toHaveBeenCalledTimes(2)
+      expect(outcome).toEqual({
+        kind: 'stopped',
+        response,
+        facts: {
+          compaction: { succeeded: false, error: 'provider stopped' },
+          ...(aggregateAvailable
+            ? { turnUsage: { inputTokens: 30, cacheTokens: 0, outputTokens: 9 } }
+            : {})
+        }
+      })
+    }
+  )
 
   it('accepts once, routes updates in order, captures stop, and returns raw normalized facts', async () => {
     const response: PromptResponse = {

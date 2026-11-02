@@ -99,6 +99,7 @@ export type ConnectorsSnapshot = {
   ncbi: NcbiCredentialsView
   // Optional only for compatibility with an older main process during local development.
   openAlex?: OpenAlexCredentialView
+  semanticScholar?: { hasApiKey: boolean }
 }
 
 export type DeviceCredentialKind = 'api_key' | 'token' | 'oauth'
@@ -215,7 +216,7 @@ export type PermissionProfile = 'ask' | 'auto' | 'full'
 export type DelegationPolicy = 'allow' | 'deny'
 export type TurnIntent = 'plan-first'
 export type ReasoningEffort = 'default' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
-export type AgentFramework = 'claude-code' | 'opencode' | 'codex' | 'codebuddy'
+export type AgentFramework = 'claude-code' | 'opencode' | 'codex' | 'codebuddy' | 'pi'
 export type ReadinessStatus = 'ready' | 'missing' | 'not_ready'
 export type ProviderReadinessReason =
   | 'credential_invalid'

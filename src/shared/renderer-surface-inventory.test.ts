@@ -68,6 +68,9 @@ const GENERATED_SOURCE_OMISSIONS = [
   'artifacts.onReproducibilityCheckChanged',
   'artifacts.startReproducibilityCheck',
   'artifacts.sessionReproducibility',
+  'packagePresentation.getState',
+  'packagePresentation.onStateChanged',
+  'packagePresentation.cancelTransfer',
   'runtimeStartup.getState',
   'runtimeStartup.stopAndContinue',
   'runtimeStartup.recover',
@@ -92,7 +95,6 @@ const GENERATED_SOURCE_OMISSIONS = [
   'locale.setPreference',
   'managedFileVersions.cancelDiff',
   'managedFileVersions.diffText',
-  'managedFileVersions.inspect',
   'managedFileVersions.saveTextEdit',
   'network.checkConnectivity',
   'network.getInfo',
@@ -197,6 +199,8 @@ const BROWSER_NATIVE_CALLABLE_PATHS = [
 ] as const
 
 const WEB_UNAVAILABLE_CHANNELS = [
+  'file:artifact-save-progress',
+  'file:cancel-artifact-save',
   'file:save-blob',
   'file:save-managed',
   'file:save-project-artifacts',
@@ -205,11 +209,8 @@ const WEB_UNAVAILABLE_CHANNELS = [
   'sessions:inspect-diagnostics',
   'sessions:export-diagnostics',
   'sessions:export-conversation',
-  'sessions:export-package',
   'sessions:fork',
-  'sessions:import-package',
   'sessions:open-recovery-folder',
-  'sessions:package-operation',
   'settings:import-agent-home-skills',
   'settings:list-agent-home-skills',
   'uploads:stage-local-file',
@@ -218,7 +219,7 @@ const WEB_UNAVAILABLE_CHANNELS = [
 
 const REMOTE_LOCAL_ONLY_CHANNELS: GroupedInventory = {
   'pdf-structure': ['read-cached', 'parse', 'cancel', 'read-thumbnail', 'clear-cache'],
-  'local-models': ['get-snapshot', 'install', 'cancel', 'remove'],
+  'local-models': ['get-snapshot', 'install', 'cancel', 'remove', 'set-ocr-languages'],
   artifacts: ['open-file'],
   cli: ['install', 'uninstall'],
   compute: [
@@ -246,6 +247,13 @@ const REMOTE_LOCAL_ONLY_CHANNELS: GroupedInventory = {
   'notebook-env': ['cancel', 'provision', 'repair'],
   notebook: ['export-ipynb', 'export-ipynb-all'],
   'remote-access': ['probe'],
+  sessions: [
+    'export-package',
+    'import-package',
+    'package-operation',
+    'use-case-catalog',
+    'use-case-introduction'
+  ],
   runtime: [
     'pick-interpreter',
     'register-interpreter',
@@ -283,6 +291,7 @@ const REMOTE_LOCAL_ONLY_CHANNELS: GroupedInventory = {
     'install-notebook-network',
     'cancel-notebook-network-setup',
     'install-opencode',
+    'install-pi',
     'install-recommended-wsl-distro',
     'install-wsl-platform',
     'list-device-credentials',
@@ -312,9 +321,11 @@ const REMOTE_LOCAL_ONLY_CHANNELS: GroupedInventory = {
     'set-notifications-enabled',
     'set-show-notification-content',
     'set-openalex-credential',
+    'set-semantic-scholar-credential',
     'set-package-mirror',
     'set-network-proxy',
     'set-notebook-network',
+    'set-notebook-folder-restriction-enabled',
     'set-project-files-filter',
     'switch-local-shell-to-powershell',
     'test-classification',
@@ -322,6 +333,7 @@ const REMOTE_LOCAL_ONLY_CHANNELS: GroupedInventory = {
     'uninstall-codebuddy',
     'uninstall-codex',
     'uninstall-opencode',
+    'uninstall-pi',
     'update-classification',
     'update-custom-server',
     'update-device-credential',
@@ -342,11 +354,21 @@ const REMOTE_LOCAL_ONLY_CHANNELS: GroupedInventory = {
     'set-data-root-and-relaunch',
     'validate-data-root'
   ],
-  update: ['apply', 'cancel', 'download', 'recheck', 'recover'],
+  update: [
+    'apply',
+    'cancel',
+    'download',
+    'get-installer',
+    'recheck',
+    'recover',
+    'reveal-installer'
+  ],
   uploads: ['stage-local-path']
 }
 
 const ELECTRON_ONLY_CALLABLE_PATHS = [
+  'getArtifactSaveProgress',
+  'cancelArtifactSave',
   ...GENERATED_SOURCE_OMISSIONS.filter((path) => path !== 'getRuntimeVersions'),
   'saveSessionArtifacts',
   'sessions.cancelDiagnostics',

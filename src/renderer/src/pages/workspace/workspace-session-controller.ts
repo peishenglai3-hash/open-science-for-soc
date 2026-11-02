@@ -19,8 +19,9 @@ import type {
 import type { JobSummary } from '../../../../shared/compute'
 import { useNavigationStore } from '@/stores/navigation-store'
 import { useArchiveUndoStore } from '@/stores/archive-undo-store'
-import { projectSessionActionability, useSessionStore } from '@/stores/session-store'
-import type { ChatSession } from '@/stores/session-store'
+import { projectSessionActionability } from '@/stores/session-actionability'
+import { useSessionStore } from '@/stores/session-store'
+import type { ChatSession } from '@/stores/session-store-contract'
 import {
   hydratePersistedSessionIfPresent,
   loadPersistedSession
@@ -288,6 +289,9 @@ const useWorkspaceSessionController = ({
       })
   }
   const openDelete = (session: ChatSession): void => {
+    const current =
+      useSessionStore.getState().sessions.find(({ id }) => id === session.id) ?? session
+    if (current.firstPromptDraft || current.isPending) return
     if (isPersistenceHydrated && canDeleteConversations && deletingIdsRef.current.size === 0) {
       setDeleteDialog({
         session,
@@ -299,7 +303,10 @@ const useWorkspaceSessionController = ({
   const confirmDelete = (): void => {
     if (!isPersistenceHydrated || !canDeleteConversations || !deleteDialog) return
     useNavigationStore.getState().recordUserNavigation()
-    const { session } = deleteDialog
+    const session =
+      useSessionStore.getState().sessions.find(({ id }) => id === deleteDialog.session.id) ??
+      deleteDialog.session
+    if (session.firstPromptDraft || session.isPending) return
     const sessionId = session.id
     if (deletingIdsRef.current.has(sessionId) || !beginSessionDeletion(sessionId)) return
     deletingIdsRef.current.add(sessionId)
@@ -371,7 +378,12 @@ const useWorkspaceSessionController = ({
             setSessionSpecialistId(sessionId, specialistId, true)
             setPendingSpecialists((current) => ({ ...current, [sessionId]: specialistId }))
             setReconfigureError(
-              pendingSpecialistReconfigureError(sessionId, specialistItems, specialistId)
+              pendingSpecialistReconfigureError(
+                sessionId,
+                specialistItems,
+                specialistId,
+                result.reason
+              )
             )
             return
           }
@@ -462,7 +474,7 @@ const useWorkspaceSessionController = ({
       if (result?.status === 'pending') {
         setSessionSpecialistId(sessionId, specialistId, true)
         setReconfigureError(
-          pendingSpecialistReconfigureError(sessionId, specialistItems, specialistId)
+          pendingSpecialistReconfigureError(sessionId, specialistItems, specialistId, result.reason)
         )
         setBarrier(sessionId, false)
         return false
@@ -505,6 +517,7 @@ const useWorkspaceSessionController = ({
     if (!setter || isWorkspaceSpecialistBarrierInFlight(sessionId)) return
     specialistResolutionTokens.current.set(sessionId, Symbol())
     const attempt = reconfiguration.beginIdleAttempt(sessionId, undefined)
+    setPendingSpecialists((current) => ({ ...current, [sessionId]: undefined }))
     setBarrier(sessionId, true)
     void setter({ sessionId, specialistId: undefined })
       .then((result) => {
@@ -513,7 +526,7 @@ const useWorkspaceSessionController = ({
           setSessionSpecialistId(sessionId, undefined, true)
           setPendingSpecialists((current) => ({ ...current, [sessionId]: undefined }))
           setReconfigureError(
-            pendingSpecialistReconfigureError(sessionId, specialistItems, undefined)
+            pendingSpecialistReconfigureError(sessionId, specialistItems, undefined, result.reason)
           )
           return
         }
@@ -530,6 +543,9 @@ const useWorkspaceSessionController = ({
   }
   useEffect(() => {
     if (!activeSession) return
+    // Main broadcasts the durable pending marker before the switch request finishes. Only
+    // restore recovery when no local attempt owns that intermediate state.
+    if (isWorkspaceSpecialistBarrierInFlight(activeSession.id)) return
     if (activeSession.specialistBindingPending !== true) {
       if (!restoredPendingBindings.current.has(activeSession.id)) return
       const restoredId = restoredPendingBindings.current.get(activeSession.id)
@@ -564,7 +580,7 @@ const useWorkspaceSessionController = ({
             activeSession.specialistId
           )
     )
-  }, [activeSession, setReconfigureError, specialistItems])
+  }, [activeSession, barrierInFlightIds, setReconfigureError, specialistItems])
 
   useEffect(() => {
     if (typeof window.api?.specialist?.list !== 'function') return

@@ -1,3 +1,5 @@
+import type { LiteratureReadingStatus } from '../workflows/useLiteratureReadingStatus'
+import { useLiteratureHost } from '../renderer-host'
 import type { LiteratureItemType } from '@aipoch/literature-citations/contracts'
 import type {
   LiteratureCatalogSearchRequest,
@@ -63,6 +65,7 @@ export function useLiteratureQuery({
   filterYearFrom,
   filterYearTo,
   filterHasPdf,
+  filterReadingStatus,
   journalAttributeFilters,
   tableScrollRef,
   setError,
@@ -85,6 +88,7 @@ export function useLiteratureQuery({
   filterYearFrom: string
   filterYearTo: string
   filterHasPdf: 'with' | 'all' | 'without'
+  filterReadingStatus: LiteratureReadingStatus | 'all'
   journalAttributeFilters: ReturnType<typeof useLiteratureTable>['journalAttributeFilters']
   tableScrollRef: React.RefObject<HTMLDivElement | null>
   setError: React.Dispatch<React.SetStateAction<string | undefined>>
@@ -131,6 +135,8 @@ export function useLiteratureQuery({
     includeHidden?: boolean
   ) => Promise<void>
 } {
+  const { api: hostApi } = useLiteratureHost()
+
   const { t } = useTranslation()
   const [items, setItems] = useState<LiteratureItemView[]>([])
   const [candidates, setCandidates] = useState<LiteratureInboxCandidateView[]>([])
@@ -155,20 +161,20 @@ export function useLiteratureQuery({
     const collections: LiteratureCollectionView[] = []
     let offset: number | undefined = 0
     do {
-      const page = await window.api.literature.search({ scope: 'collections', limit: 100, offset })
+      const page = await hostApi.literature.search({ scope: 'collections', limit: 100, offset })
       if (generation !== collectionsGenerationRef.current) return
       collections.push(...page.entries.filter(isCollection))
       offset = page.nextOffset
     } while (offset !== undefined)
     setCollections(collections)
     return collections
-  }, [pendingDecisionsRef])
+  }, [hostApi.literature, pendingDecisionsRef])
   const inboxCountGeneration = useRef(0)
   const loadInboxCounts = useCallback(async (): Promise<void> => {
     const generation = ++inboxCountGeneration.current
     await Promise.all(
       (['pending', 'dismissed'] as const).map(async (state) => {
-        const page = await window.api.literature.search({
+        const page = await hostApi.literature.search({
           scope: 'inbox',
           inboxState: state,
           limit: 1
@@ -179,11 +185,11 @@ export function useLiteratureQuery({
         else setInboxDismissedCount(count)
       })
     )
-  }, [])
+  }, [hostApi.literature])
   const projectCountsGenerationRef = useRef(0)
   const loadProjectCounts = useCallback(async (): Promise<void> => {
     const generation = ++projectCountsGenerationRef.current
-    const page = await window.api.literature.search({ scope: 'project-counts' })
+    const page = await hostApi.literature.search({ scope: 'project-counts' })
     if (generation !== projectCountsGenerationRef.current) return
     setProjectItemCounts(
       Object.fromEntries(
@@ -192,7 +198,7 @@ export function useLiteratureQuery({
           .map(({ projectId, itemCount }) => [projectId, itemCount])
       )
     )
-  }, [])
+  }, [hostApi.literature])
   const selectedCollection = useMemo(
     () => collections.find((collection) => collection.id === collectionId),
     [collectionId, collections]
@@ -216,6 +222,7 @@ export function useLiteratureQuery({
         filterYearFrom,
         filterYearTo,
         filterHasPdf,
+        filterReadingStatus,
         journalAttributeFilters,
         entriesPageSize
       }),
@@ -224,6 +231,7 @@ export function useLiteratureQuery({
       smartFilter,
       smartDecisionSource,
       filterHasPdf,
+      filterReadingStatus,
       journalAttributeFilters,
       entriesPageSize,
       filterItemType,
@@ -271,6 +279,7 @@ export function useLiteratureQuery({
               ...(filterYearFrom ? { yearFrom: Number(filterYearFrom) } : {}),
               ...(filterYearTo ? { yearTo: Number(filterYearTo) } : {}),
               ...(filterHasPdf !== 'all' ? { hasFullText: filterHasPdf === 'with' } : {}),
+              ...(filterReadingStatus !== 'all' ? { readingStatus: filterReadingStatus } : {}),
               ...(journalAttributeFilters.length
                 ? { journalAttributes: journalAttributeFilters }
                 : {})
@@ -286,6 +295,7 @@ export function useLiteratureQuery({
       entriesOffset,
       entriesPageSize,
       filterHasPdf,
+      filterReadingStatus,
       journalAttributeFilters,
       filterItemType,
       filterYearFrom,

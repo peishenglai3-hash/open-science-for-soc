@@ -93,12 +93,12 @@ describe('ProviderRuntimeProjectionOwner', () => {
 
     expect(resolveProviderDraft(provider)).toMatchObject({
       baseUrl: 'https://api.deepseek.com/anthropic',
-      openaiBaseUrl: 'https://api.deepseek.com/v1',
+      chatCompletionsBaseUrl: 'https://api.deepseek.com/v1',
       responsesBaseUrl: 'https://api.deepseek.com'
     })
     expect(owner.resolveProvider(provider, 'deepseek-flash')).toMatchObject({
       baseUrl: 'https://api.deepseek.com/anthropic',
-      openaiBaseUrl: 'https://api.deepseek.com/v1',
+      chatCompletionsBaseUrl: 'https://api.deepseek.com/v1',
       responsesBaseUrl: 'https://api.deepseek.com',
       model: 'deepseek-flash'
     })
@@ -118,9 +118,9 @@ describe('ProviderRuntimeProjectionOwner', () => {
       })
     ).toMatchObject({
       baseUrl: `https://token.sensenova.${domain}`,
-      openaiBaseUrl: `https://token.sensenova.${domain}/v1`,
+      chatCompletionsBaseUrl: `https://token.sensenova.${domain}/v1`,
       model: 'sensenova-6.8-flash-lite',
-      apiEndpoints: ['anthropic', 'openai']
+      apiEndpoints: ['messages', 'chat-completions']
     })
   })
 
@@ -143,7 +143,7 @@ describe('ProviderRuntimeProjectionOwner', () => {
           owner.resolveRuntimeTarget(provider, { kind: 'required', model }, framework)
         ).toMatchObject({
           effectiveModel: model,
-          apiEndpoints: ['anthropic', 'openai'],
+          apiEndpoints: ['messages', 'chat-completions'],
           frameworkCompatible: true,
           reasoningEffortProfile: {
             supported: true,
@@ -224,7 +224,7 @@ describe('ProviderRuntimeProjectionOwner', () => {
           effectiveModel: model,
           apiEndpoints: ['responses'],
           frameworkCompatible: frameworkId === 'codex',
-          needsChatResponsesBridge: false,
+          needsChatResponsesToChatCompletionsBridge: false,
           needsNativeResponsesCompatibility: false,
           reasoningEffortProfile: {
             supported: true,
@@ -232,7 +232,67 @@ describe('ProviderRuntimeProjectionOwner', () => {
           },
           provider: { model, supportsImageInput: true }
         })
-        if (type === 'official') expect(target.provider.contextWindow).toBe(1_050_000)
+        expect(target.provider.contextWindow).toBe(1_050_000)
+      }
+    }
+  )
+
+  it.each(['official', 'codex-isolated', 'codex-shared'] as const)(
+    'requests published OpenAI windows while leaving native caps to Codex for %s',
+    (type) => {
+      const owner = new ProviderRuntimeProjectionOwner()
+      const provider: StoredProvider = {
+        id: type,
+        type,
+        ...(type === 'official' ? { vendorId: 'openai' as const } : {}),
+        name: 'OpenAI',
+        model: 'gpt-5.4-mini'
+      }
+      const before = structuredClone(provider)
+      const framework = getAgentFramework('codex')
+      for (const [model, contextWindow] of [
+        ['gpt-6-astra', 1_050_000],
+        ['gpt-6.1-sol', 1_050_000],
+        ['gpt-6-sol', 1_050_000],
+        ['gpt-6-luna', 1_050_000],
+        ['gpt-5.6-sol', 1_050_000],
+        ['gpt-5.6-terra', 1_050_000],
+        ['gpt-5.6-luna', 1_050_000],
+        ['gpt-5.5', 1_050_000],
+        ['gpt-5.4', 1_050_000],
+        ['gpt-5.4-mini', 400_000]
+      ] as const) {
+        const target = owner.resolveRuntimeTarget(provider, { kind: 'required', model }, framework)
+        expect(target.provider).toMatchObject({ model, contextWindow })
+        const config = framework.prepareModelConfig(target.provider, {
+          storageRoot: '/data',
+          executablePath: '/runtime/codex-acp'
+        })
+        expect(JSON.parse(config.env?.CODEX_CONFIG ?? '')).toMatchObject({
+          model,
+          model_context_window: contextWindow,
+          model_auto_compact_token_limit: contextWindow * 0.9
+        })
+      }
+      expect(provider).toEqual(before)
+    }
+  )
+
+  it.each(['codex-isolated', 'codex-shared'] as const)(
+    'leaves unknown and account-default %s context limits to Codex',
+    (type) => {
+      const owner = new ProviderRuntimeProjectionOwner()
+      const provider: StoredProvider = { id: type, type, name: 'Codex' }
+      for (const model of [undefined, 'unpublished-model']) {
+        const resolved = owner.resolveProvider(provider, model)
+        expect(resolved.contextWindow).toBeUndefined()
+        const config = getAgentFramework('codex').prepareModelConfig(resolved, {
+          storageRoot: '/data',
+          executablePath: '/runtime/codex-acp'
+        })
+        const parsed = JSON.parse(config.env?.CODEX_CONFIG ?? '')
+        expect(parsed).not.toHaveProperty('model_context_window')
+        expect(parsed).not.toHaveProperty('model_auto_compact_token_limit')
       }
     }
   )
@@ -273,11 +333,11 @@ describe('ProviderRuntimeProjectionOwner', () => {
 
           expect(target).toMatchObject({
             effectiveModel: model,
-            apiEndpoints: ['anthropic'],
+            apiEndpoints: ['messages'],
             frameworkCompatible:
               frameworkId === 'claude-code' ||
               (provider.type === 'official' && frameworkId === 'opencode'),
-            needsChatResponsesBridge: false,
+            needsChatResponsesToChatCompletionsBridge: false,
             needsNativeResponsesCompatibility: false,
             reasoningEffortProfile: {
               supported: true,
@@ -369,7 +429,7 @@ describe('ProviderRuntimeProjectionOwner', () => {
       name: 'Lab gateway',
       baseUrl: 'https://lab.example/v1',
       model: 'lab-model',
-      apiEndpoints: ['openai']
+      apiEndpoints: ['chat-completions']
     }
 
     expect(() =>
@@ -393,7 +453,7 @@ describe('ProviderRuntimeProjectionOwner', () => {
       model: 'lab-model',
       keyRef: encryptKey('secret-key'),
       keyMask: 'secr…-key',
-      apiEndpoints: ['openai']
+      apiEndpoints: ['chat-completions']
     }
     const before = structuredClone(provider)
 
@@ -408,7 +468,7 @@ describe('ProviderRuntimeProjectionOwner', () => {
       providerId: 'provider-1',
       effectiveModel: 'lab-model',
       provider: { model: 'lab-model', key: 'secret-key' },
-      needsChatResponsesBridge: true
+      needsChatResponsesToChatCompletionsBridge: true
     })
     expect(view).toMatchObject({
       models: ['lab-model'],
@@ -430,7 +490,7 @@ describe('ProviderRuntimeProjectionOwner', () => {
       model: 'lab-model',
       keyRef: encryptKey('secret-key'),
       keyMask: 'secr…-key',
-      apiEndpoints: ['openai']
+      apiEndpoints: ['chat-completions']
     }
 
     expect(owner.toProviderView(provider).maskedKey).toBe('••••-key')
@@ -477,9 +537,9 @@ describe('ProviderRuntimeProjectionOwner', () => {
         getAgentFramework('codex')
       )
     ).toMatchObject({
-      apiEndpoints: ['anthropic', 'openai', 'responses'],
+      apiEndpoints: ['messages', 'chat-completions', 'responses'],
       frameworkCompatible: true,
-      needsChatResponsesBridge: false,
+      needsChatResponsesToChatCompletionsBridge: false,
       needsNativeResponsesCompatibility: true
     })
   })
@@ -506,7 +566,7 @@ describe('ProviderRuntimeProjectionOwner', () => {
         expect(target).toMatchObject({
           effectiveModel: model,
           frameworkCompatible: true,
-          needsChatResponsesBridge: false,
+          needsChatResponsesToChatCompletionsBridge: false,
           needsNativeResponsesCompatibility: frameworkId === 'codex',
           provider: { supportsImageInput: true, contextWindow: 1_024_000 }
         })
@@ -551,12 +611,12 @@ describe('ProviderRuntimeProjectionOwner', () => {
         ].includes(target.effectiveModel ?? '')
         expect(target).toMatchObject({
           frameworkCompatible: frameworkId !== 'claude-code' || messagesSupported,
-          needsChatResponsesBridge: frameworkId === 'codex',
+          needsChatResponsesToChatCompletionsBridge: frameworkId === 'codex',
           needsNativeResponsesCompatibility: false,
           provider: {
             vendorId: 'sensenova',
             baseUrl: 'https://token.sensenova.cn',
-            openaiBaseUrl: 'https://token.sensenova.cn/v1',
+            chatCompletionsBaseUrl: 'https://token.sensenova.cn/v1',
             supportsImageInput: [
               'sensenova-6.8-flash-lite',
               'kimi-k3',
@@ -598,11 +658,11 @@ describe('ProviderRuntimeProjectionOwner', () => {
         expect.objectContaining({
           effectiveModel: 'sensenova-6.8-flash-lite',
           frameworkCompatible: true,
-          needsChatResponsesBridge: frameworkId === 'codex',
+          needsChatResponsesToChatCompletionsBridge: frameworkId === 'codex',
           needsNativeResponsesCompatibility: false,
           provider: expect.objectContaining({
             baseUrl: 'https://token.sensenova.ai',
-            openaiBaseUrl: 'https://token.sensenova.ai/v1',
+            chatCompletionsBaseUrl: 'https://token.sensenova.ai/v1',
             supportsImageInput: true
           })
         })
@@ -643,7 +703,7 @@ describe('ProviderRuntimeProjectionOwner', () => {
           getAgentFramework('codex')
         )
       ).toMatchObject({
-        apiEndpoints: ['anthropic', 'openai', 'responses'],
+        apiEndpoints: ['messages', 'chat-completions', 'responses'],
         needsNativeResponsesCompatibility: true,
         provider: { supportsImageInput: true, model }
       })
@@ -670,12 +730,12 @@ describe('ProviderRuntimeProjectionOwner', () => {
         )
       ).toMatchObject({
         effectiveModel: 'hy4-preview',
-        apiEndpoints: ['anthropic', 'openai', 'responses'],
+        apiEndpoints: ['messages', 'chat-completions', 'responses'],
         frameworkCompatible: true,
         provider: {
           vendorId: 'tencent',
           baseUrl: 'https://tokenhub-intl.tencentcloudmaas.com',
-          openaiBaseUrl: 'https://tokenhub-intl.tencentcloudmaas.com/v1',
+          chatCompletionsBaseUrl: 'https://tokenhub-intl.tencentcloudmaas.com/v1',
           model: 'hy4-preview',
           contextWindow: 1_000_000,
           supportsImageInput: false
@@ -690,7 +750,7 @@ describe('ProviderRuntimeProjectionOwner', () => {
         getAgentFramework('codex')
       )
     ).toMatchObject({
-      needsChatResponsesBridge: false,
+      needsChatResponsesToChatCompletionsBridge: false,
       needsNativeResponsesCompatibility: true
     })
   })
@@ -701,14 +761,14 @@ describe('ProviderRuntimeProjectionOwner', () => {
       name: 'Tencent Coding Plan',
       model: 'deepseek-v4-flash-202605',
       baseUrl: 'https://api.lkeap.cloud.tencent.com/coding/anthropic',
-      openaiBaseUrl: 'https://api.lkeap.cloud.tencent.com/coding/v3'
+      chatCompletionsBaseUrl: 'https://api.lkeap.cloud.tencent.com/coding/v3'
     },
     {
       vendorId: 'tencenttokenplan' as const,
       name: 'Tencent Token Plan',
       model: 'glm-5.2',
       baseUrl: 'https://tokenhub-intl.tencentcloudmaas.com/plan/anthropic',
-      openaiBaseUrl: 'https://tokenhub-intl.tencentcloudmaas.com/plan/v3'
+      chatCompletionsBaseUrl: 'https://tokenhub-intl.tencentcloudmaas.com/plan/v3'
     }
   ])('projects $name across every supported framework', (expected) => {
     const owner = new ProviderRuntimeProjectionOwner()
@@ -728,14 +788,14 @@ describe('ProviderRuntimeProjectionOwner', () => {
         )
       ).toMatchObject({
         effectiveModel: expected.model,
-        apiEndpoints: ['anthropic', 'openai'],
+        apiEndpoints: ['messages', 'chat-completions'],
         frameworkCompatible: true,
-        needsChatResponsesBridge: frameworkId === 'codex',
+        needsChatResponsesToChatCompletionsBridge: frameworkId === 'codex',
         needsNativeResponsesCompatibility: false,
         provider: {
           vendorId: expected.vendorId,
           baseUrl: expected.baseUrl,
-          openaiBaseUrl: expected.openaiBaseUrl,
+          chatCompletionsBaseUrl: expected.chatCompletionsBaseUrl,
           model: expected.model
         }
       })
@@ -764,9 +824,10 @@ describe('ProviderRuntimeProjectionOwner', () => {
             owner.resolveRuntimeTarget(provider, { kind: 'required', model }, framework)
           ).toMatchObject({
             effectiveModel: model,
-            apiEndpoints: vendorId === 'openrouter' ? ['anthropic', 'openai'] : ['openai'],
+            apiEndpoints:
+              vendorId === 'openrouter' ? ['messages', 'chat-completions'] : ['chat-completions'],
             frameworkCompatible: vendorId === 'openrouter' || frameworkId !== 'claude-code',
-            needsChatResponsesBridge: frameworkId === 'codex',
+            needsChatResponsesToChatCompletionsBridge: frameworkId === 'codex',
             needsNativeResponsesCompatibility: false,
             provider: { model, supportsImageInput: model !== 'big-pickle' }
           })
@@ -803,7 +864,7 @@ describe('ProviderRuntimeProjectionOwner', () => {
     expect(responsesTarget).toMatchObject({
       apiEndpoints: ['responses'],
       frameworkCompatible: true,
-      needsChatResponsesBridge: false,
+      needsChatResponsesToChatCompletionsBridge: false,
       needsNativeResponsesCompatibility: true
     })
     expect(incompatibleResponsesTarget).toMatchObject({
@@ -811,9 +872,9 @@ describe('ProviderRuntimeProjectionOwner', () => {
       frameworkCompatible: false
     })
     expect(messagesTarget).toMatchObject({
-      apiEndpoints: ['anthropic'],
+      apiEndpoints: ['messages'],
       frameworkCompatible: true,
-      needsChatResponsesBridge: false,
+      needsChatResponsesToChatCompletionsBridge: false,
       needsNativeResponsesCompatibility: false
     })
   })
@@ -822,10 +883,10 @@ describe('ProviderRuntimeProjectionOwner', () => {
     ['gpt-6.1-sol', 'responses', 'codex'],
     ['gpt-6-sol', 'responses', 'codex'],
     ['gpt-6-luna', 'responses', 'codex'],
-    ['claude-opus-5-5', 'anthropic', 'claude-code'],
-    ['claude-sonnet-5-5', 'anthropic', 'claude-code'],
-    ['qwen3.8-max', 'openai', 'codex'],
-    ['deepseek-v4-flash-vision-exp', 'openai', 'codex']
+    ['claude-opus-5-5', 'messages', 'claude-code'],
+    ['claude-sonnet-5-5', 'messages', 'claude-code'],
+    ['qwen3.8-max', 'chat-completions', 'codex'],
+    ['deepseek-v4-flash-vision-exp', 'chat-completions', 'codex']
   ] as const)('routes the new Zen model %s through %s', (model, endpoint, framework) => {
     const owner = new ProviderRuntimeProjectionOwner()
     const target = owner.resolveRuntimeTarget(
@@ -837,7 +898,7 @@ describe('ProviderRuntimeProjectionOwner', () => {
       effectiveModel: model,
       apiEndpoints: [endpoint],
       frameworkCompatible: true,
-      needsChatResponsesBridge: endpoint === 'openai',
+      needsChatResponsesToChatCompletionsBridge: endpoint === 'chat-completions',
       needsNativeResponsesCompatibility: endpoint === 'responses'
     })
   })
@@ -869,7 +930,7 @@ describe('ProviderRuntimeProjectionOwner', () => {
       type: 'custom',
       name: 'Lab gateway',
       model: 'lab-model',
-      apiEndpoints: ['anthropic']
+      apiEndpoints: ['messages']
     }
 
     expect(owner.resolveRuntimeModelCatalog(provider, getAgentFramework('claude-code'))).toEqual([

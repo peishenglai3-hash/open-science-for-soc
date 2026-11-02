@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { literatureRecordImportRequestSchema } from '@aipoch/literature-library/contracts'
 
 vi.mock('../renderer-broadcast', () => ({ broadcastToRenderers: vi.fn() }))
 vi.mock('../storage/migration-state', () => ({
@@ -7,6 +8,7 @@ vi.mock('../storage/migration-state', () => ({
 import { broadcastToRenderers } from '../renderer-broadcast'
 import { withDataRootWrite } from '../storage/migration-state'
 import { createLiteratureCommandOwner } from './command-owner'
+import { ApplicationCommandError } from '../../shared/application-command-contract'
 
 type Services = Parameters<typeof createLiteratureCommandOwner>[0]
 const request = {
@@ -71,6 +73,90 @@ const fixture = (): {
 beforeEach(() => vi.clearAllMocks())
 
 describe('Literature command workflows', () => {
+  it.each([
+    'ZOTERO_BATCH_POLICY_CONFLICT',
+    'ZOTERO_FILL_TYPE_CONFLICT',
+    'ZOTERO_COLLECTION_CONFLICT',
+    'ZOTERO_PREVIEW_CHANGED',
+    'ZOTERO_CONNECTION_FAILED',
+    'ZOTERO_REQUEST_TIMED_OUT',
+    'ZOTERO_LOCAL_API_DISABLED'
+  ])('exposes the safe collector error %s to Web callers', async (message) => {
+    const owner = createLiteratureCommandOwner({
+      literatureCollector: { run: vi.fn().mockRejectedValue(new Error(message)) }
+    } as unknown as Services)
+    await expect(owner.collect({ kind: 'zotero-preview' })).rejects.toEqual(
+      new ApplicationCommandError('command-failed', message)
+    )
+  })
+
+  it('leaves unexpected collector errors private', async () => {
+    const error = new Error('private database path')
+    const owner = createLiteratureCommandOwner({
+      literatureCollector: { run: vi.fn().mockRejectedValue(error) }
+    } as unknown as Services)
+    await expect(owner.collect({ kind: 'zotero-preview' })).rejects.toBe(error)
+    expect(error).not.toBeInstanceOf(ApplicationCommandError)
+  })
+
+  it('forwards Zotero collection to its owner under the command write gate', async () => {
+    const result = { kind: 'preview' }
+    const run = vi.fn().mockResolvedValue(result)
+    const owner = createLiteratureCommandOwner({
+      literatureCollector: { run }
+    } as unknown as Services)
+    const request = { kind: 'zotero-preview' as const }
+    const signal = new AbortController().signal
+    await expect(owner.collect(request, signal)).resolves.toBe(result)
+    expect(run).toHaveBeenCalledWith(request, signal)
+    expect(withDataRootWrite).not.toHaveBeenCalled()
+  })
+
+  it('forwards citation relationship queries and caller cancellation without publishing changes', async () => {
+    const run = vi.fn().mockResolvedValue({ records: [] })
+    const owner = createLiteratureCommandOwner({
+      literatureRelatedFinder: { run }
+    } as unknown as Services)
+    const request = {
+      itemId: 'paper',
+      expectedMetadataRevision: 1,
+      direction: 'references' as const,
+      offset: 0
+    }
+    const signal = new AbortController().signal
+    await owner.related(request, signal)
+    expect(run).toHaveBeenCalledWith(request, signal)
+    expect(withDataRootWrite).not.toHaveBeenCalled()
+    expect(broadcastToRenderers).not.toHaveBeenCalled()
+  })
+  it('forwards supplement queries and caller cancellation without publishing changes', async () => {
+    const run = vi.fn().mockResolvedValue({ records: [] })
+    const owner = createLiteratureCommandOwner({
+      literatureSupplementFinder: { run }
+    } as unknown as Services)
+    const request = { itemId: 'paper', expectedMetadataRevision: 1, provider: 'datacite' as const }
+    const signal = new AbortController().signal
+    await owner.supplements(request, signal)
+    expect(run).toHaveBeenCalledWith(request, signal)
+    expect(withDataRootWrite).not.toHaveBeenCalled()
+    expect(broadcastToRenderers).not.toHaveBeenCalled()
+  })
+  it('forwards publication checks with caller cancellation and leaves the write gate to persistence', async () => {
+    const result = { itemId: 'paper', metadataRevision: 1 }
+    const run = vi.fn().mockResolvedValue(result)
+    const owner = createLiteratureCommandOwner({
+      literaturePublicationChecker: { run }
+    } as unknown as Services)
+    const signal = new AbortController().signal
+    for (const mode of ['get', 'check'] as const) {
+      const request = { mode, itemId: 'paper', expectedMetadataRevision: 1 }
+      await expect(owner.publicationCheck(request, signal)).resolves.toBe(result)
+      expect(run).toHaveBeenLastCalledWith(request, signal)
+    }
+    expect(withDataRootWrite).not.toHaveBeenCalled()
+    expect(broadcastToRenderers).not.toHaveBeenCalled()
+  })
+
   it('routes exact candidate reads through the catalog without publishing mutations', async () => {
     const result = {
       candidates: [{ candidateId: 'a', state: 'accepted', acceptedItemId: 'paper' }]
@@ -194,8 +280,8 @@ it('maps package style errors to the existing application command error envelope
   const { toApplicationCommandErrorEnvelope } =
     await import('../../shared/application-command-contract')
   const owner = createLiteratureCommandOwner({
-    literatureCitationStyles: {
-      import: async () => {
+    literatureCitationFormatter: {
+      citationStyles: async () => {
         throw new CitationStyleError('csl-undefined-macro', 'Unknown macro', { macro: 'missing' })
       }
     }
@@ -208,4 +294,131 @@ it('maps package style errors to the existing application command error envelope
     message: 'Unknown macro',
     parameters: { macro: 'missing' }
   })
+})
+
+describe('selected reference import', () => {
+  it('imports explicitly selected rows in source order and maps preview diagnostics to source indices', async () => {
+    const { owner, formatter, catalog } = fixture()
+    const items = [{ title: 'First' }, { title: 'Conflicting' }, { title: 'Last' }]
+    const entries = items.map((item, index) => ({
+      index,
+      item,
+      status: index === 1 ? 'conflict' : 'ready'
+    }))
+    formatter.parseReferences.mockResolvedValue({ items, errors: [], warnings: [] })
+    catalog.inspectImportItems.mockResolvedValue([entries[0], { ...entries[2], index: 1 }])
+    catalog.importItems.mockResolvedValue({
+      itemIds: ['first', 'last'],
+      createdCount: 2,
+      reusedCount: 0
+    })
+    const result = await owner.importRecords({
+      mode: 'commit',
+      content: 'source',
+      selectedItemIndexes: [2, 0],
+      collectionId: 'collection',
+      duplicatePolicy: 'reuse'
+    })
+    expect(catalog.importItems).toHaveBeenCalledWith([items[0], items[2]], 'collection', 'reuse')
+    expect(result.entries).toEqual([entries[0], entries[2]])
+    expect(result.items).toEqual(items)
+    expect(result.imported?.itemIds).toEqual(['first', 'last'])
+  })
+
+  it('previews only selected identities and maps conflicts and invalid rows back to source indices', async () => {
+    const { owner, formatter, catalog } = fixture()
+    const items = [{ title: 'Excluded' }, { title: 'First selected' }, { title: 'Second selected' }]
+    const errors = [{ preview: 'Invalid', error: 'Invalid input' }]
+    formatter.parseReferences.mockResolvedValue({
+      items,
+      errors,
+      warnings: [[], ['missing-year'], []]
+    })
+    catalog.inspectImportItems.mockResolvedValue([
+      { index: 0, item: items[1], status: 'ready', warnings: ['missing-year'] },
+      {
+        index: 1,
+        item: items[2],
+        status: 'conflict',
+        conflict: { identifiers: [], matches: [{ inputIndex: 0, title: 'First selected' }] }
+      },
+      { index: 2, status: 'invalid', error: 'Invalid input' }
+    ])
+    const result = await owner.importRecords({
+      mode: 'preview',
+      content: 'source',
+      selectedItemIndexes: [2, 1]
+    })
+    expect(catalog.inspectImportItems).toHaveBeenCalledWith([items[1], items[2]], errors, [
+      ['missing-year'],
+      []
+    ])
+    expect(result.items).toEqual(items)
+    expect(result.entries.map((entry) => entry.index)).toEqual([1, 2, 3])
+    expect(result.entries[1].conflict?.matches).toEqual([
+      { inputIndex: 1, title: 'First selected' }
+    ])
+    expect(catalog.importItems).not.toHaveBeenCalled()
+  })
+
+  it.each([[], [0, 0], [-1], [1.5], [1]].map((indexes) => ({ indexes })))(
+    'rejects invalid selections %j before any write',
+    async ({ indexes: selectedItemIndexes }) => {
+      const { owner, catalog } = fixture()
+      await expect(
+        owner.importRecords({ mode: 'commit', content: 'source', selectedItemIndexes })
+      ).rejects.toThrow('Import selection is invalid')
+      expect(catalog.importItems).not.toHaveBeenCalled()
+    }
+  )
+
+  it('keeps selected identity conflicts authoritative at commit', async () => {
+    const { owner, catalog } = fixture()
+    catalog.importItems.mockRejectedValue(new Error('conflicting identifiers'))
+    await expect(
+      owner.importRecords({ mode: 'commit', content: 'source', selectedItemIndexes: [0] })
+    ).rejects.toThrow('conflicting identifiers')
+  })
+
+  it('accepts legacy whole-file requests and validates the optional selection at the transport boundary', () => {
+    const request = { mode: 'commit', content: 'source' }
+    expect(literatureRecordImportRequestSchema.parse(request)).toEqual(request)
+    expect(
+      literatureRecordImportRequestSchema.parse({ ...request, selectedItemIndexes: [0, 2] })
+    ).toEqual({ ...request, selectedItemIndexes: [0, 2] })
+    for (const indexes of [
+      [],
+      [-1],
+      [0, 0],
+      [0.1],
+      Array.from({ length: 1001 }, (_, index) => index)
+    ]) {
+      expect(
+        literatureRecordImportRequestSchema.safeParse({ ...request, selectedItemIndexes: indexes })
+          .success
+      ).toBe(false)
+    }
+    expect(
+      literatureRecordImportRequestSchema.safeParse({
+        mode: 'preview',
+        content: 'source',
+        selectedItemIndexes: [0]
+      }).success
+    ).toBe(true)
+  })
+})
+
+it.each([
+  ['10.1234/paper', 'doi:10.1234/paper'],
+  ['pmid:12345', 'pmid:12345'],
+  ['arxiv:2401.12345', 'arxiv:2401.12345']
+])('looks up %s without mutating the library', async (input, reference) => {
+  const item = { title: 'Resolved reference' }
+  const resolve = vi.fn().mockResolvedValue([{ item }])
+  const owner = createLiteratureCommandOwner({
+    literatureReferenceResolver: { resolve }
+  } as unknown as Services)
+  await expect(owner.lookupMetadata(input)).resolves.toBe(item)
+  expect(resolve).toHaveBeenCalledWith([reference])
+  expect(broadcastToRenderers).not.toHaveBeenCalled()
 })

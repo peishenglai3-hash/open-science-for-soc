@@ -1,6 +1,32 @@
 import { expect, test } from '@playwright/test'
-import { delimiter } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { delimiter, join, win32 } from 'node:path'
 import { electronLaunchTarget, launchEnvironment } from './fixtures/electron-app'
+
+test('starts native Windows OpenSSH without exposing operator credentials', () => {
+  test.skip(process.platform !== 'win32', 'Requires the Windows OpenSSH client.')
+  const ssh = win32.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
+  test.skip(!existsSync(ssh), 'Requires the native Windows OpenSSH client.')
+  const environment = launchEnvironment(
+    join(tmpdir(), 'open-science-ssh-environment', 'storage'),
+    undefined,
+    {
+      ...process.env,
+      OPENAI_API_KEY: 'operator-credential-must-not-escape'
+    }
+  )
+  expect(environment.OPENAI_API_KEY).toBeUndefined()
+  const result = spawnSync(ssh, ['-V'], {
+    env: environment,
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 10_000
+  })
+  expect(result.status).toBe(0)
+  expect(/OpenSSH_for_Windows/i.test(result.stdout + result.stderr)).toBe(true)
+})
 
 test('normalizes a Windows-style Path before injecting the fake Agent directory', () => {
   const environment = launchEnvironment('storage-root', 'fake-agent-bin', {
@@ -15,21 +41,24 @@ test('normalizes a Windows-style Path before injecting the fake Agent directory'
   expect(environment.OPEN_SCIENCE_E2E_WINDOW_MODE).toBe('hidden')
 })
 
-test('isolates source E2E data storage without changing the process home', () => {
+test('isolates source E2E storage and initializes the matching Electron home', () => {
   const environment = launchEnvironment('storage-root', undefined, { HOME: 'host-home' })
 
   expect(environment.OPEN_SCIENCE_E2E_STORAGE_ROOT).toBe('storage-root')
   expect(environment.OPEN_SCIENCE_STORAGE_ROOT).toBe('storage-root')
-  expect(environment.HOME).toBe('host-home')
+  expect(environment.HOME).toBe('isolated home')
+  expect(environment.APPDATA).toBe(join('isolated home', 'AppData', 'Roaming'))
+  expect(environment.OPEN_SCIENCE_E2E_ISOLATE_HOME).toBe('1')
 })
 
-test('isolates packaged certification storage without changing the process home', () => {
+test('isolates packaged certification storage and process home', () => {
   const environment = launchEnvironment('storage-root', undefined, {
     OPEN_SCIENCE_E2E_EXECUTABLE: '/artifacts/Open-Science'
   })
 
   expect(environment.OPEN_SCIENCE_E2E_STORAGE_ROOT).toBe('storage-root')
   expect(environment.OPEN_SCIENCE_STORAGE_ROOT).toBe('storage-root')
+  expect(environment.HOME).toBe('isolated home')
 })
 
 test('allows native window-system tests to opt into normal presentation', () => {

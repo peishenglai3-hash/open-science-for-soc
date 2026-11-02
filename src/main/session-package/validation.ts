@@ -1,14 +1,12 @@
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
-import type { SessionPackageManifest } from '../../shared/session-package'
+import { join } from 'node:path'
+import type { PackageProgress, SessionPackageManifest } from '../../shared/session-package'
 import { sha256 } from '../artifacts/provenance-canonical'
 import { ArtifactProvenanceRepository } from '../artifacts/provenance-repository'
 import { decodeReviewScopeSnapshot } from '../artifacts/provenance-snapshot-decoder'
-import { resolveStorageKey } from '../artifacts/provenance-storage'
-import { copyFileWithinBudget } from '../bounded-file-io'
 import { createProjectDbClient, migrateApplicationDatabase } from '../projects/prisma-client'
-import { assertPackageCapacity } from './capacity'
+import { createPackageMaterializer } from './materialize'
 import { executionEvidenceKeys } from './execution-evidence'
 import { validatePackageLiterature } from './literature'
 import {
@@ -58,7 +56,9 @@ export const validatePackageRecords = async (
   records: PackageRecords,
   signal?: AbortSignal,
   sourceIdentity = manifest.source,
-  temporaryRoot = tmpdir()
+  temporaryRoot = tmpdir(),
+  onProgress?: (progress: PackageProgress) => void,
+  destination = false
 ): Promise<void> => {
   if (Boolean(records.literature) !== Boolean(manifest.requiredFeatures?.includes('literature')))
     throw new Error('Literature package capability declaration is invalid.')
@@ -113,28 +113,47 @@ export const validatePackageRecords = async (
     )
       throw new Error('Session package Review snapshot ownership is invalid.')
   }
+  const materializeStage = destination ? 'prepare-validation' : 'prepare-preview'
+  const validationStage = destination ? 'validate-import' : 'validate-preview'
+  const reportValidation = (stageProgress: number): void =>
+    onProgress?.({ phase: 'validating', importStage: validationStage, stageProgress })
+  const totalBytes = [...files.values()].reduce((sum, entry) => sum + entry.sizeBytes, 0)
+  let completedBytes = 0
+  onProgress?.({ phase: 'validating', importStage: materializeStage, completedBytes, totalBytes })
   const root = await mkdtemp(join(temporaryRoot, 'open-science-package-validation-'))
   let client: ReturnType<typeof createProjectDbClient> | undefined
   try {
-    await assertPackageCapacity(
+    const materialize = await createPackageMaterializer(
+      directory,
       root,
-      [...files.values()].reduce((sum, entry) => sum + entry.sizeBytes, 0)
+      [...files.values()],
+      signal,
+      nativeStorageKeys(records)
     )
     for (const [key, entry] of files) {
-      const target = resolveStorageKey(root, key)
-      await mkdir(dirname(target), { recursive: true })
-      await copyFileWithinBudget(join(directory, entry.path), target, entry.sizeBytes, signal)
+      await materialize(entry, key, (bytes) =>
+        onProgress?.({
+          phase: 'validating',
+          importStage: materializeStage,
+          completedBytes: completedBytes + bytes,
+          totalBytes
+        })
+      )
+      completedBytes += entry.sizeBytes
     }
+    reportValidation(0)
     await installPackageReproducibility(root, records, excluded)
     await validatePackageReproducibility(root, records, manifest, sourceIdentity)
     const notebooks = await readPackageNotebooks(root, [...files.keys()])
     await executionEvidenceKeys(root, records, notebooks, signal)
     await validatePackageRoCrateMetadata(directory, manifest, records, signal)
+    reportValidation(0.35)
     // File and reproducibility checks still apply to conversation-only packages. With no
     // native rows, there are no database relationships or provenance records to validate.
     if (Object.values(records.tables).every((rows) => rows.length === 0)) return
     client = createProjectDbClient(root)
     await migrateApplicationDatabase(client)
+    reportValidation(0.6)
     const projectIds = new Set([manifest.source.projectId])
     for (const rows of Object.values(records.tables))
       for (const row of rows) if (typeof row.projectId === 'string') projectIds.add(row.projectId)
@@ -144,6 +163,8 @@ export const validatePackageRecords = async (
         await transaction.project.create({ data: { id, name: 'Package validation' } })
       await publishRecords(transaction)
     })
+    reportValidation(0.7)
+    let validatedVersions = 0
     const repository = new ArtifactProvenanceRepository({
       storageRoot: root,
       getClient: async () => client!
@@ -173,6 +194,7 @@ export const validatePackageRecords = async (
         versionId: identity.versionId,
         direction: 'up'
       })
+      reportValidation(0.7 + (0.3 * ++validatedVersions) / records.tables.ArtifactVersion.length)
     }
   } finally {
     try {

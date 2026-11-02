@@ -1,26 +1,28 @@
+import type { AgentProcessSpawner } from '../node-process-host'
 import type { ClientConnection, McpServer, SessionModeState } from '@agentclientprotocol/sdk'
-import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from 'node:child_process'
+import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 
 import type { AcpModelStepTokenUsage } from '../../shared/acp-usage-contract'
 import type { GrantedLocalRoot } from '../../shared/local-fs'
-import type { ChatApiEndpoint } from '../../shared/model-preference-contract'
-import type { PermissionProfileId } from '../../shared/permission-profiles'
-import type { OfficialVendorId } from '../../shared/provider-registry'
 import type {
+  ModelProtocol,
+  OfficialVendorId,
   CustomReasoningEffortTransport,
   ModelReasoningEffort,
   ResolvedReasoningEffort
-} from '../../shared/reasoning-effort'
+} from '@aipoch/providers'
+import type { PermissionProfileId } from '../../shared/permission-profiles'
+
 import type { AgentFrameworkId, CodexSubscriptionTransport } from '../../shared/settings'
 import type { PermissionProfileApplication } from '../acp/permission-profile-controller'
 import type { ResolvedProvider } from '../settings/provider-env'
 import type {
-  ResponsesBridgeConnection,
-  ResponsesBridgeModelTarget,
-  ResponsesBridgeSkillCandidate,
-  ResponsesBridgeSkillInput
-} from '../settings/responses-bridge-contract'
-import type { ResponsesBridgeNamespacedTool } from '../settings/responses-protocol-types'
+  ResponsesConnection,
+  ResponsesModelTarget,
+  ResponsesSkillCandidate,
+  ResponsesSkillInput
+} from '../settings/responses-transport-contract'
+import type { ResponsesNamespacedTool } from '@aipoch/providers/protocol'
 
 // The agent frameworks the app can drive over ACP (id union defined in shared settings so the renderer
 // and persisted settings share it). Adding one means implementing AgentFramework.
@@ -92,6 +94,7 @@ export type AgentModelRoute =
   | 'opencode-anthropic'
   | 'opencode-openai'
   | 'codebuddy-openai'
+  | 'pi'
   | 'codex-responses'
   | 'codex-responses-compatibility'
   | 'codex-bridge'
@@ -123,7 +126,7 @@ export type AgentModelChangeTarget = Readonly<{
   contextWindow?: number
   // Opaque, secret-free id for one provider/model already registered in the current Claude
   // generation's loopback Anthropic bridge. Absent means this target cannot cross a provider env.
-  anthropicBridgeTargetId?: string
+  messagesBridgeTargetId?: string
   // Opaque, secret-free id for a provider/model route pre-registered in the generation transport.
   // The lease decides whether selecting it is validation-only (OpenCode) or retargets a route.
   providerTransportTargetId?: string
@@ -139,6 +142,11 @@ export type AgentModelChangeTarget = Readonly<{
 export type ModelConfigContext = {
   // App storage root; frameworks derive their config dir/location beneath it.
   storageRoot: string
+  // Fixed per-backend discovery scope; source documents may be shared by parallel sessions.
+  skillDiscovery?: {
+    allowedNames: readonly string[]
+    allowedPaths: readonly string[]
+  }
   // Current GUI-authorized local roots. Frameworks may translate write-capable roots into their
   // native sandbox configuration; access remains advisory to the model, never an authorization.
   grantedLocalRoots?: readonly Pick<GrantedLocalRoot, 'path' | 'access'>[]
@@ -147,7 +155,10 @@ export type ModelConfigContext = {
   // Detected version of the native CLI behind an adapter. Codex uses this to trust bundled model
   // metadata only when the model/version pair is explicitly known.
   nativeVersion?: string
-  responsesBridge?: ResponsesBridgeConnection
+  responsesConnection?: ResponsesConnection
+  // Shared credential of the app-owned loopback bridges behind Pi's model catalog. The token is sent
+  // over ACP authentication and must remain out of generated config files and the child environment.
+  piModelBridge?: Readonly<{ token: string }>
   // Compact connector conventions for frameworks that need host.mcp guidance in their baseline
   // instructions. Detailed connector schemas live in on-demand `mcp-*` skills. Empty ⇒ omitted.
   instructions?: string
@@ -176,8 +187,8 @@ export type SessionSetupContext = {
   // Framework-native options resolved with the active backend and applied to every session created
   // on that connection. Claude uses this to inject app-owned settings/plugins into shared auth mode.
   sessionOptions?: Record<string, unknown>
-  // undefined is the Main Agent and must omit the native field; [] is an explicit Specialist
-  // zero-skill whitelist and must be preserved verbatim by supporting frameworks.
+  // Production sessions pass the exact Main/Specialist names; [] is an explicit zero-Skill
+  // whitelist. Undefined preserves defaults for injected/legacy callers.
   skillWhitelist?: string[]
   // App-owned Skill loading is a primary-session capability, not a backend-wide default. Absent
   // means disabled (for example Reviewer and restricted inference); `all` is an unrestricted
@@ -201,13 +212,7 @@ export type SessionSetup = {
 
 export type ProxyEnvironmentMode = 'inherit' | 'replace'
 
-// Already-resolved spawn inputs: env and args come from prepareModelConfig merged over the base
-// process env; configFiles are written by the runtime before this call.
-export type AgentProcessSpawner = (
-  command: string,
-  args: readonly string[],
-  options: SpawnOptionsWithoutStdio & { stdio: 'pipe' }
-) => ChildProcessWithoutNullStreams
+export type { AgentProcessSpawner } from '../node-process-host'
 
 export type AgentSpawnInput = {
   // Injected only for app-owned delegated launches, after framework-specific preparation.
@@ -239,8 +244,8 @@ export type CommandShellDialect = 'posix' | 'powershell'
 
 // One switchable agent backend. The ACP runtime stays generic and delegates only the framework-coupled
 // decisions to this interface. See docs/internal/pluggable-agent-framework-feasibility.md.
-export interface AgentFramework {
-  readonly id: AgentFrameworkId
+export interface AgentFramework<FrameworkId extends string = AgentFrameworkId> {
+  readonly id: FrameworkId
   readonly displayName: string
 
   // The shell grammar used for provider-native command tools. The permission Broker consumes this
@@ -312,7 +317,7 @@ export interface AgentFramework {
 
   // Chat endpoints this framework can drive. A provider is only selectable when it shares one:
   // Claude Code speaks Anthropic /v1/messages; opencode speaks both.
-  readonly supportedApiTypes: readonly ChatApiEndpoint[]
+  readonly supportedApiTypes: readonly ModelProtocol[]
 }
 
 // The resolved agent backend for one connect: which framework to drive plus its already-resolved spawn
@@ -338,6 +343,8 @@ export type ResolvedAgentBackend = {
   // Process-local snapshot of app-generated OpenCode config/plugin/instruction files. Delegated
   // Attempts materialize this admission's files rather than rereading mutable global config.
   opencodeConfigFiles?: readonly Readonly<AgentConfigFile>[]
+  // Probed from the executable for this generation, never persisted as session state.
+  opencodeMajorVersion?: 1 | 2
   proxyEnvironmentMode?: ProxyEnvironmentMode
   // Framework-native session options retained by the runtime and passed through buildSessionSetup.
   sessionOptions?: Record<string, unknown>
@@ -368,47 +375,48 @@ export type ResolvedAgentBackend = {
   contextUsageModel?: string
   authentication?: AgentAuthentication
   providerConfiguration?: AgentProviderConfiguration
-  // Authenticated loopback API exposed by the same OpenCode ACP process. The runtime snapshots
+  // Authenticated loopback API exposed by ACP (1.x) or its owned companion (2.x). The runtime snapshots
   // assistant messages around a prompt so it can aggregate every model step in that user turn.
   opencodeUsageApi?: {
     baseUrl: string
     authorization: string
+    version?: 2
   }
   // A bridged backend owns one reference to its local loopback bridge. Runtime teardown releases it;
   // reviewer sessions register their Codex prompt_cache_key here so routing never depends on content.
-  responsesBridgeLease?: {
+  responsesTransportLease?: {
     selectSkills: (
       text: string,
-      catalog: ResponsesBridgeSkillCandidate[],
+      catalog: ResponsesSkillCandidate[],
       signal?: AbortSignal,
       observeUsage?: (observation: SkillSelectorUsageObservation) => void
-    ) => Promise<ResponsesBridgeSkillInput[]>
+    ) => Promise<ResponsesSkillInput[]>
     registerReviewerSession: (promptCacheKey: string) => void
     unregisterReviewerSession: (promptCacheKey: string) => boolean
     registerToolLessSession?: (promptCacheKey: string) => void
     unregisterToolLessSession?: (promptCacheKey: string) => boolean
     registerHostMessageSession?: (
       promptCacheKey: string,
-      namespacedTools: ResponsesBridgeNamespacedTool[],
+      namespacedTools: ResponsesNamespacedTool[],
       options?: Readonly<{ failClosedUnknownKeys?: boolean }>
     ) => void
     unregisterHostMessageSession?: (promptCacheKey: string) => boolean
     registerMcpSession?: (
       promptCacheKey: string,
-      namespacedTools: ResponsesBridgeNamespacedTool[],
+      namespacedTools: ResponsesNamespacedTool[],
       namespaces?: readonly string[]
     ) => void
     unregisterMcpSession?: (promptCacheKey: string) => boolean
     // Updates the concrete effort on this runtime's own bridged provider/model. Keeping it on the
     // lease prevents an active-model value from leaking into bridges owned by retiring generations.
     setReasoningEffort?: (effort?: ModelReasoningEffort) => void
-    setModelTarget?: (target: ResponsesBridgeModelTarget) => void
+    setModelTarget?: (target: ResponsesModelTarget) => void
     release: () => Promise<void>
   }
   // API-key Claude generations keep their process environment stable by talking to an app-owned
   // loopback Anthropic bridge. The bridge owns endpoint/token/model routing in memory; live model
   // targets carry only an opaque id into this lease.
-  anthropicBridgeLease?: {
+  messagesBridgeLease?: {
     setTarget: (targetId: string) => boolean
     release: () => Promise<void>
   }
@@ -416,10 +424,10 @@ export type ResolvedAgentBackend = {
     setTarget: (targetId: string) => boolean
     selectSkills?: (
       text: string,
-      catalog: ResponsesBridgeSkillCandidate[],
+      catalog: ResponsesSkillCandidate[],
       signal?: AbortSignal,
       observeUsage?: (observation: SkillSelectorUsageObservation) => void
-    ) => Promise<ResponsesBridgeSkillInput[]>
+    ) => Promise<ResponsesSkillInput[]>
     release: () => Promise<void>
   }
 }

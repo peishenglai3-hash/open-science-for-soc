@@ -1,6 +1,5 @@
-import { app } from 'electron'
+import { app, shell } from 'electron'
 import { spawnSync } from 'node:child_process'
-import { join } from 'node:path'
 import type { RuntimeStartupOptions } from '../runtime-startup-options'
 import { autoUpdater, CancellationToken, AppImageUpdater, DebUpdater } from 'electron-updater'
 
@@ -12,6 +11,8 @@ import {
   UPDATE_INSTALLATION_REQUIRED,
   type UpdateApplyOptions,
   type UpdateDownloadOptions,
+  type UpdateInstaller,
+  type UpdateInstallerRevealResult,
   type UpdateStatus
 } from '../../shared/update'
 import { startDiagnosticOperation, type DiagnosticOperation } from '@aipoch/diagnostics/node'
@@ -27,11 +28,17 @@ import {
 import type { ApplicationEventMap } from '../application-events'
 import { broadcastToRenderers } from '../renderer-broadcast'
 import { markApplicationShutdownTrigger } from '../application-shutdown-trigger'
-import { englishNativeTranslator, type NativeTranslator } from '../locale/main-process-messages'
+import { type NativeTranslator } from '../locale/main-process-messages'
+import { prepareWindowsUpdateHandoff, type WindowsUpdateHandoff } from './windows-update-handoff'
 import {
-  startWindowsInstallProgress,
-  type WindowsInstallProgress
-} from './windows-install-progress'
+  confirmInstaller,
+  inspectConfirmedInstaller,
+  inspectInstallerFile,
+  installerMatchesStatus,
+  withoutMissingInstaller,
+  type ConfirmedInstaller,
+  type InspectInstallerFile
+} from './current-installer'
 
 type UpdateBroadcast = <Channel extends 'update:status' | 'update:progress'>(
   channel: Channel,
@@ -82,7 +89,7 @@ export type UpdateInstallationHooks = {
 }
 export type ElectronUpdaterDeps = UpdateInstallationHooks & {
   translate?: NativeTranslator
-  startInstallProgress?: () => Promise<WindowsInstallProgress>
+  prepareInstallHandoff?: () => Promise<WindowsUpdateHandoff>
   installationGuard?: (interactive: boolean, knownReadOnly?: boolean) => boolean
   updater?: MinimalAutoUpdater
   currentVersion?: string
@@ -109,6 +116,8 @@ export type ElectronUpdaterDeps = UpdateInstallationHooks & {
   // sysctl.proc_translated and selects the arm64 artifact, so we must match that to show the correct
   // pre-download size. When undefined, the strategy omits size rather than risking the wrong arch.
   isRosetta?: () => boolean | undefined
+  showItemInFolder?: (path: string) => void
+  inspectInstallerFile?: InspectInstallerFile
 }
 
 // Detects whether an x64 process is running under Rosetta 2 on Apple Silicon. Electron-updater's
@@ -155,7 +164,7 @@ const notesToString = (notes: unknown): string => {
 }
 
 // A file entry in electron-updater's UpdateInfo.files array.
-type UpdateFeedFile = { url?: string; size?: number }
+type UpdateFeedFile = { url?: string; size?: number; sha512?: string }
 
 // The file extension electron-updater downloads for each platform (the auto-update artifact, not the
 // CDN manifest's installer entry): ZIP on macOS, NSIS .exe on Windows. Linux package format is not available on this port, so omit its estimate.
@@ -256,8 +265,12 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
   private readonly installGate?: InstallGate
   private readonly releaseInstallHandoff: () => void
   private readonly markUpdateShutdown: () => () => void
-  private readonly startInstallProgress?: () => Promise<WindowsInstallProgress>
-  private installProgress?: WindowsInstallProgress
+  private readonly prepareInstallHandoff?: () => Promise<WindowsUpdateHandoff>
+  private updateHandoff?: WindowsUpdateHandoff
+  private readonly showItemInFolder: (path: string) => void
+  private readonly inspectInstallerFile: InspectInstallerFile
+  private confirmedInstaller?: ConfirmedInstaller
+  private installerInvalidated = false
 
   constructor(deps: ElectronUpdaterDeps = {}) {
     this.updater = deps.updater ?? (autoUpdater as unknown as MinimalAutoUpdater)
@@ -282,6 +295,8 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
     this.fetchImpl = deps.fetchImpl
     this.manifestUrl = deps.manifestUrl ?? APP.update.manifestUrl
     this.log = deps.log ?? NOOP_LOGGER
+    this.showItemInFolder = deps.showItemInFolder ?? ((path) => shell.showItemInFolder(path))
+    this.inspectInstallerFile = deps.inspectInstallerFile ?? inspectInstallerFile
     this.createCancellationToken = deps.createCancellationToken ?? (() => new CancellationToken())
     this.installationGuard = deps.installationGuard ?? createMacInstallationGuard()
     this.installationHooks = deps
@@ -289,25 +304,20 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
     this.releaseInstallHandoff = deps.releaseInstallHandoff ?? (() => undefined)
     this.markUpdateShutdown =
       deps.markUpdateShutdown ?? (() => markApplicationShutdownTrigger('update'))
-    this.startInstallProgress =
-      deps.startInstallProgress ??
+    this.prepareInstallHandoff =
+      deps.prepareInstallHandoff ??
       (this.platform === 'win32' && !deps.updater && app.isPackaged
         ? async () => {
             const installerPath = this.updater.installerPath
             if (!installerPath) throw new Error('Downloaded installer path is unavailable')
             const startupOptions = deps.getStartupOptions?.()
             if (!startupOptions) throw new Error('Update startup configuration is unavailable')
-            return startWindowsInstallProgress({
+            return prepareWindowsUpdateHandoff(app.getPath('appData'), {
               installerPath,
               applicationPath: process.execPath,
-              helperPath: join(process.resourcesPath, 'open-science-update-progress.exe'),
-              appData: app.getPath('appData'),
               profilePath: app.getPath('userData'),
               targetVersion: this.status.latest ?? '',
-              startupOptions,
-              logDirectory: app.getPath('logs'),
-              translate: deps.translate ?? englishNativeTranslator,
-              log: this.log
+              startupOptions
             })
           }
         : undefined)
@@ -328,10 +338,32 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
     this.updater.on('update-available', (info) => {
       const i = info as { version?: string; releaseNotes?: unknown; files?: UpdateFeedFile[] }
       const readyStatus = this.readyCheckStatus
+      const artifactChanged =
+        readyStatus &&
+        readyStatus.latest === i.version &&
+        readyStatus.artifactSha512 &&
+        i.files?.some((file) => file.sha512) &&
+        !i.files.some((file) => file.sha512 === readyStatus.artifactSha512)
       if (
         readyStatus &&
         this.status === readyStatus &&
-        (!i.version || !isNewer(i.version, readyStatus.latest ?? this.currentVersion))
+        artifactChanged &&
+        readyStatus.recovery &&
+        withoutMissingInstaller(readyStatus).state !== 'available'
+      ) {
+        this.confirmedInstaller = undefined
+        this.installerInvalidated = true
+        this.setStatus(withoutMissingInstaller(readyStatus, true))
+        // Continue protecting this recovery snapshot if the provider emits another event or rejects
+        // after announcing the changed artifact. Only the existing recovery flow may release it.
+        this.readyCheckStatus = this.status
+        return
+      }
+      if (
+        readyStatus &&
+        this.status === readyStatus &&
+        (!i.version || !isNewer(i.version, readyStatus.latest ?? this.currentVersion)) &&
+        !artifactChanged
       ) {
         return
       }
@@ -396,19 +428,35 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
       )
         return
       const downloaded = info as
-        { downloadedFile?: string; files?: Array<{ url?: string; sha512?: string }> } | undefined
+        | {
+            version?: string
+            downloadedFile?: string
+            files?: Array<{ url?: string; sha512?: string }>
+          }
+        | undefined
+      // A late SDK event from a superseded release cannot confirm the current artifact.
+      if (downloaded?.version && this.status.latest && downloaded.version !== this.status.latest)
+        return
       const extension = downloaded?.downloadedFile?.split('.').pop()?.toLowerCase()
       const candidates =
         downloaded?.files?.filter((file) =>
           file.url?.split('?')[0].toLowerCase().endsWith(`.${extension}`)
         ) ?? []
-      this.setStatus({
+      const readyStatus: UpdateStatus = {
         ...this.status,
         state: 'ready',
         progress: 100,
         artifactSha512: candidates.length === 1 ? candidates[0].sha512 : undefined,
         localPath: (info as { downloadedFile?: string } | undefined)?.downloadedFile
-      })
+      }
+      delete readyStatus.installerMissing
+      this.installerInvalidated = false
+      this.confirmedInstaller = confirmInstaller(
+        readyStatus,
+        this.platform,
+        this.inspectInstallerFile
+      )
+      this.setStatus(readyStatus)
     })
     this.updater.on('error', (err) => {
       if (this.applying && !this.installerStarted) return
@@ -450,13 +498,13 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
   }
 
   private releaseAbortedInstallHandoff(): void {
-    const progress = this.installProgress
-    this.installProgress = undefined
+    const progress = this.updateHandoff
+    this.updateHandoff = undefined
     this.updater.openScienceUpdateOperation = undefined
     try {
       progress?.cancel()
     } catch (error) {
-      this.log.warn('update progress cancellation failed', error)
+      this.log.warn('update handoff cancellation failed', error)
     }
     try {
       this.releaseInstallHandoff()
@@ -479,6 +527,10 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
       current: this.currentVersion,
       applyKind: 'restart'
     }
+    if (this.installerInvalidated && this.status.state === 'ready' && !this.status.localPath)
+      this.status = withoutMissingInstaller(this.status)
+    if (this.confirmedInstaller && !installerMatchesStatus(this.confirmedInstaller, this.status))
+      this.confirmedInstaller = undefined
     this.broadcast('update:status', this.status)
   }
 
@@ -491,6 +543,51 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
 
   getStatus(): UpdateStatus {
     return this.status
+  }
+
+  private async inspectCurrentInstaller(): ReturnType<typeof inspectConfirmedInstaller> {
+    const artifact = this.confirmedInstaller
+    const result = await inspectConfirmedInstaller(
+      artifact,
+      this.inspectInstallerFile,
+      (value) => this.confirmedInstaller === value && installerMatchesStatus(value, this.status)
+    )
+    if (result.kind === 'missing' && this.confirmedInstaller === artifact) {
+      this.confirmedInstaller = undefined
+      this.installerInvalidated = true
+      this.setStatus(
+        withoutMissingInstaller(
+          this.status,
+          this.applying || this.installerStarted || Boolean(this.recoveryAction)
+        )
+      )
+    }
+    return result
+  }
+
+  async getInstaller(): Promise<UpdateInstaller | null> {
+    const result = await this.inspectCurrentInstaller()
+    return result.kind === 'ready' &&
+      this.confirmedInstaller === result.artifact &&
+      installerMatchesStatus(result.artifact, this.status)
+      ? result.installer
+      : null
+  }
+
+  async revealInstaller(): Promise<UpdateInstallerRevealResult> {
+    const result = await this.inspectCurrentInstaller()
+    if (result.kind !== 'ready') return result.kind
+    if (
+      this.confirmedInstaller !== result.artifact ||
+      !installerMatchesStatus(result.artifact, this.status)
+    )
+      return 'unavailable'
+    try {
+      this.showItemInFolder(result.path)
+      return 'revealed'
+    } catch {
+      return 'unavailable'
+    }
   }
 
   // Fetch the CDN manifest and, when it matches the offered update and actually carries notes,
@@ -539,7 +636,7 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
           await this.updater.checkForUpdates()
         } catch (error) {
           providerFailure = error
-          if (!readyStatus || this.status !== readyStatus) {
+          if (!this.readyCheckStatus || this.status !== this.readyCheckStatus) {
             this.setStatus({
               state: 'error',
               error: error instanceof Error ? error.message : 'Update check failed'
@@ -626,6 +723,18 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
         }
         // A cancel() during the drain means never start this download.
         if (token.cancelled) return
+        if (this.installerInvalidated) {
+          // The SDK's same-process cache shortcut checks existence only. Discard its invalidated
+          // receipt through its own cleanup before another transfer may emit a completed artifact.
+          this.transferToken = undefined
+          operation.phase('reset-invalidated-cache')
+          const helper = Reflect.get(this.updater, 'downloadedUpdateHelper') as
+            { clear?: () => Promise<void> } | undefined
+          if (typeof helper?.clear !== 'function')
+            throw new Error('The installer is missing or has changed. Download the update again.')
+          await helper.clear()
+          if (token.cancelled) return
+        }
         operation.phase('transfer')
         this.transferToken = token
         await this.updater.downloadUpdate(token)
@@ -761,7 +870,8 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
     // then claim the update synchronously so repeat clicks or concurrent renderers cannot start a
     // second teardown/install. The broadcast also gives the renderer immediate feedback during the
     // shutdown gate, which can take up to 15 seconds on Windows.
-    if (this.status.state !== 'ready' || this.applying) return this.status
+    if (this.status.state !== 'ready' || this.applying || this.installerInvalidated)
+      return this.status
     if (this.blockForInstallation(options.relaunch !== false)) return this.status
     this.applying = true
     this.installerStarted = false
@@ -795,11 +905,13 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
     }
     if (!this.applying) return this.status
 
-    // Prepare presentation before stopping the backend. A missing helper must leave the current
-    // application usable, without attempting credential bootstrap while Chromium owns its files.
-    if (options.relaunch !== false && this.startInstallProgress) {
+    if (this.stopInvalidatedInstall()) return this.status
+
+    // Persist the next profile before stopping the backend. A failed write must leave the current
+    // application usable; NSIS alone owns the subsequent installation UI.
+    if (options.relaunch !== false && this.prepareInstallHandoff) {
       try {
-        this.installProgress = await this.startInstallProgress()
+        this.updateHandoff = await this.prepareInstallHandoff()
         if (!this.applying) {
           this.releaseAbortedInstallHandoff()
           return this.status
@@ -811,7 +923,7 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
           ...this.status,
           state: 'error',
           reason: 'install-failed',
-          error: error instanceof Error ? error.message : 'Could not start update progress.'
+          error: error instanceof Error ? error.message : 'Could not prepare update handoff.'
         })
         operation.fail(error, { result: 'error' })
         return this.status
@@ -858,7 +970,7 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
         operation.cancel({ reason: 'apply-interrupted' })
         return this.status
       }
-      if (!readiness.completed || !readiness.reaped) {
+      if ((!readiness.completed || !readiness.reaped) && !readiness.runtimeStopped) {
         this.releaseAbortedInstallHandoff()
         this.log.error('update install gate refused: backend teardown degraded', readiness)
         this.applying = false
@@ -895,6 +1007,8 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
       this.log.info('update install gate cleared; proceeding to quitAndInstall')
     }
 
+    if (this.stopInvalidatedInstall()) return this.status
+
     try {
       await this.installationHooks.beforeInstallHandoff?.(this.status)
     } catch (error) {
@@ -904,15 +1018,17 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
       return this.status
     }
     if (!this.applying) return this.status
+    if (this.stopInvalidatedInstall()) return this.status
     operation.phase('install')
     const rollbackTrigger = this.markUpdateShutdown()
     this.pendingInstallRollback = rollbackTrigger
     this.installerStarted = true
     try {
+      // A supervised installer can exit the application before this hook returns.
+      this.updateHandoff?.handoff()
       const executed = await this.installationHooks.executeInstall?.(this.status, options)
       if (!this.installationHooks.executeInstall || executed === 'legacy') {
-        this.installProgress?.handoff()
-        this.updater.openScienceUpdateOperation = this.installProgress?.operationId
+        this.updater.openScienceUpdateOperation = this.updateHandoff?.operationId
         this.updater.quitAndInstall(
           this.platform !== 'win32' || options.relaunch === false,
           options.relaunch ?? true
@@ -935,5 +1051,13 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
     }
     operation.complete({ result: 'handoff-requested' })
     return this.status
+  }
+
+  private stopInvalidatedInstall(): boolean {
+    if (!this.installerInvalidated) return false
+    this.releaseAbortedInstallHandoff()
+    this.applying = false
+    this.setStatus(withoutMissingInstaller({ ...this.status, state: 'ready' }))
+    return true
   }
 }

@@ -12,6 +12,7 @@ const {
   nativeOwnedFigureBottomLabels,
   nativeOwnedRasterTitleRows,
   nativeOwnedFigureTopLabel,
+  nativeOwnedRasterPaletteTitle,
   nativeOwnedPairedFacePanelKeys
 } = await import(
   pathToFileURL(resolve('resources/literature-pdf-native-owned-figure-labels.mjs')).href
@@ -129,6 +130,208 @@ const completeRasterTitleRows = (): ReturnType<typeof JSON.parse> => {
     }
   }
 }
+
+const completeRasterPaletteTitle = (): ReturnType<typeof JSON.parse> => {
+  const width = 500,
+    height = 400,
+    operators = { fnArray: [] as number[], argsArray: [] as ReturnType<typeof JSON.parse>[] },
+    graphicsBounds: ReturnType<typeof JSON.parse>[] = [],
+    items: ReturnType<typeof JSON.parse>[] = [],
+    tokens: ReturnType<typeof JSON.parse>[] = [],
+    glyphs = new Map(),
+    skippedSpaceGlyphs: ReturnType<typeof JSON.parse>[] = []
+  const add = (op: number, args: ReturnType<typeof JSON.parse>): number => {
+    operators.fnArray.push(op)
+    operators.argsArray.push(args)
+    return operators.fnArray.length - 1
+  }
+  const viewport = {
+    width,
+    height,
+    scale: 1,
+    rotation: 0,
+    transform: [1, 0, 0, -1, 0, height],
+    convertToViewportPoint: (x: number, y: number): number[] => [x, height - y]
+  }
+  const text = (str: string, x: number, baseline: number, size: number): void => {
+    add(OPS.beginText, null)
+    add(OPS.setFont, ['F', size])
+    add(OPS.setTextMatrix, [[1, 0, 0, 1, x, height - baseline]])
+    const chars = [...str].map((c) => {
+      glyphs.set(c, { fontChar: c, bounds: [0, -0.1, 0.5, 0.7] })
+      return { unicode: c, fontChar: c, width: 500, isSpace: c === ' ', isInFont: c !== ' ' }
+    })
+    const i = add(OPS.showText, [chars])
+    chars.forEach((g, n) => {
+      if (g.isSpace)
+        skippedSpaceGlyphs.push({
+          operationIndex: i,
+          glyphIndex: n,
+          fontName: 'F',
+          fontChar: ' ',
+          width: 500
+        })
+    })
+    add(OPS.endText, null)
+    const sourceItem = { pageNumber: 1, index: items.length, text: str },
+      rect = [x, baseline - size, x + str.length * size * 0.5, baseline]
+    items.push({
+      str,
+      width: rect[2] - rect[0],
+      height: size,
+      transform: [size, 0, 0, size, x, height - baseline],
+      fontName: 'F',
+      sourceItem
+    })
+    tokens.push({
+      text: str,
+      rect,
+      height: size,
+      baseline,
+      horizontal: true,
+      fontAscent: 0.8,
+      fontDescent: -0.2,
+      sourceItem
+    })
+  }
+  add(OPS.paintFormXObjectBegin, [null, [60, 130, 300, 330]])
+  text('Measured regions', 150, 86, 8)
+  for (const r of [
+    [80, 100, 240, 260],
+    [260, 100, 268, 260]
+  ]) {
+    add(OPS.save, null)
+    add(OPS.transform, [r[2] - r[0], 0, 0, r[3] - r[1], r[0], height - r[3]])
+    const i = add(OPS.paintImageXObject, ['image', 160, 160])
+    add(OPS.restore, null)
+    graphicsBounds.push({
+      kind: 'image',
+      operationIndex: i,
+      normalizedRect: r.map((v, n) => v / (n % 2 ? height : width))
+    })
+    const p = [
+      0,
+      r[0],
+      height - r[1],
+      1,
+      r[2],
+      height - r[1],
+      1,
+      r[2],
+      height - r[3],
+      1,
+      r[0],
+      height - r[3],
+      4
+    ]
+    const k = add(OPS.constructPath, [OPS.stroke, [p], [r[0], height - r[3], r[2], height - r[1]]])
+    graphicsBounds.push({
+      kind: 'path',
+      operationIndex: k,
+      normalizedRect: r.map((v, n) => v / (n % 2 ? height : width))
+    })
+  }
+  for (let n = 0; n < 4; n++) text(String(n), 275, 255 - n * 40, 6)
+  add(OPS.paintFormXObjectEnd, [])
+  text('Figure 1: Measured regions and a legend.', 80, 290, 10)
+  const caption = { page: 1, rect: tokens.at(-1).rect, lines: [tokens.at(-1).text] }
+  return {
+    page: {
+      pageNumber: 1,
+      width,
+      height,
+      rotation: 0,
+      invalidGraphicsBounds: 0,
+      graphicsBounds,
+      lines: tokens.map((t) => ({
+        text: t.text,
+        x: t.rect[0],
+        y: t.rect[1],
+        width: t.rect[2] - t.rect[0],
+        height: t.height,
+        fontSize: t.height
+      }))
+    },
+    figure: { reason: 'native-raster-vector-strip', rect: [78, 90, 450, 263], caption },
+    captions: [caption],
+    tokens,
+    context: {
+      operators,
+      viewport,
+      graphicsBounds,
+      glyphBounds: [{ fontName: 'F', glyphs: [...glyphs.values()] }],
+      skippedSpaceGlyphs,
+      content: { items, styles: { F: { ascent: 0.8, descent: -0.2, vertical: false } } }
+    }
+  }
+}
+
+it('completes a whole native title above its independently closed raster and numeric palette', () => {
+  const f = completeRasterPaletteTitle(),
+    before = JSON.stringify(f)
+  expect(
+    nativeOwnedRasterPaletteTitle(
+      f.page,
+      f.figure,
+      f.captions,
+      [],
+      f.tokens,
+      () => false,
+      f.context
+    )
+  ).toEqual([78, 78, 450, 263])
+  expect(JSON.stringify(f)).toBe(before)
+})
+it.each([
+  'missing-space-proof',
+  'transparent-title',
+  'foreign-text',
+  'foreign-table',
+  'foreign-owner',
+  'not-palette',
+  'missing-palette-frame',
+  'clipped-title',
+  'missing-digit',
+  'different-form',
+  'missing-font'
+])('preserves the old crop for an unproved raster title: %s', (mode) => {
+  const f = completeRasterPaletteTitle()
+  if (mode === 'missing-space-proof') delete f.context.skippedSpaceGlyphs
+  if (mode === 'missing-font') f.context.glyphBounds = []
+  if (mode === 'transparent-title') {
+    const i = f.context.operators.fnArray.indexOf(OPS.beginText)
+    f.context.operators.fnArray.splice(i, 0, OPS.setGState)
+    f.context.operators.argsArray.splice(i, 0, [[['ca', 0]]])
+    for (const g of f.context.skippedSpaceGlyphs) if (g.operationIndex >= i) g.operationIndex++
+    for (const g of f.page.graphicsBounds) if (g.operationIndex >= i) g.operationIndex++
+  }
+  if (mode === 'foreign-text')
+    f.tokens.push({ ...f.tokens[0], sourceItem: { ...f.tokens[0].sourceItem, index: 99 } })
+  if (mode === 'not-palette') {
+    const indexes = f.context.operators.fnArray.flatMap((op: number, i: number) =>
+      op === OPS.paintImageXObject ? [i] : []
+    )
+    f.context.operators.argsArray[indexes[1] - 1][0] = 80
+  }
+  if (mode === 'missing-palette-frame') {
+    const index = f.context.operators.fnArray.lastIndexOf(OPS.constructPath)
+    f.context.operators.argsArray[index][0] = OPS.fill
+  }
+  if (mode === 'clipped-title') f.context.operators.argsArray[0][1][3] = 315
+  if (mode === 'missing-digit') f.tokens[2].text = '?'
+  if (mode === 'different-form') f.context.operators.fnArray[0] = OPS.save
+  expect(
+    nativeOwnedRasterPaletteTitle(
+      f.page,
+      f.figure,
+      f.captions,
+      mode === 'foreign-table' ? [[100, 75, 200, 90]] : [],
+      f.tokens,
+      () => mode === 'foreign-owner',
+      f.context
+    )
+  ).toBeUndefined()
+})
 
 it('completes full ordinary title packets below four already owned rasters', () => {
   const f = completeRasterTitleRows()
@@ -996,6 +1199,175 @@ it('fails closed on an empty legacy line without complete native font metrics', 
   const before = structuredClone(f)
   expect(
     nativeCaptionedAlignedRasterPair(f.page, f.captions[0], f.captions, f.tables)
+  ).toBeUndefined()
+  expect(f).toEqual(before)
+})
+
+const nativeImagePlate = (columns: number): ReturnType<typeof JSON.parse> => {
+  const f = completePaintedRasterRows()
+  const rectangles =
+    columns === 1
+      ? [
+          [60, 80, 540, 180],
+          [60, 200, 540, 300]
+        ]
+      : [
+          [60, 80, 280, 180],
+          [320, 80, 540, 180],
+          [190, 200, 410, 300]
+        ]
+  const fnArray: number[] = [],
+    argsArray: unknown[] = []
+  const add = (op: number, args: unknown): void => {
+    fnArray.push(op)
+    argsArray.push(args)
+  }
+  add(OPS.save, null)
+  add(OPS.transform, [1, 0, 0, 1, 30, 760])
+  add(OPS.setDash, [[], 0])
+  add(OPS.setLineCap, [0])
+  add(OPS.setLineWidth, [0.5])
+  add(OPS.constructPath, [
+    OPS.stroke,
+    [new Float32Array([0, 0, 0, 1, 540, 0])],
+    new Float32Array([0, 0, 540, 0])
+  ])
+  add(OPS.restore, null)
+  f.page.graphicsBounds = rectangles.map((r, i) => {
+    add(OPS.save, null)
+    add(OPS.transform, [r[2] - r[0], 0, 0, r[3] - r[1], r[0], 800 - r[3]])
+    const operationIndex = fnArray.length
+    add(OPS.paintImageXObject, ['raster-' + i, 1000, 500])
+    add(OPS.restore, null)
+    return {
+      kind: 'image',
+      operationIndex,
+      normalizedRect: r.map((v, n) => v / (n % 2 ? 800 : 600)),
+      paintedNormalizedRect: r.map((v, n) => v / (n % 2 ? 800 : 600))
+    }
+  })
+  const text = f.captions[0].lines[0]
+  add(OPS.beginText, null)
+  add(OPS.setFont, ['f', 10])
+  add(OPS.moveText, [40, 470])
+  add(OPS.showText, [
+    [...text].map((c) => ({
+      unicode: c,
+      fontChar: c,
+      width: 500,
+      originalCharCode: c.codePointAt(0),
+      isInFont: true,
+      accent: null
+    }))
+  ])
+  add(OPS.endText, null)
+  f.context = {
+    operators: { fnArray, argsArray },
+    viewport: { width: 600, height: 800, scale: 1, rotation: 0, transform: [1, 0, 0, -1, 0, 800] },
+    content: {
+      items: [
+        {
+          str: text,
+          dir: 'ltr',
+          width: 520,
+          height: 10,
+          transform: [10, 0, 0, 10, 40, 470],
+          fontName: 'f'
+        }
+      ],
+      styles: { f: { ascent: 1, descent: 0 } }
+    }
+  }
+  return f
+}
+
+it.each([1, 2])(
+  'owns an entire native raster plate with %s upper columns and an independent margin rule',
+  (columns) => {
+    const f = nativeImagePlate(columns),
+      before = structuredClone(f)
+    const result = associateFigures(f.page, f.captions, f.tables, [], [], [], f.context)
+    expect(result).toHaveLength(1)
+    expect(result[0].rect).toEqual([60, 80, 540, 300])
+    expect(result[0].graphicsCount).toBe(columns + 1)
+    expect(result[0].sourceItems).toBeUndefined()
+    expect(f).toEqual(before)
+  }
+)
+
+it.each([
+  'rule-in-plate',
+  'curved-rule',
+  'dashed-rule',
+  'alpha',
+  'clip',
+  'duplicate-operation',
+  'duplicate-image',
+  'invalid-image-size',
+  'paint-outside-native-image',
+  'native-prose',
+  'unobserved-native-text',
+  'competing-caption',
+  'caption-extra-row',
+  'foreign-table'
+])('refuses incomplete native raster plate proof: %s', (missing) => {
+  const f = nativeImagePlate(2),
+    ops = f.context.operators
+  if (missing === 'rule-in-plate') ops.argsArray[1][5] = 650
+  if (missing === 'curved-rule') ops.argsArray[5][1][0][3] = 2
+  if (missing === 'dashed-rule') ops.argsArray[2][0] = [3, 2]
+  if (missing === 'alpha') {
+    ops.fnArray.unshift(OPS.setGState)
+    ops.argsArray.unshift([[['ca', 0.5]]])
+    f.page.graphicsBounds.forEach((g: { operationIndex: number }) => g.operationIndex++)
+  }
+  if (missing === 'clip') {
+    ops.fnArray.push(OPS.clip)
+    ops.argsArray.push(null)
+  }
+  if (missing === 'duplicate-operation')
+    f.page.graphicsBounds[1].operationIndex = f.page.graphicsBounds[0].operationIndex
+  if (missing === 'duplicate-image')
+    ops.argsArray[f.page.graphicsBounds[1].operationIndex][0] =
+      ops.argsArray[f.page.graphicsBounds[0].operationIndex][0]
+  if (missing === 'invalid-image-size')
+    ops.argsArray[f.page.graphicsBounds[0].operationIndex][1] = 0
+  if (missing === 'paint-outside-native-image') {
+    f.page.graphicsBounds[0].normalizedRect[0] = 0
+    f.page.graphicsBounds[0].paintedNormalizedRect[0] = 0
+  }
+  if (missing === 'native-prose')
+    f.page.lines.push({
+      text: 'Independent note.',
+      x: 60,
+      y: 185,
+      width: 180,
+      height: 10,
+      fontSize: 10
+    })
+  if (missing === 'unobserved-native-text')
+    f.context.content.items.push({
+      ...f.context.content.items[0],
+      str: 'Independent note.',
+      transform: [10, 0, 0, 10, 60, 610]
+    })
+  if (missing === 'competing-caption')
+    f.captions.push({ page: 1, lines: ['Figure 4. Other source.'], rect: [40, 185, 560, 195] })
+  if (missing === 'caption-extra-row')
+    f.page.lines.push({ text: 'foreign', x: 100, y: 324, width: 30, height: 4, fontSize: 4 })
+  if (missing === 'foreign-table') f.tables.push([60, 80, 280, 180])
+  const before = structuredClone(f)
+  expect(
+    nativeCaptionedAlignedRasterPair(
+      f.page,
+      f.captions[0],
+      f.captions,
+      f.tables,
+      [],
+      [],
+      [],
+      f.context
+    )
   ).toBeUndefined()
   expect(f).toEqual(before)
 })
@@ -3431,4 +3803,147 @@ it.each([
     })
   if (reason === 'no-panel-keys') f.nativeTokens = f.nativeTokens.slice(0, 2)
   expect(nativeFigureRunningHead(f.page, f.captions, f.nativeTokens, f.rules)).toBeUndefined()
+})
+const nativePriorInlineScript = (): ReturnType<typeof JSON.parse> => {
+  const caption = {
+    page: 1,
+    lines: ['Figure 2. A complete anonymous diagram.'],
+    rect: [60, 490, 540, 500]
+  }
+  const specs: [string, number, number, number, number, string][] = [
+    ['where the span', 70, 225, 50, 10, 'body'],
+    ['B', 120, 230, 7, 7, 'math'],
+    ['2', 127, 230, 4, 5, 'math'],
+    ['(I)', 131, 230, 10, 7, 'math'],
+    [
+      'is the independently defined space used in the complete preceding sentence.',
+      145,
+      225,
+      200,
+      10,
+      'body'
+    ],
+    ['Native diagram label', 300, 265, 80, 8, 'diagram'],
+    [caption.lines[0], 60, 490, 480, 10, 'body']
+  ]
+  const tokens = specs.map(([text, x, y, width, height], index) => ({
+    text,
+    sourceItem: { pageNumber: 1, index, text },
+    horizontal: true,
+    inlineSymbol: false,
+    rect: [x, y, x + width, y + height],
+    baseline: y + height,
+    height,
+    fontAscent: 0.7,
+    fontDescent: -0.2,
+    nativeLabelRect: [x, y + height * 0.3, x + width, y + height * 1.3]
+  }))
+  const context = {
+    viewport: { width: 600, height: 800, scale: 1, rotation: 0, transform: [1, 0, 0, -1, 0, 800] },
+    content: {
+      items: specs.map(([str, x, y, width, height, fontName]) => ({
+        str,
+        width,
+        height,
+        fontName,
+        dir: 'ltr',
+        transform: [height, 0, 0, height, x, 800 - y - height]
+      })),
+      styles: Object.fromEntries(
+        ['body', 'math', 'diagram'].map((f) => [f, { ascent: 0.7, descent: -0.2, vertical: false }])
+      )
+    }
+  }
+  return {
+    page: {
+      pageNumber: 1,
+      width: 600,
+      height: 800,
+      invalidGraphicsBounds: 0,
+      graphicsBounds: [
+        { kind: 'path', normalizedRect: [150 / 600, 250 / 800, 450 / 600, 450 / 800] },
+        { kind: 'image', normalizedRect: [200 / 600, 300 / 800, 400 / 600, 430 / 800] }
+      ],
+      lines: [
+        { text: specs[0][0], x: 70, y: 225, width: 50, height: 10, fontSize: 10 },
+        { text: 'B2(I)', x: 120, y: 230, width: 21, height: 7, fontSize: 7 },
+        { text: specs[4][0], x: 145, y: 225, width: 200, height: 10, fontSize: 10 },
+        { text: specs[5][0], x: 300, y: 265, width: 80, height: 8, fontSize: 8 },
+        { text: caption.lines[0], x: 60, y: 490, width: 480, height: 10, fontSize: 10 }
+      ]
+    },
+    figure: { caption, rect: [120, 230, 450, 450] },
+    tokens,
+    context
+  }
+}
+it('excludes only a complete preceding native sentence with an inline subscript entering the crop', () => {
+  const f = nativePriorInlineScript(),
+    before = structuredClone(f)
+  const actual = excludeOwnedFigurePriorProse(
+    f.page,
+    f.figure,
+    [f.figure.caption],
+    [],
+    f.tokens,
+    f.context
+  )
+  expect(actual.rect).toEqual([120, 250, 450, 450])
+  expect(actual.caption).toBe(f.figure.caption)
+  expect(actual.excludedProseLines).toEqual(f.page.lines.slice(0, 3))
+  expect(f).toEqual(before)
+})
+it.each([
+  'source-literal',
+  'duplicate-source',
+  'missing-font',
+  'different-body-font',
+  'incomplete-sentence',
+  'foreign-table',
+  'native-label-in-gap',
+  'paint-in-gap',
+  'source-order',
+  'partial-source',
+  'missing-native-label',
+  'missing-native-height',
+  'forged-native-height',
+  'forged-token-baseline',
+  'reversed-token-rectangle'
+])('keeps a prior inline script without complete native sentence proof: %s', (reason) => {
+  const f = nativePriorInlineScript()
+  if (reason === 'source-literal') f.context.content.items[1].str = 'other'
+  if (reason === 'duplicate-source') f.tokens.push(structuredClone(f.tokens[1]))
+  if (reason === 'missing-font') delete f.context.content.styles.math.ascent
+  if (reason === 'missing-native-label') delete f.tokens[1].nativeLabelRect
+  if (reason === 'missing-native-height') delete f.context.content.items[1].height
+  if (reason === 'forged-native-height') f.context.content.items[1].height = 12
+  if (reason === 'forged-token-baseline') f.tokens[1].baseline += 0.1
+  if (reason === 'reversed-token-rectangle') f.tokens[1].rect = [127, 230, 120, 237]
+  if (reason === 'different-body-font') f.context.content.items[4].fontName = 'diagram'
+  if (reason === 'incomplete-sentence') {
+    f.tokens[4].text = f.tokens[4].text.slice(0, -1)
+    f.tokens[4].sourceItem.text = f.tokens[4].text
+    f.context.content.items[4].str = f.tokens[4].text
+    f.page.lines[2].text = f.tokens[4].text
+  }
+  if (reason === 'native-label-in-gap') {
+    f.tokens[5].rect = [150, 240, 230, 248]
+    f.tokens[5].baseline = 248
+    f.page.lines[3].y = 240
+  }
+  if (reason === 'paint-in-gap') f.page.graphicsBounds[1].normalizedRect[1] = 238 / 800
+  if (reason === 'source-order')
+    [f.tokens[0].sourceItem.index, f.tokens[4].sourceItem.index] = [4, 0]
+  if (reason === 'partial-source')
+    f.tokens[1].sourceSegment = { pageNumber: 1, index: 1, text: 'B' }
+  expect(
+    excludeOwnedFigurePriorProse(
+      f.page,
+      f.figure,
+      [f.figure.caption],
+      reason === 'foreign-table' ? [[100, 224, 150, 241]] : [],
+      f.tokens,
+      f.context
+    ).rect
+  ).toEqual(f.figure.rect)
 })

@@ -28,6 +28,8 @@ import { SessionProjectionAfterCommitError } from '../session-persistence/save-s
 import { NotebookRuntimeService } from '../notebook/runtime-service'
 import {
   startWorkingFileObservation,
+  completeWorkingFileEvidence,
+  maintainWorkingFileEvidence,
   deleteWorkingFileEvidenceProject
 } from '../notebook/working-file-observer'
 import { ManagedFileVersionService } from '../managed-file-versions/service'
@@ -39,7 +41,7 @@ import {
   resolveActiveConversationMessages,
   projectConversationMessage
 } from '../../shared/conversation-graph'
-import { SessionPackageService } from './service'
+import { PackageImportRecoveryRequiredError, SessionPackageService } from './service'
 import * as selection from './selection'
 import * as fsPromises from 'node:fs/promises'
 import * as storageUsage from '../storage/usage'
@@ -58,6 +60,188 @@ vi.mock('electron', () => ({
 }))
 
 const fixtures: Awaited<ReturnType<typeof createProvenanceTestFixture>>[] = []
+
+it('round-trips a compaction activity and its conversation through a science package', async () => {
+  const source = await createProvenanceTestFixture()
+  const target = await createProvenanceTestFixture()
+  fixtures.push(source, target)
+  initDataRoot(source.storageRoot)
+  await source.client.project.create({ data: { id: 'project-1', name: 'Research' } })
+  await new SessionRepository(source.storageRoot).saveSession({
+    id: 'session-1',
+    projectId: 'project-1',
+    title: 'Compacted conversation',
+    cwd: '',
+    status: 'idle',
+    createdAt: 1,
+    updatedAt: 3,
+    messages: [
+      {
+        id: 'prompt',
+        role: 'user',
+        content: 'Continue the analysis',
+        status: 'complete',
+        eventIds: [],
+        createdAt: 1,
+        updatedAt: 1
+      },
+      {
+        id: 'answer',
+        role: 'agent',
+        content: 'The analysis is complete.',
+        status: 'complete',
+        eventIds: [],
+        createdAt: 3,
+        updatedAt: 3
+      }
+    ],
+    activities: [
+      {
+        id: 'context-compaction:compact-1',
+        kind: 'tool',
+        providerToolName: 'ContextCompaction',
+        title: 'Context compacted',
+        status: 'completed',
+        promptMessageId: 'prompt',
+        sortIndex: 2,
+        eventIds: ['compact-event'],
+        createdAt: 2,
+        updatedAt: 2
+      }
+    ]
+  })
+  const exporter = new SessionPackageService({
+    storageRoot: source.storageRoot,
+    getClient: async () => source.client
+  })
+  const importer = new SessionPackageService({
+    storageRoot: target.storageRoot,
+    getClient: async () => target.client
+  })
+  try {
+    const archive = join(source.storageRoot, 'compacted.science')
+    await exporter.exportTo({ projectId: 'project-1', sessionId: 'session-1' }, archive)
+    initDataRoot(target.storageRoot)
+    const imported = await importer.importFrom(archive)
+    const session = await new SessionRepository(target.storageRoot).loadSession(
+      imported.projectId,
+      imported.sessionId
+    )
+    expect(session?.messages.map(({ content }) => content)).toEqual([
+      'Continue the analysis',
+      'The analysis is complete.'
+    ])
+    expect(session?.activities).toMatchObject([
+      {
+        providerToolName: 'ContextCompaction',
+        title: 'Context compacted',
+        status: 'completed',
+        promptMessageId: session?.messages[0].id
+      }
+    ])
+    expect(session?.conversationGraph?.activities).toHaveLength(1)
+  } finally {
+    await Promise.all([exporter.close(), importer.close()])
+  }
+})
+
+it('defers native evidence cleanup while an import publishes its marked directories', async () => {
+  const source = await createProvenanceTestFixture()
+  const target = await createProvenanceTestFixture()
+  fixtures.push(source, target)
+  initDataRoot(target.storageRoot)
+  await source.client.project.create({ data: { id: 'source', name: 'Source' } })
+  await target.client.project.create({ data: { id: 'target', name: 'Target' } })
+  await new SessionRepository(source.storageRoot).saveSession({
+    id: 'original',
+    projectId: 'source',
+    title: 'Research',
+    cwd: '',
+    status: 'idle',
+    messages: [],
+    createdAt: 1,
+    updatedAt: 1
+  })
+  const sourceData = join(source.storageRoot, 'notebooks/source/original/data')
+  await mkdir(sourceData, { recursive: true })
+  await writeFile(join(sourceData, 'result.txt'), 'imported result')
+  const archive = join(source.storageRoot, 'history.science')
+  const exporter = new SessionPackageService({
+    storageRoot: source.storageRoot,
+    getClient: async () => source.client
+  })
+  const importer = new SessionPackageService({
+    storageRoot: target.storageRoot,
+    getClient: async () => target.client
+  })
+  const sessionRoot = join(target.storageRoot, 'notebooks/target/native')
+  const dataRoot = join(sessionRoot, 'data')
+  await mkdir(dataRoot, { recursive: true })
+  const location = {
+    storageRoot: target.storageRoot,
+    root: join(target.storageRoot, 'execution-file-evidence/target/native'),
+    storageKeyPrefix: 'execution-file-evidence/target/native'
+  }
+  const observation = await startWorkingFileObservation(
+    {
+      dataRoot,
+      notebookSessionRoot: sessionRoot,
+      runId: 'native-run',
+      fileEvidenceStorageRoot: target.storageRoot,
+      fileEvidenceRoot: location.root,
+      fileEvidenceStoragePrefix: location.storageKeyPrefix
+    },
+    {
+      watchDirectory: () => {
+        throw new Error('No watcher in fixture')
+      }
+    }
+  )
+  await writeFile(join(dataRoot, 'kept.txt'), 'kept result')
+  const { fileEvidence } = await observation.finish()
+  await completeWorkingFileEvidence(location, { runId: 'native-run', fileEvidence })
+  const orphan = 'unreferenced capture'
+  const blob = `sha256-${sha256(orphan)}`
+  const pooled = join(target.storageRoot, 'execution-file-evidence/target/blobs', blob)
+  const alias = join(location.root, 'activity-native-run/blobs', blob)
+  await writeFile(pooled, orphan)
+  await fsPromises.link(pooled, alias)
+  const owner = {
+    receiptName: 'receipt-native-run.json',
+    finalName: 'activity-native-run',
+    activityId: 'native-run',
+    activityKind: 'notebook-run' as const,
+    evidenceId: fileEvidence.evidenceId!,
+    checksum: fileEvidence.checksum!,
+    storageKey: fileEvidence.storageKey!
+  }
+  const write = fsPromises.writeFile
+  let checked = false
+  const intercept = vi.spyOn(fsPromises, 'writeFile').mockImplementation(async (...args) => {
+    await Reflect.apply(write, fsPromises, args)
+    const path = String(args[0])
+    if (
+      path.startsWith(join(target.storageRoot, 'notebooks/target') + sep) &&
+      path.endsWith(`${sep}.session-package-owner`)
+    ) {
+      // The imported directory is reserved but its children have not yet been published.
+      checked = true
+      await maintainWorkingFileEvidence(location, [owner])
+      await expect(readFile(alias, 'utf8')).resolves.toBe(orphan)
+    }
+  })
+  try {
+    await exporter.exportTo({ projectId: 'source', sessionId: 'original' }, archive)
+    await importer.importFrom(archive, undefined, undefined, undefined, { projectId: 'target' })
+    expect(checked).toBe(true)
+    await maintainWorkingFileEvidence(location, [owner])
+    await expect(stat(alias)).rejects.toMatchObject({ code: 'ENOENT' })
+  } finally {
+    intercept.mockRestore()
+    await exporter.close()
+    await importer.close()
+  }
+})
 
 it.each(['identical versions', 'identical evidence', 'small edit'] as const)(
   'preserves independent history with shared package content for %s',
@@ -561,9 +745,24 @@ it('clears copying counters while finalizing an import', async () => {
     getClient: async () => target.client
   }).importFrom(archive, undefined, (update) => progress.push(update))
   expect(progress.some((update) => update.totalBytes && update.completedBytes)).toBe(true)
-  expect(publishing).toEqual({ phase: 'importing' })
+  expect(publishing).toEqual({ phase: 'importing', importStage: 'publish' })
   const lastCopy = progress.findLastIndex((update) => update.totalBytes !== undefined)
-  expect(progress.slice(lastCopy + 1)).toContainEqual({ phase: 'validating' })
+  expect(progress.slice(lastCopy + 1)).toContainEqual({
+    phase: 'validating',
+    importStage: 'validate-import',
+    stageProgress: 0
+  })
+  expect([...new Set(progress.map((update) => update.importStage).filter(Boolean))]).toEqual([
+    'read-archive',
+    'verify-archive',
+    'prepare-preview',
+    'validate-preview',
+    'import-files',
+    'verify-files',
+    'prepare-validation',
+    'validate-import',
+    'publish'
+  ])
 })
 
 it.each(['success', 'rollback', 'late-ack', 'publication-retry', 'ownership-collision'] as const)(
@@ -1367,6 +1566,75 @@ it('keeps terminal Task and Compute results as evidence without installing jobs 
   await expect(target.client.computeJob.count()).resolves.toBe(0)
 })
 
+it('exports scheduler cancellation as cancelled evidence without a local cancel operation', async () => {
+  const source = await createProvenanceTestFixture()
+  initDataRoot(source.storageRoot)
+  fixtures.push(source)
+  await source.client.project.create({ data: { id: 'project-1', name: 'Scheduler results' } })
+  await new SessionRepository(source.storageRoot).saveSession({
+    id: 'session-1',
+    projectId: 'project-1',
+    title: 'Scheduler results',
+    cwd: '',
+    status: 'idle',
+    messages: [],
+    createdAt: 1,
+    updatedAt: 2
+  })
+  for (const [id, errorCode] of [
+    ['cancelled-externally', 'job_cancelled'],
+    ['execution-failed', 'job_failed']
+  ]) {
+    await source.client.computeJob.create({
+      data: {
+        id,
+        projectId: 'project-1',
+        sessionId: 'session-1',
+        providerId: 'ssh:cluster',
+        shape: 'scheduler_cluster',
+        executionMode: 'slurm',
+        status: 'failed',
+        errorCode,
+        intent: 'Collect scheduler results',
+        command: 'analysis',
+        commandHash: sha256('analysis'),
+        sensitiveDataEncrypted: false,
+        finishedAt: new Date(2)
+      }
+    })
+  }
+  expect(await source.client.computeJobOperation.count()).toBe(0)
+  const exporter = new SessionPackageService({
+    storageRoot: source.storageRoot,
+    getClient: async () => source.client
+  })
+  try {
+    const archive = join(source.storageRoot, 'scheduler-results.science')
+    await exporter.exportTo({ projectId: 'project-1', sessionId: 'session-1' }, archive)
+    const expanded = join(source.storageRoot, 'scheduler-results-expanded')
+    await readPackageArchive(archive, expanded)
+    const records = JSON.parse(await readFile(join(expanded, 'records.json'), 'utf8'))
+    expect(records.history.computeJobs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'cancelled-externally',
+          status: 'failed',
+          cancelled: true,
+          error: 'job_cancelled'
+        }),
+        expect.objectContaining({
+          id: 'execution-failed',
+          status: 'failed',
+          cancelled: false,
+          error: 'job_failed'
+        })
+      ])
+    )
+  } finally {
+    await exporter.close()
+  }
+})
+
 it('does not remove an unclaimed directory when recovering an interrupted import', async () => {
   const target = await createProvenanceTestFixture()
   initDataRoot(target.storageRoot)
@@ -1628,13 +1896,27 @@ it.each(['readable', 'unavailable'] as const)(
       getClient: async () => target.client
     })
     if (witness === 'unavailable') {
-      vi.spyOn(target.client.fileOriginSession, 'findUnique').mockRejectedValueOnce(
-        new Error('Commit witness unavailable')
-      )
-      await expect(importer.importFrom(archive)).rejects.toThrow('Commit witness unavailable')
+      const witnessRead = vi
+        .spyOn(target.client.fileOriginSession, 'findUnique')
+        .mockRejectedValueOnce(new Error('Commit witness unavailable'))
+        .mockRejectedValueOnce(new Error('Commit witness still unavailable'))
+      const error = await importer.importFrom(archive).catch((cause: unknown) => cause)
+      expect(error).toBeInstanceOf(PackageImportRecoveryRequiredError)
+      const recovery = error as PackageImportRecoveryRequiredError
+      expect(recovery.cause).toMatchObject({ message: 'Commit witness unavailable' })
+      await expect(recovery.resume()).rejects.toMatchObject({
+        identity: recovery.identity,
+        cause: expect.objectContaining({ message: 'Commit witness still unavailable' })
+      })
+      expect(await target.client.fileOriginSession.count()).toBe(1)
+      expect(await target.client.session.count()).toBe(0)
       expect(
         await fsPromises.readdir(join(target.storageRoot, 'session-package-imports'))
       ).toHaveLength(1)
+      witnessRead.mockRestore()
+      await expect(recovery.resume()).resolves.toEqual(recovery.identity)
+      expect(await target.client.fileOriginSession.count()).toBe(1)
+      expect(await target.client.session.count()).toBe(1)
     } else {
       await expect(importer.importFrom(archive)).resolves.toEqual({
         projectId: expect.any(String),
@@ -1650,7 +1932,14 @@ it.each(['readable', 'unavailable'] as const)(
   }
 )
 
-it.each(['organized', 'deleted', 'projection-pending'] as const)(
+it.each([
+  'organized',
+  'deleted',
+  'projection-pending',
+  'owner-direct',
+  'owner-error',
+  'owner-identity-mismatch'
+] as const)(
   'preserves an already-published Session during staging recovery (%s)',
   async (state) => {
     const source = await createProvenanceTestFixture()
@@ -1676,7 +1965,7 @@ it.each(['organized', 'deleted', 'projection-pending'] as const)(
       getClient: async () => source.client
     }).exportTo({ projectId: 'source', sessionId: 'original' }, archive)
     const configRoot = join(target.storageRoot, 'config')
-    const options = {
+    const options: ConstructorParameters<typeof SessionPackageService>[0] = {
       configRoot,
       storageRoot: target.storageRoot,
       getClient: async () => target.client
@@ -1709,8 +1998,10 @@ it.each(['organized', 'deleted', 'projection-pending'] as const)(
     )
     if (state === 'projection-pending') {
       const error = await importPromise.catch((cause: unknown) => cause)
-      expect(error).toBeInstanceOf(SessionProjectionAfterCommitError)
-      expect(error).toMatchObject({
+      expect(error).toBeInstanceOf(PackageImportRecoveryRequiredError)
+      const recovery = error as PackageImportRecoveryRequiredError
+      expect(recovery.cause).toBeInstanceOf(SessionProjectionAfterCommitError)
+      expect(recovery.cause).toMatchObject({
         committedSession: {
           projectId: 'target',
           title: 'Original title',
@@ -1728,14 +2019,60 @@ it.each(['organized', 'deleted', 'projection-pending'] as const)(
     )
     const [published] = (await repository.loadAll()).sessions
     expect(published.packageOrigin).toBeDefined()
-    if (state === 'organized')
+    if (state === 'organized' || state === 'owner-direct')
       await repository.saveSession({ ...published, title: 'My organized research', pinned: true })
     else if (state === 'deleted') await repository.deleteSession(published.projectId, published.id)
+    const publication = vi.fn().mockResolvedValue(undefined)
+    options.onSessionPublished = publication
+    const publicationWork = vi.fn<NonNullable<typeof options.runSessionPublication>>(
+      async (_projectId, _sessionId, work) => work()
+    )
+    if (state === 'owner-direct') options.runSessionPublication = publicationWork
+    else if (state === 'owner-error')
+      options.runSessionPublication = async () => {
+        throw new Error('Live owner unavailable')
+      }
+    else if (state === 'owner-identity-mismatch') {
+      const read = SessionRepository.prototype.loadSessionWithDiagnostics
+      vi.spyOn(SessionRepository.prototype, 'loadSessionWithDiagnostics').mockImplementation(
+        async function (this: SessionRepository, ...args) {
+          const loaded = await Reflect.apply(read, this, args)
+          return loaded.status === 'found' &&
+            args[0] === published.projectId &&
+            args[1] === published.id
+            ? {
+                ...loaded,
+                session: {
+                  ...loaded.session,
+                  packageOrigin: { ...published.packageOrigin!, importId: 'another-import' }
+                }
+              }
+            : loaded
+        }
+      )
+    }
     const recovery = new SessionPackageService(options)
+    if (['owner-error', 'owner-identity-mismatch'].includes(state)) {
+      const save = vi.spyOn(SessionRepository.prototype, 'saveSession')
+      await expect(recovery.recover()).rejects.toThrow(
+        state === 'owner-error'
+          ? 'Live owner unavailable'
+          : 'Import publication Session identity mismatch.'
+      )
+      expect(save).not.toHaveBeenCalled()
+      expect(publication).not.toHaveBeenCalled()
+      expect(await readdir(join(configRoot, 'session-package-imports'))).toHaveLength(1)
+      if (state === 'owner-identity-mismatch')
+        vi.mocked(SessionRepository.prototype.loadSessionWithDiagnostics).mockRestore()
+      expect(await repository.loadSession(published.projectId, published.id)).toEqual(published)
+      await recovery.close()
+      return
+    }
     await expect(recovery.recover()).resolves.toBeUndefined()
     await expect(recovery.recover()).resolves.toBeUndefined()
     const current = await repository.loadSession(published.projectId, published.id)
-    if (state === 'organized')
+    if (state === 'owner-direct') expect(publicationWork).toHaveBeenCalledTimes(1)
+    if (state === 'organized' || state === 'owner-direct')
       expect(current).toMatchObject({
         title: 'My organized research',
         pinned: true,
@@ -1812,6 +2149,24 @@ it('transfers conversation branches and delivered Side Chat relays without auxil
     runtimeContext: {
       version: 1,
       revision: 1,
+      networkApprovals: [
+        {
+          version: 1,
+          kind: 'sandbox-network',
+          state: 'continuing',
+          requestId: 'network-fixture',
+          sessionId: 'session-1',
+          executionId: 'execution-fixture',
+          commandFingerprint: 'a'.repeat(64),
+          hostname: 'service.example.test',
+          port: 443,
+          runtime: 'bash',
+          originatingPromptMessageId: graph.messages[0].id,
+          agentFrameId: graph.activeFrameId,
+          messageBranchId: graph.frames[0].activeBranchId,
+          createdAt: 1
+        }
+      ],
       sideChat: {
         version: 1,
         id: 'side-chat-1',
@@ -1877,6 +2232,7 @@ it('transfers conversation branches and delivered Side Chat relays without auxil
     version: number
     session: { runtimeContext?: Record<string, unknown> }
   }
+  expect(retainedEnvelope.session.runtimeContext?.networkApprovals).toBeUndefined()
   retainedEnvelope.session.runtimeContext = {
     ...(retainedEnvelope.session.runtimeContext ?? { version: 1, revision: 1 }),
     sideChat: {
@@ -1930,6 +2286,7 @@ it('transfers conversation branches and delivered Side Chat relays without auxil
       conversationGraph?: { messages: Array<Record<string, unknown>> }
     }
   }
+  expect(forwardedEnvelope.session.runtimeContext?.networkApprovals).toBeUndefined()
   expect(forwardedEnvelope.session.runtimeContext?.sideChat).toBeUndefined()
   expect(forwardedEnvelope.session.conversationGraph?.messages).toContainEqual(
     expect.objectContaining({
@@ -1952,6 +2309,7 @@ it('transfers conversation branches and delivered Side Chat relays without auxil
     'Use a black line in the main analysis.'
   ])
   expect(reopened?.providerSessionId).toBeUndefined()
+  expect(reopened?.runtimeContext?.networkApprovals).toBeUndefined()
   expect(reopened?.runtimeContext?.sideChat).toBeUndefined()
   expect(reopened?.runtimeContext?.sideChats).toBeUndefined()
   expect(origin.identities['side-chat-1']).toBeUndefined()
@@ -2284,6 +2642,22 @@ it.each(['root', 'frame'] as const)(
     const previousRun = (
       await source.notebookRepository.readSessionRuns('project-1', 'session-1')
     )[0]
+    const repeatedObservation = await startWorkingFileObservation(
+      {
+        dataRoot: document.dataRoot,
+        notebookSessionRoot: document.notebookSessionRoot,
+        fileEvidenceStorageRoot: source.storageRoot,
+        fileEvidenceRoot: join(source.storageRoot, 'execution-file-evidence/project-1/session-1'),
+        fileEvidenceStoragePrefix: 'execution-file-evidence/project-1/session-1',
+        runId: 'notebook-run-2'
+      },
+      {
+        watchDirectory: () => {
+          throw new Error('Watcher unavailable in fixture')
+        }
+      }
+    )
+    const repeatedEvidence = await repeatedObservation.finish()
     await source.notebookRepository.appendRun({
       projectId: 'project-1',
       sessionId: 'session-1',
@@ -2295,7 +2669,7 @@ it.each(['root', 'frame'] as const)(
         startedAt: 3,
         endedAt: 4,
         script: 'read_input()',
-        fileEvidence: undefined,
+        fileEvidence: repeatedEvidence.fileEvidence,
         workingFiles: [],
         inputFiles: [
           {
@@ -2404,6 +2778,32 @@ it.each(['root', 'frame'] as const)(
     expect(sha256(sidecarText)).toBe(importedEvidence.checksum)
     const sidecar = JSON.parse(sidecarText)
     expect(sidecar.activityId).toBe(importedRun.runId)
+    const importedRuns = await target.notebookRepository.readSessionRuns(
+      imported.projectId,
+      imported.sessionId
+    )
+    const secondSidecar = JSON.parse(
+      await readFile(join(target.storageRoot, importedRuns[1].fileEvidence!.storageKey!), 'utf8')
+    )
+    const importedBlob = join(target.storageRoot, sidecar.relations[0].generation.contentStorageKey)
+    const secondBlob = join(
+      target.storageRoot,
+      secondSidecar.relations[0].generation.contentStorageKey
+    )
+    const importedBlobStats = await stat(importedBlob)
+    expect(await stat(secondBlob)).toMatchObject({
+      dev: importedBlobStats.dev,
+      ino: importedBlobStats.ino
+    })
+    const importedWorkingFile = join(
+      target.storageRoot,
+      history.files.find(
+        (file) =>
+          file.sourceStorageKey.startsWith('notebooks/') &&
+          file.sourceStorageKey.endsWith('/data/plot.png')
+      )!.localStorageKey
+    )
+    expect((await stat(importedWorkingFile)).ino).not.toBe(importedBlobStats.ino)
     await expect(
       readFile(
         join(target.storageRoot, ...sidecar.relations[0].generation.contentStorageKey.split('/'))
@@ -2542,6 +2942,20 @@ it.each(['root', 'frame'] as const)(
       'utf8'
     )
     expect(sha256(forkedEvidenceText)).toBe(forkedEvidence.checksum)
+    const forkedSidecars = await Promise.all(
+      forkedRuns.map(async (run) =>
+        JSON.parse(await readFile(join(target.storageRoot, run.fileEvidence!.storageKey!), 'utf8'))
+      )
+    )
+    const forkedBlobs = forkedSidecars.map((item) =>
+      join(target.storageRoot, item.relations[0].generation.contentStorageKey)
+    )
+    const forkedBlobStats = await stat(forkedBlobs[0])
+    expect(await stat(forkedBlobs[1])).toMatchObject({
+      dev: forkedBlobStats.dev,
+      ino: forkedBlobStats.ino
+    })
+    expect(forkedBlobStats.ino).not.toBe(importedBlobStats.ino)
     await expect(
       files.adoptLegacyArtifact({
         projectId: forked.projectId,

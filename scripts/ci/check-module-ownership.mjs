@@ -1,14 +1,19 @@
 /* eslint-disable @typescript-eslint/explicit-function-return-type */
 
 import { execFileSync } from 'node:child_process'
-import { verifiedHostOwnerSplits, verifiedHostSourceMoves } from './host-owner-split.mjs'
 import {
+  dependencyBasedConsumerRetirements,
+  dependencyBoundaryViolations,
+  sourceSnapshot,
   verifiedConsumerRetirements,
-  verifiedExcludedPackageTests,
-  verifiedFuzzyMatchOwnerSplit,
-  verifiedPdfTextOwnerSplit,
-  verifiedPromiseIdentityOwnerSplit
-} from './consumer-retirement.mjs'
+  verifiedExcludedPackageTests
+} from './module-graph/index.mjs'
+import {
+  verifiedExistingHostOwnerTransfers,
+  verifiedHostOwnerSplits,
+  verifiedHostSourceMoves
+} from './host-owner-split.mjs'
+import { verifiedFullOwnerSplits } from './full-owner-split.mjs'
 import {
   moduleImpactRegistrationPath,
   isModuleImpactRegistrationPath,
@@ -49,7 +54,8 @@ function registrationViolations(
   retiredConsumers = new Set(),
   retiredPackageTests = new Set(),
   boundedOwnerSplits = new Set(),
-  transferredOwnerTests = new Set()
+  transferredOwnerTests = new Set(),
+  rewordedFullOwners = new Set()
 ) {
   // Compare checked-in routing only; local graph evidence must not mask lost coverage.
   const graph = { status: 'not-used', testFiles: [] }
@@ -73,6 +79,9 @@ function registrationViolations(
     'fallbackCapability',
     'fullTestReason'
   ])
+  // Normalize optional arrays to empty so retention checks don't need to handle undefined.
+  const testKindsOf = (module) => testKinds.flatMap((kind) => module.testFiles[kind] ?? [])
+  const consumersOf = (module) => module.consumerModules ?? []
   const retain = (before, after, label, applicable = () => true) => {
     if (before.some((entry) => applicable(entry) && !after.includes(entry))) reject(label)
   }
@@ -91,12 +100,7 @@ function registrationViolations(
   // A coherent owner can move or absorb another owner without losing evidence. Infer
   // replacements from exact paths and retained obligations, never from a candidate flag.
   const equivalentEvidence = (base, head) =>
-    testKinds
-      .flatMap((kind) => base.testFiles[kind])
-      .every(
-        (path) =>
-          !headFiles.has(path) || testKinds.some((kind) => head.testFiles[kind].includes(path))
-      ) &&
+    testKindsOf(base).every((path) => !headFiles.has(path) || testKindsOf(head).includes(path)) &&
     base.interfacePaths.every(
       (path) => !headFiles.has(path) || head.interfacePaths.includes(path)
     ) &&
@@ -125,12 +129,12 @@ function registrationViolations(
   }
   const translatedConsumer = (id) => replacements.get(id) ?? id
   const preservesConsumers = (base, head, id) =>
-    base.consumerModules.every((consumer) => {
+    consumersOf(base).every((consumer) => {
       const target = translatedConsumer(consumer)
       return (
         target === id ||
         (!headModules[target] && !replacements.has(consumer)) ||
-        head.consumerModules.includes(target)
+        consumersOf(head).includes(target)
       )
     })
   const movedPathOwner = (path, base) =>
@@ -149,11 +153,9 @@ function registrationViolations(
     }
     if (!head) {
       if (
-        [
-          ...base.ownerPaths,
-          ...base.interfacePaths,
-          ...testKinds.flatMap((kind) => base.testFiles[kind])
-        ].some((path) => headFiles.has(path))
+        [...base.ownerPaths, ...base.interfacePaths, ...testKindsOf(base)].some((path) =>
+          headFiles.has(path)
+        )
       ) {
         reject(`${id}: module with surviving paths`)
       }
@@ -172,8 +174,8 @@ function registrationViolations(
     }
     for (const kind of testKinds) {
       retain(
-        base.testFiles[kind],
-        head.testFiles[kind],
+        base.testFiles[kind] ?? [],
+        head.testFiles[kind] ?? [],
         `${id}.testFiles.${kind}`,
         (path) =>
           headFiles.has(path) &&
@@ -183,14 +185,19 @@ function registrationViolations(
       )
     }
     retain(
-      base.consumerModules.map(translatedConsumer),
-      head.consumerModules,
+      consumersOf(base).map(translatedConsumer),
+      consumersOf(head),
       `${id}.consumerModules`,
       (consumer) => consumer !== id && Object.hasOwn(headModules, consumer)
     )
     retain(base.capabilityOverlays, head.capabilityOverlays, `${id}.capabilityOverlays`)
     if (head.fallbackCapability !== base.fallbackCapability) reject(`${id}.fallbackCapability`)
-    if (base.fullTestReason !== undefined && head.fullTestReason !== base.fullTestReason) {
+    // A verified full-owner split may restate why its remaining surface stays full.
+    if (
+      base.fullTestReason !== undefined &&
+      head.fullTestReason !== base.fullTestReason &&
+      !(rewordedFullOwners.has(id) && head.fullTestReason)
+    ) {
       reject(`${id}.fullTestReason`)
     }
   }
@@ -201,7 +208,7 @@ function registrationViolations(
       Object.values(modules).flatMap((module) => [
         ...module.ownerPaths,
         ...module.interfacePaths,
-        ...testKinds.flatMap((kind) => module.testFiles[kind])
+        ...testKindsOf(module)
       ])
     )
   const beforePaths = explicitPaths(baseModules)
@@ -236,7 +243,8 @@ export function checkModuleOwnership({
   retiredConsumers = new Set(),
   retiredPackageTests = new Set(),
   boundedOwnerSplits = new Set(),
-  transferredOwnerTests = new Set()
+  transferredOwnerTests = new Set(),
+  rewordedFullOwners = new Set()
 }) {
   validateModuleImpactManifest(baseManifest)
   const before = new Set(baseFiles)
@@ -254,7 +262,8 @@ export function checkModuleOwnership({
     retiredConsumers,
     retiredPackageTests,
     boundedOwnerSplits,
-    transferredOwnerTests
+    transferredOwnerTests,
+    rewordedFullOwners
   )
   const legacyGaps = []
   for (const path of headFiles.filter(isModuleOwnershipPath)) {
@@ -312,12 +321,31 @@ export function moduleOwnershipFromRevisions(base, head, { cwd = process.cwd() }
   validateModuleImpactManifest(headManifest, { pathExists: (path) => existing.has(path) })
   const hostSplits = verifiedHostOwnerSplits(mergeBase, head, baseManifest, headManifest, { cwd })
   const hostMoves = verifiedHostSourceMoves(mergeBase, head, baseManifest, headManifest, { cwd })
-  return checkModuleOwnership({
+  const fullSplits = verifiedFullOwnerSplits(mergeBase, head, baseManifest, headManifest, { cwd })
+  const dependencyRetirements = dependencyBasedConsumerRetirements(
+    mergeBase,
+    head,
+    baseManifest,
+    headManifest,
+    { cwd }
+  )
+  const sources = [sourceSnapshot(mergeBase, cwd), sourceSnapshot(head, cwd)]
+  const runtimeEdges = sources.flatMap((source) =>
+    Object.entries(JSON.parse(source.read('scripts/ci/module-runtime-consumers.json') ?? '{}'))
+  )
+  const boundaryViolations = dependencyBoundaryViolations(
+    sources[1],
+    headManifest,
+    baseManifest,
+    runtimeEdges
+  )
+  const result = checkModuleOwnership({
     baseManifest,
     headManifest,
     baseFiles,
     headFiles,
     retiredConsumers: new Set([
+      ...dependencyRetirements,
       ...verifiedConsumerRetirements(mergeBase, head, baseManifest, headManifest, { cwd }),
       ...hostSplits.consumers,
       ...hostMoves.consumers
@@ -326,13 +354,24 @@ export function moduleOwnershipFromRevisions(base, head, { cwd = process.cwd() }
       cwd
     }),
     boundedOwnerSplits: new Set([
-      ...verifiedPdfTextOwnerSplit(mergeBase, head, baseManifest, headManifest, { cwd }),
-      ...verifiedPromiseIdentityOwnerSplit(mergeBase, head, baseManifest, headManifest, { cwd }),
-      ...verifiedFuzzyMatchOwnerSplit(mergeBase, head, baseManifest, headManifest, { cwd }),
+      ...verifiedExistingHostOwnerTransfers(mergeBase, head, baseManifest, headManifest, { cwd }),
       ...hostSplits.paths,
-      ...hostMoves.paths
+      ...hostMoves.paths,
+      ...fullSplits.paths
     ]),
-    transferredOwnerTests: new Set([...hostSplits.ownerTests, ...hostMoves.ownerTests]),
+    transferredOwnerTests: new Set([
+      ...hostSplits.ownerTests,
+      ...hostMoves.ownerTests,
+      ...fullSplits.ownerTests
+    ]),
+    rewordedFullOwners: fullSplits.rewordedOwners,
     changes: parseNameStatus(git('diff', '--name-status', '-z', mergeBase, head))
   })
+  result.violations.push(...boundaryViolations)
+  result.ok = result.violations.length === 0
+  result.retiredConsumers = result.retiredConsumers.filter(
+    (entry) => !dependencyRetirements.has(entry)
+  )
+  result.dependencyBasedRetirements = [...dependencyRetirements]
+  return result
 }

@@ -38,12 +38,61 @@ const { ConnectorSettingsModule } = await import('./connector-settings')
 const { DeviceCredentialStore } = await import('./device-credentials')
 const { encryptKey } = await import('./crypto')
 const { selectEnabledCustomServers } = await import('../connectors/custom-mcp-config')
+const { projectConnectorsFromStored } = await import('../connectors/read-model')
 const { CustomServerIdConflictError } = await import('./custom-server-identity')
 const { SettingsRepository } = await import('./repository')
 const { ALL_CONNECTOR_IDS } = await import('../connectors/registry')
 
 // Exercises the durable Connector owner against a real on-disk repository.
 describe('ConnectorSettingsModule', () => {
+  it('offers a Main-disabled bundled definition to a separately authorized Specialist', async () => {
+    await service.setConnectorEnabled({ id: 'orphadata', enabled: false })
+    const stored = await service.getConnectors()
+    expect(service.connectorSkillNames(stored)).not.toContain('mcp-orphadata')
+    expect(await service.provisionedConnectorSkillNames()).toContain('mcp-orphadata')
+    expect(service.connectorSkillNames(stored, ['mcp-orphadata'])).toEqual(['mcp-orphadata'])
+    expect(service.connectorSkillCatalogEntries(stored, ['mcp-orphadata'])).toEqual([
+      expect.objectContaining({ directory: 'mcp-orphadata', name: 'mcp-orphadata' })
+    ])
+    expect(service.connectorSkillNames(stored, [])).toEqual([])
+    expect(await service.getConnectors()).toEqual(stored)
+  })
+
+  it.each(['tcia', 'kegg', 'orphadata', 'rxnorm', 'dailymed', 'biosamples', 'wikipathways'])(
+    'persists %s opt-in for views and Skills without changing historical choices',
+    async (id) => {
+      const existing = ['genes', 'pubmed', 'clinical-genomics', 'rna']
+      expect(service.enabledConnectorIds(undefined)).toEqual(expect.arrayContaining(existing))
+      expect(service.enabledConnectorIds(undefined)).not.toContain(id)
+      expect(service.connectorSkillNames(undefined)).not.toContain(`mcp-${id}`)
+      expect(
+        service.connectorSkillCatalogEntries(undefined).map((entry) => entry.name)
+      ).not.toContain(`mcp-${id}`)
+      await service.setConnectorEnabled({ id: 'genes', enabled: false })
+      let snapshot = await service.setConnectorEnabled({ id, enabled: true })
+      expect(snapshot.connectors.find((entry) => entry.id === id)?.enabled).toBe(true)
+      const stored = (await new SettingsRepository(dir).getSettings()).connectors
+      expect(service.enabledConnectorIds(stored)).not.toContain('genes')
+      expect(service.connectorSkillNames(stored)).toContain(`mcp-${id}`)
+      expect(service.connectorSkillCatalogEntries(stored).map((entry) => entry.name)).toContain(
+        `mcp-${id}`
+      )
+      expect(
+        projectConnectorsFromStored(stored).find((entry) => entry.id === id)?.mainEnabled
+      ).toBe(true)
+      snapshot = await service.setConnectorEnabled({ id, enabled: false })
+      expect(snapshot.connectors.find((entry) => entry.id === id)?.enabled).toBe(false)
+      const off = await service.getConnectors()
+      expect(service.connectorSkillNames(off)).not.toContain(`mcp-${id}`)
+      expect(service.enabledConnectorIds({ ...stored!, disabledConnectorIds: [id] })).not.toContain(
+        id
+      )
+      expect(
+        projectConnectorsFromStored(undefined).find((entry) => entry.id === id)?.mainEnabled
+      ).toBe(false)
+    }
+  )
+
   it('validates OpenAlex before saving, persists enablement, and refuses to replace a key', async () => {
     const probe = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 401 }))
     service = new ConnectorSettingsModule(repository, probe)
@@ -140,11 +189,24 @@ describe('ConnectorSettingsModule', () => {
     }
   })
 
-  it('lists every bundled connector, all enabled and not auto-allowed by default', async () => {
+  it('lists every bundled connector using catalog defaults without auto-allow', async () => {
     const snapshot = await service.listConnectors()
 
     expect(snapshot.connectors).toHaveLength(ALL_CONNECTOR_IDS.length)
-    expect(snapshot.connectors.every((c) => c.enabled)).toBe(true)
+    expect(snapshot.connectors.filter((c) => !c.enabled).map((c) => c.id)).toEqual([
+      'biodbnet',
+      'biosamples',
+      'chea3',
+      'ctd',
+      'dailymed',
+      'europepmc',
+      'kegg',
+      'orphadata',
+      'research-datasets',
+      'rxnorm',
+      'tcia',
+      'wikipathways'
+    ])
     expect(snapshot.connectors.every((c) => !c.autoAllow)).toBe(true)
     expect(snapshot.customServers).toEqual([])
     expect(snapshot.ncbi).toEqual({ contactEmail: undefined, hasApiKey: false })
@@ -176,7 +238,11 @@ describe('ConnectorSettingsModule', () => {
         }
       })
       await service.saveCustomServerOAuthState(`credential:${oauth.createdCredential.id}`, {
-        tokens: { access_token: 'oauth-access', token_type: 'Bearer' }
+        tokens: {
+          access_token: 'oauth-access',
+          token_type: 'Bearer',
+          issuer: 'https://auth.example.test/'
+        }
       })
 
       makeSecretsUnreadable()
@@ -392,7 +458,11 @@ describe('ConnectorSettingsModule', () => {
     })
     const credential = credentials.createdCredential
     await service.saveCustomServerOAuthState(`credential:${credential.id}`, {
-      tokens: { access_token: 'initial-oauth-token', token_type: 'bearer' }
+      tokens: {
+        access_token: 'initial-oauth-token',
+        token_type: 'bearer',
+        issuer: 'https://auth.example.test/'
+      }
     })
     const added = await addCustomServer({
       name: 'shared-oauth',
@@ -407,7 +477,11 @@ describe('ConnectorSettingsModule', () => {
     })
     const id = added.customServers[0]!.id
     await service.saveCustomServerOAuthState(id, {
-      tokens: { access_token: 'oauth-token', token_type: 'bearer' }
+      tokens: {
+        access_token: 'oauth-token',
+        token_type: 'bearer',
+        issuer: 'https://auth.example.test/'
+      }
     })
 
     const stored = (await repository.getSettings()).connectors?.customMcpServers?.[0]
@@ -489,7 +563,11 @@ describe('ConnectorSettingsModule', () => {
     })
     const id = added.customServers[0]!.id
     await service.saveCustomServerOAuthState(`credential:${credential.id}`, {
-      tokens: { access_token: 'connected-token', token_type: 'Bearer' }
+      tokens: {
+        access_token: 'connected-token',
+        token_type: 'Bearer',
+        issuer: 'https://auth.example.test/'
+      }
     })
 
     const updated = await service.updateCustomServer({
@@ -612,7 +690,11 @@ describe('ConnectorSettingsModule', () => {
       })
     ).createdCredential
     await credentialStore.saveOAuthState(credential.id, {
-      tokens: { access_token: 'shared-token', token_type: 'bearer' }
+      tokens: {
+        access_token: 'shared-token',
+        token_type: 'bearer',
+        issuer: 'https://auth.example.test/'
+      }
     })
     const barrierEntered = Promise.withResolvers<void>()
     const releaseBarrier = Promise.withResolvers<void>()
@@ -666,7 +748,11 @@ describe('ConnectorSettingsModule', () => {
         })
       ).createdCredential
       await credentialStore.saveOAuthState(credential.id, {
-        tokens: { access_token: 'scoped-token', token_type: 'bearer' }
+        tokens: {
+          access_token: 'scoped-token',
+          token_type: 'bearer',
+          issuer: 'https://auth.example.test/'
+        }
       })
       await addCustomServer({
         name: 'tampered-oauth-scope',
@@ -1055,6 +1141,19 @@ describe('ConnectorSettingsModule', () => {
       ({ id }) => id === 'credential-unavailable-enable'
     )
     expect(stored?.enabled).toBe(false)
+  })
+
+  it('encrypts Semantic Scholar at rest and exposes only configured state', async () => {
+    let snapshot = await service.setSemanticScholarCredential({ apiKey: 'semantic-scholar-secret' })
+    expect(snapshot.semanticScholar).toEqual({ hasApiKey: true })
+    expect(JSON.stringify(snapshot)).not.toContain('semantic-scholar-secret')
+
+    const raw = await readFile(join(dir, 'settings.json'), 'utf8')
+    expect(raw).not.toContain('semantic-scholar-secret')
+    expect(JSON.parse(raw).connectors.semanticScholarApiKeyRef).toMatch(/^enc:/)
+
+    snapshot = await service.setSemanticScholarCredential({ apiKey: '' })
+    expect(snapshot.semanticScholar).toEqual({ hasApiKey: false })
   })
 
   it('encrypts OpenAlex at rest and exposes only configured state', async () => {
@@ -1983,14 +2082,22 @@ describe('ConnectorSettingsModule', () => {
     await expect(service.setCustomServerEnabled({ id, enabled: true })).rejects.toThrow('Sign in')
 
     await service.saveCustomServerOAuthState(id, {
-      tokens: { access_token: 'oauth-access', token_type: 'Bearer' }
+      tokens: {
+        access_token: 'oauth-access',
+        token_type: 'Bearer',
+        issuer: 'https://example.com/oauth'
+      },
+      clientInformation: { client_id: 'registered', issuer: 'https://example.com/oauth' }
     })
     const storedJson = await readFile(join(dir, 'settings.json'), 'utf8')
     expect(storedJson).not.toContain('oauth-access')
     expect(storedJson).toContain('oauthRef')
 
     const resolved = (await service.getConnectors())?.customMcpServers?.[0]
-    expect(resolved?.oauthState?.tokens?.access_token).toBe('oauth-access')
+    expect(resolved?.oauthState).toMatchObject({
+      tokens: { access_token: 'oauth-access', issuer: 'https://example.com/oauth' },
+      clientInformation: { client_id: 'registered', issuer: 'https://example.com/oauth' }
+    })
     const connected = (await service.listConnectors()).customServers[0]
     expect(connected.oauth?.hasTokens).toBe(true)
     expect(connected.availability).toBeUndefined()
@@ -1999,6 +2106,66 @@ describe('ConnectorSettingsModule', () => {
     const enabled = await service.setCustomServerEnabled({ id, enabled: true })
     expect(enabled.customServers[0].enabled).toBe(true)
   })
+
+  it.each(['legacy', 'shared'] as const)(
+    'projects %s unbound OAuth credentials as unauthenticated before connecting',
+    async (storage) => {
+      service = new ConnectorSettingsModule(repository, fetch, new DeviceCredentialStore(dir))
+      const oauth = { authorizationServerUrl: 'https://example.com/oauth' }
+      const credential =
+        storage === 'shared'
+          ? (
+              await service.createDeviceCredential({
+                displayName: 'Historical OAuth',
+                kind: 'oauth',
+                resourceUri: 'https://example.com/mcp',
+                transport: 'streamable_http',
+                oauth
+              })
+            ).createdCredential
+          : undefined
+      const snapshot = credential
+        ? await service.addCustomServer({
+            name: 'historical-oauth',
+            displayName: 'Historical OAuth',
+            transport: 'streamable_http',
+            url: 'https://example.com/mcp',
+            oauthCredentialId: credential.id
+          })
+        : await addHistoricalCustomServer({
+            name: 'historical-oauth',
+            transport: 'streamable_http',
+            url: 'https://example.com/mcp',
+            oauth
+          })
+      const id = snapshot.customServers[0].id
+      await service.saveCustomServerOAuthState(id, {
+        tokens: { access_token: 'legacy-token', token_type: 'Bearer' },
+        clientInformation: { client_id: 'bound-client', issuer: oauth.authorizationServerUrl },
+        discoveryState: { authorizationServerUrl: 'https://obsolete-auth.example.test' }
+      })
+      await repository.setCustomServerEnabled(id, true)
+
+      const resolved = await service.getConnectors()
+      expect(resolved?.customMcpServers?.[0].oauthState).toEqual({})
+      expect(selectEnabledCustomServers(resolved)).toEqual([])
+      expect(projectConnectorsFromStored(resolved).find((entry) => entry.id === id)).toMatchObject({
+        mainEnabled: false,
+        availability: 'unauthenticated'
+      })
+      expect((await service.listConnectors()).customServers[0]).toMatchObject({
+        availability: 'unauthenticated',
+        oauth: { hasTokens: false }
+      })
+      await expect(service.setCustomServerEnabled({ id, enabled: true })).rejects.toThrow('Sign in')
+      if (credential) {
+        expect((await service.listDeviceCredentials()).credentials[0]).toMatchObject({
+          status: 'disconnected',
+          needsSecret: false
+        })
+      }
+    }
+  )
 
   it('does not let a stale OAuth save replace a concurrent configuration edit', async () => {
     const added = await addHistoricalCustomServer({
@@ -2156,7 +2323,11 @@ describe('ConnectorSettingsModule', () => {
     })
 
     await service.saveCustomServerOAuthState(id, {
-      tokens: { access_token: 'static-token', token_type: 'Bearer' }
+      tokens: {
+        access_token: 'static-token',
+        token_type: 'Bearer',
+        issuer: 'https://auth.example.test/'
+      }
     })
     await service.updateCustomServer({
       id,
@@ -2214,7 +2385,11 @@ describe('ConnectorSettingsModule', () => {
     })
     const id = added.customServers[0].id
     await service.saveCustomServerOAuthState(id, {
-      tokens: { access_token: 'issuer-token', token_type: 'Bearer' }
+      tokens: {
+        access_token: 'issuer-token',
+        token_type: 'Bearer',
+        issuer: 'https://auth.example.test/'
+      }
     })
 
     const updated = await service.updateCustomServer({
@@ -2245,7 +2420,11 @@ describe('ConnectorSettingsModule', () => {
     })
     const id = added.customServers[0].id
     await service.saveCustomServerOAuthState(id, {
-      tokens: { access_token: 'endpoint-token', token_type: 'Bearer' }
+      tokens: {
+        access_token: 'endpoint-token',
+        token_type: 'Bearer',
+        issuer: 'https://example.com/oauth'
+      }
     })
     await service.setCustomServerEnabled({ id, enabled: true })
 
@@ -2274,7 +2453,11 @@ describe('ConnectorSettingsModule', () => {
     })
     const id = added.customServers[0].id
     await service.saveCustomServerOAuthState(id, {
-      tokens: { access_token: 'remote-token', token_type: 'Bearer' }
+      tokens: {
+        access_token: 'remote-token',
+        token_type: 'Bearer',
+        issuer: 'https://auth.example.test/'
+      }
     })
 
     const updated = await service.updateCustomServer({

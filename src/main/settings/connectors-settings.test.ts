@@ -15,6 +15,7 @@ describe('sanitizeConnectors', () => {
         ncbiApiKeyRef: 'ref1',
         openAlexApiKeyRef: 'ref2',
         blockedToolIds: ['chemistry/pubchem_get_properties'],
+        enabledConnectorIds: ['orphadata', 42, 'orphadata'],
         disabledConnectorIds: ['zinc', 'zinc', 'rna']
       })
     ).toEqual({
@@ -24,6 +25,7 @@ describe('sanitizeConnectors', () => {
       ncbiApiKeyRef: 'ref1',
       openAlexApiKeyRef: 'ref2',
       blockedToolIds: ['chemistry/pubchem_get_properties'],
+      enabledConnectorIds: ['orphadata'],
       disabledConnectorIds: ['zinc', 'rna']
     })
   })
@@ -56,6 +58,20 @@ describe('SettingsRepository connector mutators', () => {
     })
   })
 
+  it('persists explicit opt-in across repository reloads and removes conflicting choices', async () => {
+    await withRepo(async (repo, dir) => {
+      await repo.setConnectorDisabled('genes', true)
+      await repo.setConnectorDisabled('orphadata', false)
+      let saved = (await new SettingsRepository(dir).getSettings()).connectors
+      expect(saved?.enabledConnectorIds).toEqual(['orphadata'])
+      expect(saved?.disabledConnectorIds).toEqual(['genes'])
+      await repo.setConnectorDisabled('orphadata', true)
+      saved = (await new SettingsRepository(dir).getSettings()).connectors
+      expect(saved?.enabledConnectorIds).toBeUndefined()
+      expect(saved?.disabledConnectorIds).toEqual(['genes', 'orphadata'])
+    })
+  })
+
   it('toggles connector auto-allow (skip approvals)', async () => {
     await withRepo(async (repo) => {
       await repo.setConnectorAutoAllow('biomart', true)
@@ -84,6 +100,15 @@ describe('SettingsRepository connector mutators', () => {
       c = await readConnectors(repo)
       expect(c?.contactEmail).toBeUndefined()
       expect(c?.ncbiApiKeyRef).toBeUndefined()
+    })
+  })
+
+  it('sets and clears a Semantic Scholar credential reference', async () => {
+    await withRepo(async (repo) => {
+      await repo.setSemanticScholarCredential('cipher-ref')
+      expect((await readConnectors(repo))?.semanticScholarApiKeyRef).toBe('cipher-ref')
+      await repo.setSemanticScholarCredential(undefined)
+      expect((await readConnectors(repo))?.semanticScholarApiKeyRef).toBeUndefined()
     })
   })
 

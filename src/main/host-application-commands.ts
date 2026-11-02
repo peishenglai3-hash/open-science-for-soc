@@ -19,7 +19,8 @@ import type {
 import type {
   LocalModelApi,
   LocalModelCapability,
-  LocalModelSnapshot
+  LocalModelSnapshot,
+  OcrLanguage
 } from '../shared/local-models'
 import type {
   InitializeLocalePreferenceRequest,
@@ -56,6 +57,8 @@ import type {
   ReviewRunRequest,
   ReviewRunResult,
   ReviewSessionRequest,
+  ReviewLogRequest,
+  ReviewerLogEntry,
   ReviewWithChecks
 } from '../shared/reviewer'
 import type { SessionPersistenceFlushResponse } from '../shared/session-persistence-flush'
@@ -289,6 +292,11 @@ const reviewerCommands = Object.freeze({
     readonly [request: ReviewSessionRequest],
     ReviewWithChecks[]
   >('reviewer:get-for-session'),
+  getReviewLog: defineApplicationCommand<
+    'reviewer:get-review-log',
+    readonly [request: ReviewLogRequest],
+    ReviewerLogEntry[]
+  >('reviewer:get-review-log'),
   run: defineApplicationCommand<
     'reviewer:run',
     readonly [request: ReviewRunRequest],
@@ -384,7 +392,17 @@ const updateCommands = Object.freeze({
   ),
   getStatus: defineApplicationCommand<'update:get-status', readonly [], UpdateStatus>(
     'update:get-status'
-  )
+  ),
+  getInstaller: defineApplicationCommand<
+    'update:get-installer',
+    readonly [],
+    import('../shared/update').UpdateInstaller | null
+  >('update:get-installer'),
+  revealInstaller: defineApplicationCommand<
+    'update:reveal-installer',
+    readonly [],
+    import('../shared/update').UpdateInstallerRevealResult
+  >('update:reveal-installer')
 })
 
 const pdfStructureCommands = {
@@ -434,7 +452,12 @@ const localModelCommands = Object.freeze({
     'local-models:remove',
     readonly [capability?: LocalModelCapability],
     LocalModelSnapshot
-  >('local-models:remove')
+  >('local-models:remove'),
+  setOcrLanguages: defineApplicationCommand<
+    'local-models:set-ocr-languages',
+    readonly [languages: readonly OcrLanguage[]],
+    LocalModelSnapshot
+  >('local-models:set-ocr-languages')
 })
 
 const backgroundResultCommands = Object.freeze({
@@ -579,7 +602,10 @@ type HostApplicationCommandDependencies = Readonly<{
     | 'revoke'
     | 'revokeBrowsers'
   >
-  reviewer: Pick<ReviewerCommandOwner, 'run' | 'getForSession' | 'abort' | 'abortFixLoop'>
+  reviewer: Pick<
+    ReviewerCommandOwner,
+    'run' | 'getForSession' | 'getReviewLog' | 'abort' | 'abortFixLoop'
+  >
   storage: Readonly<{
     acceptMissingDataRoot: () => Promise<void>
     acknowledgeDataRootHandoffFlush: (
@@ -776,6 +802,7 @@ const registerHostApplicationCommands = (
       'reviewer:abort': ({ args }) => dependencies.reviewer.abort(args[0]),
       'reviewer:abort-fix-loop': ({ args }) => dependencies.reviewer.abortFixLoop(args[0]),
       'reviewer:get-for-session': ({ args }) => dependencies.reviewer.getForSession(args[0]),
+      'reviewer:get-review-log': ({ args }) => dependencies.reviewer.getReviewLog(args[0]),
       'reviewer:run': ({ args }) => dependencies.reviewer.run(args[0])
     })
     scope.registerGroup(hostApplicationCommandGroups[7], {
@@ -851,7 +878,15 @@ const registerHostApplicationCommands = (
       'update:download': ({ args, callerContext }) =>
         localCommand(callerContext, 'update:download', () => dependencies.update.download(args[0])),
       'update:get-app-info': () => dependencies.update.getAppInfo(),
-      'update:get-status': () => dependencies.update.getStatus()
+      'update:get-status': () => dependencies.update.getStatus(),
+      'update:get-installer': ({ callerContext }) =>
+        localCommand(callerContext, 'update:get-installer', () =>
+          dependencies.update.getInstaller()
+        ),
+      'update:reveal-installer': ({ callerContext }) =>
+        localCommand(callerContext, 'update:reveal-installer', () =>
+          dependencies.update.revealInstaller()
+        )
     })
     scope.registerGroup(hostApplicationCommandGroups[9], {
       'local-models:get-snapshot': ({ callerContext, args }) =>
@@ -869,6 +904,10 @@ const registerHostApplicationCommands = (
       'local-models:remove': ({ callerContext, args }) =>
         localCommand(callerContext, 'local-models:remove', () =>
           dependencies.localModels.remove(args[0])
+        ),
+      'local-models:set-ocr-languages': ({ callerContext, args }) =>
+        localCommand(callerContext, 'local-models:set-ocr-languages', () =>
+          dependencies.localModels.setOcrLanguages(args[0])
         )
     })
     scope.registerGroup(hostApplicationCommandGroups[10], {

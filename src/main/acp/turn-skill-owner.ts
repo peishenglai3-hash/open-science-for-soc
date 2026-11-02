@@ -1,12 +1,12 @@
-import { createLogger } from '@aipoch/diagnostics/node'
+import { createLogger, diagnosticErrorFields } from '@aipoch/diagnostics/node'
 import type { EffectiveSpecialistSkills } from '@aipoch/specialists'
 import { join } from 'node:path'
 import type { AgentFrameworkId } from '../../shared/settings'
 import type { ResolvedAgentBackend } from '../agent-framework'
 import type {
-  ResponsesBridgeSkillCandidate,
-  ResponsesBridgeSkillInput
-} from '../settings/responses-bridge-contract'
+  ResponsesSkillCandidate,
+  ResponsesSkillInput
+} from '../settings/responses-transport-contract'
 import {
   loadSkillDocumentContent,
   OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION
@@ -16,6 +16,13 @@ import { AcpSessionPresentationPolicy } from './session-presentation-policy'
 
 const log = createLogger('acp-turn-skill-owner')
 const presentation = new AcpSessionPresentationPolicy()
+
+// Diagnostic metadata only: never grants authority or carries Specialist configuration.
+type AcpSpecialistResolutionContext = Readonly<{
+  sessionId: string
+  frameworkId: string
+  modelRoute?: string
+}>
 type AcpTurnSkillHooks = Readonly<{
   preparedSkillIds?: readonly string[]
   needForceLoad: (ids: string[]) => Promise<string[]>
@@ -23,9 +30,15 @@ type AcpTurnSkillHooks = Readonly<{
   descriptorsForIds?: (
     ids: string[],
     codexHome: string | undefined
-  ) => Promise<ResponsesBridgeSkillInput[]>
-  catalogForCodexHome?: (codexHome: string | undefined) => Promise<ResponsesBridgeSkillCandidate[]>
-  catalogForCodeBuddyRoot?: (root: string | undefined) => Promise<ResponsesBridgeSkillCandidate[]>
+  ) => Promise<ResponsesSkillInput[]>
+  catalogForCodexHome?: (
+    codexHome: string | undefined,
+    allowedNames?: readonly string[]
+  ) => Promise<ResponsesSkillCandidate[]>
+  catalogForCodeBuddyRoot?: (
+    root: string | undefined,
+    allowedNames?: readonly string[]
+  ) => Promise<ResponsesSkillCandidate[]>
 }>
 type TurnSkillOutcome = 'completed' | 'failed' | 'cancelled' | 'reload-restored'
 type ProviderPreparationInput = Readonly<{
@@ -35,27 +48,27 @@ type ProviderPreparationInput = Readonly<{
   codex?: Readonly<{
     home?: string
     bridgeSkillsAvailable: boolean
-    selectSkills: NonNullable<ResolvedAgentBackend['responsesBridgeLease']>['selectSkills']
+    selectSkills: NonNullable<ResolvedAgentBackend['responsesTransportLease']>['selectSkills']
     signal?: AbortSignal
     observeUsage?: Parameters<
-      NonNullable<ResolvedAgentBackend['responsesBridgeLease']>['selectSkills']
+      NonNullable<ResolvedAgentBackend['responsesTransportLease']>['selectSkills']
     >[3]
   }>
   codebuddy?: Readonly<{
     root?: string
     selectorAvailable: boolean
-    selectSkills: NonNullable<ResolvedAgentBackend['responsesBridgeLease']>['selectSkills']
+    selectSkills: NonNullable<ResolvedAgentBackend['responsesTransportLease']>['selectSkills']
     signal?: AbortSignal
     observeUsage?: Parameters<
-      NonNullable<ResolvedAgentBackend['responsesBridgeLease']>['selectSkills']
+      NonNullable<ResolvedAgentBackend['responsesTransportLease']>['selectSkills']
     >[3]
   }>
 }>
 type ProviderPreparation = Readonly<{
   text: string
   skillScopeGuidance?: string
-  codexSkillInputs: readonly ResponsesBridgeSkillInput[]
-  skillActivityInputs?: readonly ResponsesBridgeSkillInput[]
+  codexSkillInputs: readonly ResponsesSkillInput[]
+  skillActivityInputs?: readonly ResponsesSkillInput[]
   skillRuntimeAllowlist?: readonly string[]
 }>
 type LoadedCodeBuddySkill = Readonly<{
@@ -88,12 +101,19 @@ class AcpTurnSkillOwner {
   private forced: Authorization | undefined
   constructor(
     private readonly options: Readonly<{
-      resolveSpecialistSkills?: (id: string) => Promise<EffectiveSpecialistSkills>
+      resolveSpecialistSkills?: (
+        id: string,
+        context?: AcpSpecialistResolutionContext
+      ) => Promise<EffectiveSpecialistSkills>
       skills?: AcpTurnSkillHooks
       requestSkillsReload: () => void
     }>
   ) {}
   authorize(input: {
+    diagnosticContext?: AcpSpecialistResolutionContext
+    frameworkId?: AgentFrameworkId
+    nativeSkillScope?: readonly string[]
+    mainSkillScope?: readonly string[]
     role?: SessionCapabilityPolicy['role']
     specialistId?: string
     selectedSkillIds?: readonly string[]
@@ -115,7 +135,12 @@ class AcpTurnSkillOwner {
         }
       }
       const runtimeSkillIds = [
-        ...new Set([...selected, ...(scope?.kind === 'specialist' ? scope.skillIds : [])])
+        ...new Set([
+          ...selected,
+          ...(scope?.kind === 'specialist'
+            ? [...scope.skillIds, ...scope.frameworkNames.filter((name) => name.startsWith('mcp-'))]
+            : [])
+        ])
       ]
       const create = (disabled: string[]): TurnSkillHandle => {
         if (scope?.kind === 'main') {
@@ -125,7 +150,17 @@ class AcpTurnSkillOwner {
           }
         }
         disabled = disabled.filter((id) => !this.options.skills?.preparedSkillIds?.includes(id))
-        const needsReload = disabled.length > 0 && !input.signal?.aborted
+        // Connector definitions are already prepared independently of Main's authorization.
+        if (scope?.kind === 'specialist') disabled = disabled.filter((id) => !id.startsWith('mcp-'))
+        const requested = scope?.kind === 'specialist' ? scope.frameworkNames : input.mainSkillScope
+        const native = new Set(input.nativeSkillScope)
+        const target = new Set(requested)
+        const scopeChanged =
+          input.frameworkId === 'opencode' &&
+          input.nativeSkillScope !== undefined &&
+          requested !== undefined &&
+          (native.size !== target.size || [...target].some((name) => !native.has(name)))
+        const needsReload = (disabled.length > 0 || scopeChanged) && !input.signal?.aborted
         const state: Authorization = {
           selectedSkillIds: selected,
           forcedSkillIds: Object.freeze([...disabled]),
@@ -150,21 +185,38 @@ class AcpTurnSkillOwner {
     if (!input.specialistId) return finish({ kind: 'main' })
     if (!this.options.resolveSpecialistSkills) return finish()
     return this.options
-      .resolveSpecialistSkills(input.specialistId)
-      .catch(
-        () => ({ kind: 'unavailable', reason: 'The bound specialist is unavailable.' }) as const
-      )
+      .resolveSpecialistSkills(input.specialistId, input.diagnosticContext)
+      .catch((error) => {
+        log.warn('bound specialist capability resolution failed', {
+          ...input.diagnosticContext,
+          operation: 'specialist-resolution',
+          phase: 'skills',
+          mode: 'authorize',
+          specialistId: input.specialistId,
+          frameworkId: input.frameworkId,
+          reason: 'resolver-threw',
+          ...diagnosticErrorFields(error)
+        })
+        return { kind: 'unavailable', reason: 'The bound specialist is unavailable.' } as const
+      })
       .then(finish)
   }
-  backendPreparation(): Readonly<{ forcedSkillIds: readonly string[] }> {
+  backendPreparation(): Readonly<{
+    forcedSkillIds: readonly string[]
+    skillWhitelist?: readonly string[]
+  }> {
     return Object.freeze({
-      forcedSkillIds: Object.freeze([...(this.forced?.forcedSkillIds ?? [])])
+      forcedSkillIds: Object.freeze([...(this.forced?.forcedSkillIds ?? [])]),
+      ...(this.forced?.scope?.kind === 'specialist'
+        ? { skillWhitelist: Object.freeze([...this.forced.scope.frameworkNames]) }
+        : {})
     })
   }
   // Mid-turn inject must not force-load disabled Skills: that reconnects the session. Main still
   // checks enablement here so a stale or forged chip cannot bypass its current Skill scope.
   // Prefix names / attach Codex skill-inputs on the steered prompt instead.
   async presentFollowUp(input: {
+    diagnosticContext?: AcpSpecialistResolutionContext
     frameworkId: AgentFrameworkId
     text: string
     selectedSkillIds: readonly string[]
@@ -182,8 +234,21 @@ class AcpTurnSkillOwner {
       role !== 'primary' ? undefined : input.specialistId ? undefined : { kind: 'main' }
     if (role === 'primary' && input.specialistId && this.options.resolveSpecialistSkills) {
       try {
-        scope = await this.options.resolveSpecialistSkills(input.specialistId)
-      } catch {
+        scope = await this.options.resolveSpecialistSkills(
+          input.specialistId,
+          input.diagnosticContext
+        )
+      } catch (error) {
+        log.warn('bound specialist capability resolution failed', {
+          ...input.diagnosticContext,
+          operation: 'specialist-resolution',
+          phase: 'skills',
+          mode: 'follow-up',
+          specialistId: input.specialistId,
+          frameworkId: input.frameworkId,
+          reason: 'resolver-threw',
+          ...diagnosticErrorFields(error)
+        })
         throw new Error('The bound specialist is unavailable.')
       }
       if (scope.kind === 'unavailable') throw new Error(scope.reason)
@@ -232,7 +297,7 @@ class AcpTurnSkillOwner {
     state.outcome = outcome
     if (this.forced !== state) return
     this.forced = undefined
-    if (reload) this.options.requestSkillsReload()
+    if (reload && (state.forcedSkillIds?.length ?? 0) > 0) this.options.requestSkillsReload()
   }
   private async prepareProvider(
     state: Authorization,
@@ -357,9 +422,12 @@ class AcpTurnSkillOwner {
     if (!codebuddy?.selectorAvailable || !this.options.skills?.catalogForCodeBuddyRoot) {
       return []
     }
-    let catalog: ResponsesBridgeSkillCandidate[]
+    let catalog: ResponsesSkillCandidate[]
     try {
-      catalog = await this.options.skills.catalogForCodeBuddyRoot(codebuddy.root)
+      catalog = await this.options.skills.catalogForCodeBuddyRoot(
+        codebuddy.root,
+        state.scope?.kind === 'specialist' ? state.scope.frameworkNames : undefined
+      )
     } catch {
       return this.selectionFailed('catalog-error', 'CodeBuddy')
     }
@@ -399,7 +467,7 @@ class AcpTurnSkillOwner {
   private async resolveCodexInputs(
     state: Authorization,
     input: ProviderPreparationInput
-  ): Promise<ResponsesBridgeSkillInput[]> {
+  ): Promise<ResponsesSkillInput[]> {
     if (input.frameworkId !== 'codex') return []
     if (state.selectedSkillIds.length > 0) {
       return (
@@ -409,9 +477,12 @@ class AcpTurnSkillOwner {
     }
     const codex = input.codex
     if (!codex?.bridgeSkillsAvailable || !this.options.skills?.catalogForCodexHome) return []
-    let catalog: ResponsesBridgeSkillCandidate[]
+    let catalog: ResponsesSkillCandidate[]
     try {
-      catalog = await this.options.skills.catalogForCodexHome(codex.home)
+      catalog = await this.options.skills.catalogForCodexHome(
+        codex.home,
+        state.scope?.kind === 'specialist' ? state.scope.frameworkNames : undefined
+      )
     } catch {
       return this.selectionFailed('catalog-error', 'Codex')
     }
@@ -449,4 +520,4 @@ const followUpPromptText = (presented: { text: string; skillScopeGuidance?: stri
     : presented.text
 
 export { AcpTurnSkillOwner, codeBuddySkillRuntimeRoot, followUpPromptText }
-export type { AcpTurnSkillHooks, TurnSkillHandle, TurnSkillOutcome }
+export type { AcpSpecialistResolutionContext, AcpTurnSkillHooks, TurnSkillHandle, TurnSkillOutcome }

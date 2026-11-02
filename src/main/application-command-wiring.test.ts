@@ -98,14 +98,14 @@ describe('production application command wiring', () => {
   it('constructs Session package desktop once with shared owners and retains lifecycle bindings', () => {
     const source = domainCompact('session-packages')
     expect(source).toContain(
-      'const sessionPackageDesktop = createSessionPackageDesktop({ sessionPackageService, translate, archiveCoordinator, sessionPersistenceCoordinator, applicationEvents, projectRepository, sessionRepository, isPackageHandoffHeld: () => packageHandoffHeld.current, onSensitiveContentFailure: rememberSensitiveContentFailure })'
+      'const sessionPackageDesktop = createSessionPackageDesktop({ sessionPackageService, translate, archiveCoordinator, sessionPersistenceCoordinator, applicationEvents, projectRepository, sessionRepository, isPackageHandoffHeld: () => packageHandoffHeld.current, cancelBrowserTransfer: (id) => browserPackageImport.cancel(id), onSensitiveContentFailure: rememberSensitiveContentFailure })'
     )
     expect(occurrences(source, 'createSessionPackageDesktop(')).toBe(1)
     expect(source).toContain(
-      'sessionPackageDesktopLifecycle.isActive = () => sessionPackageDesktop.operations.active'
+      'sessionPackageDesktopLifecycle.isActive = () => browserPackageImport.active || sessionPackageDesktop.operations.active'
     )
     expect(source).toContain(
-      'sessionPackageDesktopLifecycle.close = async () => { await sessionPackageDesktop.close() }'
+      'sessionPackageDesktopLifecycle.close = async () => { browserPackageImport.stop() await sessionPackageDesktop.close() await browserPackageImport.close() }'
     )
     expect(source).toContain(
       'await Promise.all([service.close(), sessionPackageDesktopLifecycle.close()])'
@@ -457,11 +457,12 @@ describe('production application command wiring', () => {
     const returnedViews = compact(
       between(ipcSource, '    applicationCommands: {', '    applicationEvents,')
     )
+    expect(returnedViews).toContain('beginStopping: applicationCommandComposition.beginStopping')
     expect(returnedViews).toContain('localWeb: applicationCommandComposition.localWeb')
     expect(returnedViews).toContain('remoteWeb: applicationCommandComposition.remoteWeb')
     expect(returnedViews).toContain('task: applicationCommandComposition.task')
     expect(returnedViews).toContain('desktop: applicationCommandComposition.desktop')
-    expect(occurrences(returnedViews, 'applicationCommandComposition.')).toBe(4)
+    expect(occurrences(returnedViews, 'applicationCommandComposition.')).toBe(5)
   })
 
   it('shares one Electron page preview resolver with the production Reviewer owner', () => {
@@ -513,7 +514,7 @@ describe('production application command wiring', () => {
     expect(notificationIpcSource).toContain('owner.markSessionCompletionsRead(')
   })
 
-  it('adds transport adapters after composition and disposes the router before its owners', () => {
+  it('adds transport adapters after composition and disposes the router before backend teardown', () => {
     const backendModule = ipcSource.indexOf('await composeBackendLifecycle({')
     const commandModule = ipcSource.indexOf('await registerApplicationCommandComposition({')
     expect(backendModule).toBeGreaterThan(-1)
@@ -530,6 +531,16 @@ describe('production application command wiring', () => {
     expect(install).toBeGreaterThan(build)
     expect(ownAdapter).toBeGreaterThan(install)
     expect(runtimeSource).toContain("await modules.dispose('rollback')")
+  })
+
+  it('cancels journal writes before draining commands and Compute during reverse disposal', () => {
+    const journalModule = ipcSource.indexOf('await modules.add(researchCatalog.journalAttributes')
+    const commandModule = ipcSource.indexOf('await registerApplicationCommandComposition({')
+    const computeModule = ipcSource.indexOf('await composeComputeRecovery({')
+    expect(computeModule).toBeGreaterThan(-1)
+    expect(commandModule).toBeGreaterThan(computeModule)
+    expect(journalModule).toBeGreaterThan(commandModule)
+    expect(occurrences(ipcSource, "name: 'literature-journal-attributes'")).toBe(1)
   })
 
   it('exposes startup network commands before attaching the desktop transport', () => {
@@ -702,7 +713,11 @@ vi.mock('./composition/session-surfaces', () => ({
   composeSessionSurfaces: vi.fn(() => rootFixture.owners)
 }))
 vi.mock('./composition/settings-bootstrap', () => ({
-  composeSettingsBootstrap: vi.fn(() => rootFixture.owners)
+  composeSettingsBootstrap: vi.fn((options) => {
+    // Startup certification can ask permission questions before the agent runtime is constructed.
+    expect(options.getRuntimeRef().current).toBeUndefined()
+    return rootFixture.owners
+  })
 }))
 vi.mock('./composition/settings-effects', () => ({
   composeSettingsEffects: vi.fn(() => rootFixture.owners)
@@ -768,6 +783,7 @@ it('connects committed deletion to the same credential broker used by approval s
     },
     settingsSnapshotCommits: { currentSnapshotAfter },
     specialistService: { resolveRunnableByReference: resolveSpecialist },
+    browserPackageImport: { active: false },
     sessionPackageDesktop: {
       reportOpenOverflow: vi.fn(),
       enqueueFile: vi.fn(),
@@ -872,6 +888,11 @@ it('connects committed deletion to the same credential broker used by approval s
   expect(owners.sessionPackageDesktop.reportOpenOverflow).toHaveBeenCalledOnce()
   expect(owners.sessionPackageDesktop.enqueueFile).toHaveBeenCalledWith('/session.osci')
   expect(result.hasActivePackageTransfer()).toBe(true)
+  owners.sessionPackageDesktop.hasActiveTransfer.mockReturnValue(false)
+  owners.browserPackageImport.active = true
+  expect(result.hasActivePackageTransfer()).toBe(true)
+  owners.browserPackageImport.active = false
+  expect(result.hasActivePackageTransfer()).toBe(false)
   expect(result.hasActiveReviewerWork()).toBe(true)
   expect(result.getActiveSettingsInstallId()).toBe('install')
   result.holdSettingsInstallAdmission()

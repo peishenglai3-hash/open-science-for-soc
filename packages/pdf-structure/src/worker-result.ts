@@ -8,6 +8,7 @@ import {
   checkPdfStructureDecodingBudget,
   pdfTextRunsSchema,
   pdfTableSourceItemsSchema,
+  pdfNativeBodySchema,
   pdfTableSourceSegmentSchema
 } from './result.js'
 import {
@@ -40,12 +41,14 @@ const candidate = z.object({
   region: rect.optional(),
   thumbnail: z.string().optional(),
   caption,
-  issue: z.string().optional()
+  issue: z.string().optional(),
+  nativeBody: pdfNativeBodySchema.optional()
 })
 const rawNote = z.object({ text: z.string(), rect, page: z.number().int().positive().optional() })
 const rawTableData = z.object({
   sourceViewport: z.object({ width: z.number().positive(), height: z.number().positive() }),
   grid: z.array(z.array(z.string()).max(128)).max(256),
+  unreliableMathSourceItems: pdfTableSourceItemsSchema.optional(),
   cells: z
     .array(
       z.object({
@@ -121,7 +124,12 @@ function fitSourceMetadataBudget(input: unknown): unknown {
   } catch {
     const withoutOrigins: unknown = JSON.parse(
       JSON.stringify(input, (key, value) =>
-        key === 'sourceItems' || key === 'sourceSegments' ? undefined : value
+        key === 'sourceItems' ||
+        key === 'sourceSegments' ||
+        key === 'nativeBody' ||
+        key === 'unreliableMathSourceItems'
+          ? undefined
+          : value
       )
     )
     check(withoutOrigins)
@@ -248,6 +256,7 @@ export const readWorkerResult = async (
         regions: [region(item.page, item.region)],
         thumbnailId: item.id,
         ...('sourceItems' in item && item.sourceItems ? { sourceItems: item.sourceItems } : {}),
+        ...(item.nativeBody ? { nativeBody: item.nativeBody } : {}),
         ...(item.caption
           ? {
               caption: {
@@ -274,6 +283,9 @@ export const readWorkerResult = async (
         return {
           rowCount: data.grid.length,
           columnCount: data.grid[0].length,
+          ...(data.unreliableMathSourceItems
+            ? { unreliableMathSourceItems: data.unreliableMathSourceItems }
+            : {}),
           cells: data.cells.map((cell) => ({
             row: cell.row,
             column: cell.column,
@@ -326,9 +338,8 @@ export const readWorkerResult = async (
           table: convertTable(part)
         }))
         element.tableNotes = item.notes?.map(convertNote)
-        element.issues = element.tableParts.flatMap((part) =>
-          part.table.issues.map((issue) => ({ ...issue }))
-        )
+        // Each part owns its uncertainty. Copying it to the parent would turn
+        // a local conflict into a group-wide veto in downstream readers.
       } else if ('cells' in item) {
         element.issues = item.issues.map((code) => ({ code, detail: code }))
         if (item.captionIssue)

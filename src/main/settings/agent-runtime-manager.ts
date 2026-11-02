@@ -1,6 +1,8 @@
+import { installManagedPi, uninstallManagedPi } from './managed-pi'
 import { nodeRuntimeEnvironment } from '../node-process-host'
+import { resolveClaudeExecutableForSpawn } from '../acp/claude-executable'
 import { execFile } from 'node:child_process'
-import { constants } from 'node:fs'
+import { constants, existsSync } from 'node:fs'
 import { access, mkdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { createServer } from 'node:net'
@@ -18,6 +20,7 @@ import type {
   EnvironmentCheckResult,
   InstallClaudeRequest,
   InstallCodeBuddyRequest,
+  InstallPiRequest,
   InstallCodexRequest,
   InstallOpencodeRequest,
   ReadinessPreflight,
@@ -35,8 +38,8 @@ import {
   isSupportedCodexAcpVersion,
   MINIMUM_CODEX_ACP_VERSION
 } from '../../shared/codex-runtime'
-import { isModelBridgeSupported } from '../../shared/provider-registry'
-import { CLAUDE_EXECUTABLE_MISSING_MESSAGE } from '../../shared/run-error-classification'
+import { isModelBridgeSupported } from '../../shared/provider-bridge-policy'
+import { CLAUDE_EXECUTABLE_MISSING_MESSAGE } from '../../shared/failure/messages'
 import { buildAgentSpawnEnv } from '../acp/agent-process'
 import {
   DEFAULT_AGENT_FRAMEWORK_ID,
@@ -50,7 +53,9 @@ import {
   syncMaterializedCustomServerSkillDocs
 } from '../connectors/provision'
 import { createLogger } from '@aipoch/diagnostics/node'
-import type { SkillDirectoryLayout } from '@aipoch/skills/projection'
+import { OS_SKILL_PREFIX, type SkillDirectoryLayout } from '@aipoch/skills/projection'
+import { isSkillEffectivelyEnabled } from '@aipoch/skills/document'
+import { ALL_CONNECTOR_IDS } from '../connectors/registry'
 import { writeAgentConfigFiles } from './agent-config-files'
 import { createDefaultDetectDeps, detectClaude, type ClaudeDetectDeps } from './claude-detect'
 import {
@@ -70,6 +75,13 @@ import {
   runAcpInitializeSmoke,
   type CodexDetectDeps
 } from './codex-detect'
+import {
+  isPiAdapterAvailable,
+  isPiRuntimeReady,
+  piAdapterPath,
+  managedPiRoot,
+  resolvePiExecutable as resolveManagedPiExecutable
+} from '../agent-framework/pi-runtime'
 import { detectNpmAvailable, runInstallWithFallback, type InstallTarget } from './claude-install'
 import { OPENCODE_INSTALL_TARGET } from './opencode-install'
 import { SettingsInstallCoordinator } from './settings-install-coordinator'
@@ -141,14 +153,18 @@ export type ExecuteClaudeProbe = (
 ) => Promise<void>
 
 const executeClaudeProbe: ExecuteClaudeProbe = async (executablePath, env, runtimeArgs = []) => {
-  await execFileAsync(executablePath, [...runtimeArgs, '-p', 'ok'], {
-    env,
-    timeout: CLAUDE_PROBE_TIMEOUT_MS,
-    // On Windows the detected claude is a `claude.cmd` shim, which execFile cannot launch without a
-    // shell. Keep the probe on the same platform-specific path as the pre-extraction implementation.
-    shell: process.platform === 'win32',
-    windowsHide: true
-  })
+  const resolvedPath = resolveClaudeExecutableForSpawn(executablePath)
+  const isScript = /\.(js|mjs)$/i.test(resolvedPath)
+  // Match the auth controllers: resolve npm shims and preserve argument boundaries without a shell.
+  await execFileAsync(
+    isScript ? process.execPath : resolvedPath,
+    [...(isScript ? [resolvedPath] : []), ...runtimeArgs, '-p', 'ok'],
+    {
+      env: isScript ? { ...env, ...nodeRuntimeEnvironment() } : env,
+      timeout: CLAUDE_PROBE_TIMEOUT_MS,
+      windowsHide: true
+    }
+  )
 }
 
 const runCodexAdapterVersion = async (
@@ -463,6 +479,12 @@ export class AgentRuntimeManager {
         this.storeReusableRuntimeProbe('environmentCheckRuntimeProbe', runtimeProbe)
 
       const agentFrameworkId = settings.agentFrameworkId ?? DEFAULT_AGENT_FRAMEWORK_ID
+      // Settings needs a cheap availability signal to show the managed Pi card for every framework.
+      // Spawn the ACP smoke process only when Pi is selected; checkEnvironment owns the same probe.
+      const piReady =
+        agentFrameworkId === 'pi'
+          ? await isPiRuntimeReady({ configRoot: this.configRoot })
+          : isPiAdapterAvailable({ configRoot: this.configRoot })
       const framework = getAgentFramework(agentFrameworkId)
       const activeProvider = settings.activeProviderId
         ? settings.providers.find((provider) => provider.id === settings.activeProviderId)
@@ -493,7 +515,7 @@ export class AgentRuntimeManager {
               activeProvider.type === 'xai-subscription'
                 ? (['responses'] as const)
                 : framework.id === 'codex'
-                  ? (['anthropic', 'openai', 'responses'] as const)
+                  ? (['messages', 'chat-completions', 'responses'] as const)
                   : requiresChatCompletionsBridge({ apiEndpoints: activeEndpoints }, framework)
                     ? (activeEndpoints ?? [])
                     : framework.supportedApiTypes
@@ -508,6 +530,10 @@ export class AgentRuntimeManager {
         opencodePathExists: runtimeProbe.opencodeVersion !== null,
         codebuddyPathExists: isSupportedCodeBuddyVersion(runtimeProbe.codebuddyVersion),
         codexPathExists: codexVersionsFromProbe(runtimeProbe.codex) !== undefined,
+        piRuntimeReady: piReady,
+        ...(existsSync(managedPiRoot(this.configRoot))
+          ? { piRuntimePath: piAdapterPath({ configRoot: this.configRoot }) }
+          : {}),
         agentFrameworkId,
         isProviderKeyUsable: (provider) =>
           provider.id === activeProvider?.id && activeProviderKeyUsable,
@@ -518,24 +544,34 @@ export class AgentRuntimeManager {
     })
   }
 
+  async resolvePiExecutable(): Promise<string> {
+    return resolveManagedPiExecutable({ configRoot: this.configRoot })
+  }
+
   async checkEnvironment(): Promise<EnvironmentCheckResult> {
     return this.trackDetection(async (signal) => {
       const settings = await this.repository.getSettings()
       signal.throwIfAborted()
       const agentFrameworkId = settings.agentFrameworkId ?? DEFAULT_AGENT_FRAMEWORK_ID
       const runtimeProbe = this.takeReusableRuntimeProbe('environmentCheckRuntimeProbe', settings)
-      const [claudeRuntime, opencodeRuntime, codebuddyRuntime, codexRuntime] = await Promise.all([
-        this.trackDetection(() =>
-          this.resolveClaudeRuntime(settings, runtimeProbe?.claudeVersion, signal)
-        ),
-        this.trackDetection(() =>
-          this.resolveOpencodeRuntime(settings, runtimeProbe?.opencodeVersion, signal)
-        ),
-        this.trackDetection(() =>
-          this.resolveCodeBuddyRuntime(settings, runtimeProbe?.codebuddyVersion, signal)
-        ),
-        this.trackDetection(() => this.resolveCodexRuntime(settings, runtimeProbe?.codex, signal))
-      ])
+      const [claudeRuntime, opencodeRuntime, codebuddyRuntime, codexRuntime, piReady] =
+        await Promise.all([
+          this.trackDetection(() =>
+            this.resolveClaudeRuntime(settings, runtimeProbe?.claudeVersion, signal)
+          ),
+          this.trackDetection(() =>
+            this.resolveOpencodeRuntime(settings, runtimeProbe?.opencodeVersion, signal)
+          ),
+          this.trackDetection(() =>
+            this.resolveCodeBuddyRuntime(settings, runtimeProbe?.codebuddyVersion, signal)
+          ),
+          this.trackDetection(() =>
+            this.resolveCodexRuntime(settings, runtimeProbe?.codex, signal)
+          ),
+          agentFrameworkId === 'pi'
+            ? isPiRuntimeReady({ configRoot: this.configRoot })
+            : Promise.resolve(false)
+        ])
 
       signal.throwIfAborted()
       this.storeResolvedRuntimeProbe(
@@ -569,7 +605,22 @@ export class AgentRuntimeManager {
             id: 'codebuddy',
             label: getAgentFramework('codebuddy').displayName,
             runtime: codebuddyRuntime
-          }
+          },
+          ...(agentFrameworkId === 'pi'
+            ? [
+                {
+                  id: 'pi' as const,
+                  label: getAgentFramework('pi').displayName,
+                  runtime: piReady
+                    ? {
+                        found: true,
+                        path: piAdapterPath({ configRoot: this.configRoot }),
+                        version: '0.1.8'
+                      }
+                    : { found: false }
+                }
+              ]
+            : [])
         ],
         encryptionAvailable: isEncryptionAvailable(),
         credentialStore: getCredentialStore()
@@ -801,6 +852,27 @@ export class AgentRuntimeManager {
     })
   }
 
+  async installPi(
+    _request: InstallPiRequest,
+    onEvent: (event: ClaudeInstallEvent) => void
+  ): Promise<ClaudeInstallResult> {
+    const installId = `install-pi-${Date.now()}-${this.allocateSettingsIdSequence()}`
+    return this.runExclusiveInstall(installId, (signal) =>
+      installManagedPi({ configRoot: this.configRoot, installId, onEvent, signal })
+    )
+  }
+
+  async uninstallPi(): Promise<RuntimeUninstallResult> {
+    const settings = await this.repository.getSettings()
+    const result = await this.runExclusiveInstall(`uninstall-pi-${Date.now()}`, async () => {
+      await uninstallManagedPi(this.configRoot)
+      await this.autoSwitchAwayFrom('pi')
+      return { installId: 'uninstall-pi', ok: true }
+    })
+    if (!result.ok) throw new Error(result.error)
+    return { activeBackendAffected: settings.agentFrameworkId === 'pi' }
+  }
+
   async installCodeBuddy(
     _request: InstallCodeBuddyRequest,
     onEvent: (event: ClaudeInstallEvent) => void
@@ -985,6 +1057,7 @@ export class AgentRuntimeManager {
   }
 
   isManagedRuntimePath(frameworkId: AgentFrameworkId, path: string): boolean {
+    if (frameworkId === 'pi') return path === piAdapterPath({ configRoot: this.configRoot })
     if (frameworkId === 'claude-code') return isManagedClaudePath(path, this.configRoot)
     if (frameworkId === 'opencode') return isManagedOpencodePath(path, this.configRoot)
     if (frameworkId === 'codebuddy') return isManagedCodeBuddyPath(path, this.configRoot)
@@ -1008,15 +1081,72 @@ export class AgentRuntimeManager {
     settings: StoredSettings,
     configRoot: string,
     forcedSkillIds: ReadonlySet<string>,
-    options: Readonly<{ directoryLayout?: SkillDirectoryLayout }> = {}
+    options: Readonly<{
+      directoryLayout?: SkillDirectoryLayout
+      connectorSkillNames?: readonly string[]
+    }> = {}
   ): Promise<string[]> {
     return this.materializeSkillProjection(
       settings,
       configRoot,
       forcedSkillIds,
-      this.connectors.enabledConnectorIds(settings.connectors),
+      options.connectorSkillNames === undefined
+        ? this.connectors.enabledConnectorIds(settings.connectors)
+        : ALL_CONNECTOR_IDS.filter((id) => options.connectorSkillNames!.includes(`mcp-${id}`)),
       options
     )
+  }
+
+  async prepareAgentSkillDiscovery(
+    settings: StoredSettings,
+    configRoot: string,
+    _forcedSkillIds: ReadonlySet<string>,
+    allowedNames?: readonly string[],
+    options: Readonly<{ directoryLayout?: SkillDirectoryLayout }> = {}
+  ): Promise<{
+    connectorSkillNames: string[]
+    allowedNames: string[]
+    mainAllowedNames: string[]
+    allowedPaths: string[]
+  }> {
+    // A parallel instance must never remove a document another instance is authorized to use.
+    const connectorNames = await this.materializeSkillProjection(
+      { ...settings, disabledSkillIds: [] },
+      configRoot,
+      new Set(),
+      [...ALL_CONNECTOR_IDS],
+      options
+    )
+    const skills = await this.skills.listHostSkills()
+    const disabled = new Set(settings.disabledSkillIds ?? [])
+    const mainConnectorNames = new Set(this.connectors.connectorSkillNames(settings.connectors))
+    const entries = [
+      ...skills.map((skill) => ({
+        name: skill.name,
+        path: join(
+          configRoot,
+          'skills',
+          options.directoryLayout === 'agent-facing' ? skill.name : `${OS_SKILL_PREFIX}${skill.id}`,
+          'SKILL.md'
+        ),
+        enabled: isSkillEffectivelyEnabled(skill, disabled)
+      })),
+      ...connectorNames.map((name) => ({
+        name,
+        path: join(configRoot, 'skills', name, 'SKILL.md'),
+        enabled: mainConnectorNames.has(name)
+      }))
+    ]
+    const admitted = (entry: (typeof entries)[number]): boolean =>
+      allowedNames === undefined ? entry.enabled : allowedNames.includes(entry.name)
+    return {
+      connectorSkillNames: connectorNames.filter((name) =>
+        allowedNames === undefined ? mainConnectorNames.has(name) : allowedNames.includes(name)
+      ),
+      allowedNames: entries.filter(admitted).map(({ name }) => name),
+      mainAllowedNames: entries.filter(({ enabled }) => enabled).map(({ name }) => name),
+      allowedPaths: entries.filter(admitted).map(({ path }) => path)
+    }
   }
 
   private async materializeSkillProjection(
@@ -1055,9 +1185,11 @@ export class AgentRuntimeManager {
     settings: StoredSettings,
     forcedSkillIds: ReadonlySet<string> = new Set(),
     modelConfig?: ClaudeRuntimeModelConfig | null,
-    includeSkillAndConnectorContext = true
-  ): Promise<ClaudeRuntimeAssets> {
-    return provisionClaudeRuntime({
+    includeSkillAndConnectorContext = true,
+    allowedNames?: readonly string[]
+  ): Promise<ClaudeRuntimeAssets & { mainAllowedNames: string[] }> {
+    let mainAllowedNames: string[] = []
+    const assets = await provisionClaudeRuntime({
       storageRoot: this.configRoot,
       provisionPrivateProfile: (privateProfileDir) =>
         provisionAppClaudePrivateProfile(privateProfileDir, modelConfig),
@@ -1067,16 +1199,17 @@ export class AgentRuntimeManager {
           await mkdir(join(claudeProjectConfigRoot, 'skills'), { recursive: true })
           return
         }
-        const connectors = await this.connectors.getConnectors()
-        await this.materializeSkillProjection(
+        const discovery = await this.prepareAgentSkillDiscovery(
           settings,
           claudeProjectConfigRoot,
           forcedSkillIds,
-          this.connectors.enabledConnectorIds(connectors),
+          allowedNames,
           { directoryLayout: 'agent-facing' }
         )
+        mainAllowedNames = discovery.mainAllowedNames
       }
     })
+    return { ...assets, mainAllowedNames }
   }
 
   async resolveClaudeExecutable(storedPath: string | undefined): Promise<string> {
@@ -1105,6 +1238,10 @@ export class AgentRuntimeManager {
       )
     }
     return detected.resolvedPath
+  }
+
+  async probeOpencodeVersion(executablePath: string): Promise<string | undefined> {
+    return this.opencodeDetectDeps.getVersion(executablePath).catch(() => undefined)
   }
 
   async resolveCodeBuddyExecutable(storedPath: string | undefined): Promise<string> {

@@ -1,10 +1,8 @@
+import type { LiteratureProject, LiteratureNavigation } from '../renderer-host'
 import { Button } from '@/components/ui/button'
-import type { useNavigationStore } from '@/stores/navigation-store'
-import { useProjectStore } from '@/stores/project-store'
 import type { LiteratureCollectionView } from '@aipoch/literature-library/contracts'
 import { ExternalLink, Sparkles } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { type PdfImportDestination } from '../imports/LiteraturePdfBatchImportDialog'
 import { LiteratureAddMenu, LiteratureLibraryActionsMenu } from './LiteratureLibraryMenus'
 import { type LibrarySection } from './LiteratureLibrarySidebar'
 import { LiteratureSearchInput } from './LiteratureSearchInput'
@@ -21,13 +19,11 @@ export function LiteratureLibraryHeader({
   startLiteratureReviewConversation,
   setShouldCueLiteratureReview,
   importPdfInputRef,
-  setPdfBatch,
-  projectId,
-  collectionId,
-  beginPdfImport,
+  onImportFiles,
   importRecordsInputRef,
-  previewRecordImport,
   beginManualImport,
+  onImportZotero,
+  beginLinkImport,
   query,
   searchResetRevision,
   setQuery,
@@ -41,27 +37,21 @@ export function LiteratureLibraryHeader({
   exportCurrentScope
 }: {
   selectedCollection: LiteratureCollectionView | undefined
-  selectedProject: ReturnType<typeof useProjectStore.getState>['projects'][number] | undefined
+  selectedProject: LiteratureProject | undefined
   section: LibrarySection
-  openProject: ReturnType<typeof useNavigationStore.getState>['openProject']
+  openProject: LiteratureNavigation['openProject']
   smartSetup: boolean
   showLiteratureReviewAction: boolean
   reviewProjectId: string | undefined
   shouldCueLiteratureReview: boolean
-  startLiteratureReviewConversation: ReturnType<
-    typeof useNavigationStore.getState
-  >['startLiteratureReviewConversation']
+  startLiteratureReviewConversation: LiteratureNavigation['startLiteratureReviewConversation']
   setShouldCueLiteratureReview: React.Dispatch<React.SetStateAction<boolean>>
   importPdfInputRef: React.RefObject<HTMLInputElement | null>
-  setPdfBatch: React.Dispatch<
-    React.SetStateAction<{ files: File[]; destination: PdfImportDestination } | undefined>
-  >
-  projectId: string | undefined
-  collectionId: string | undefined
-  beginPdfImport: (file: File) => void
+  onImportFiles: (files: File[]) => void
   importRecordsInputRef: React.RefObject<HTMLInputElement | null>
-  previewRecordImport: (file: File) => Promise<void>
   beginManualImport: (resetDraft?: boolean) => void
+  onImportZotero: () => void
+  beginLinkImport: (trigger: HTMLButtonElement | null) => void
   query: string
   searchResetRevision: number
   setQuery: React.Dispatch<React.SetStateAction<string>>
@@ -111,7 +101,7 @@ export function LiteratureLibraryHeader({
         </div>
         <p className="mt-1 text-sm text-muted-foreground">
           {section === 'inbox'
-            ? t('Review references found by Agents before they enter your library.')
+            ? t('Review discovered references before they enter your library.')
             : section === 'trash'
               ? t(
                   'Restore references to edit, preview, or export them, or delete them permanently.'
@@ -175,17 +165,7 @@ export function LiteratureLibraryHeader({
               onChange={(event) => {
                 const files = Array.from(event.currentTarget.files ?? [])
                 event.currentTarget.value = ''
-                if (files.length > 1)
-                  setPdfBatch({
-                    files,
-                    destination: {
-                      name:
-                        selectedProject?.name ?? selectedCollection?.name ?? t('All references'),
-                      projectId,
-                      collectionId
-                    }
-                  })
-                else if (files[0]) beginPdfImport(files[0])
+                onImportFiles(files)
               }}
             />
             <input
@@ -197,10 +177,12 @@ export function LiteratureLibraryHeader({
               onChange={(event) => {
                 const file = event.currentTarget.files?.[0]
                 event.currentTarget.value = ''
-                if (file) void previewRecordImport(file)
+                if (file) onImportFiles([file])
               }}
             />
             <LiteratureAddMenu
+              onImportZotero={onImportZotero}
+              onAddLink={beginLinkImport}
               onAddReference={() => beginManualImport(true)}
               onImportPdf={() => importPdfInputRef.current?.click()}
               onImportReferences={() => importRecordsInputRef.current?.click()}

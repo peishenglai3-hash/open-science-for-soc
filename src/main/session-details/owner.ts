@@ -702,6 +702,18 @@ export const createSessionDetailsOwner = (
     retriedAdmissionClaims.add(claimKey)
     let queued: SessionDetailsSession | undefined
     try {
+      // Admission failure is not an inference attempt. Recheck before creating another durable
+      // transition; unchanged unavailability must not rewrite and republish the whole Session.
+      const target = await dependencies.targets
+        .resolve(session)
+        .catch((): ResolvedSessionDetailsTarget => ({ mode: 'unavailable' }))
+      if (target.mode === 'unavailable') {
+        // No admission was attempted. Let a later save recheck availability without spinning
+        // through saves coalesced during this check or consuming the claim's actual retry.
+        retriedAdmissionClaims.delete(claimKey)
+        pendingAdmissionRetries.delete(claimKey)
+        return false
+      }
       queued = await dependencies.sessions.mutateSession(
         session.projectId,
         session.id,
@@ -901,6 +913,14 @@ export const createSessionDetailsOwner = (
           ) {
             throw new SessionDetailsConflictError()
           }
+          const edited = {
+            ...session,
+            ...(titleChanged ? { title: details.title } : {}),
+            ...(descriptionChanged ? { description: details.description } : {})
+          }
+          // Imported generation provenance is recorded research, not local editing authority.
+          // The repository still rejects any research changes, including description edits.
+          if (session.packageOrigin) return { kind: 'write', session: edited }
           const generation = session.sessionDetailsGeneration
           const superseded =
             generation?.status === 'queued' || generation?.status === 'running'
@@ -909,9 +929,7 @@ export const createSessionDetailsOwner = (
           return {
             kind: 'write',
             session: {
-              ...session,
-              ...(titleChanged ? { title: details.title } : {}),
-              ...(descriptionChanged ? { description: details.description } : {}),
+              ...edited,
               sessionDetailsSource: 'manual',
               ...(superseded ? { sessionDetailsGeneration: superseded } : {})
             }

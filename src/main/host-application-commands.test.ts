@@ -103,7 +103,8 @@ const createDependencies = (): HostApplicationCommandDependencies => ({
     getSnapshot: vi.fn(),
     install: vi.fn(),
     cancel: vi.fn(),
-    remove: vi.fn()
+    remove: vi.fn(),
+    setOcrLanguages: vi.fn()
   },
   cli: {
     getStatus: vi.fn(async () => ({
@@ -172,6 +173,7 @@ const createDependencies = (): HostApplicationCommandDependencies => ({
   reviewer: {
     run: vi.fn(async () => ({ started: true })),
     getForSession: vi.fn(async () => []),
+    getReviewLog: vi.fn(async () => []),
     abort: vi.fn(() => undefined),
     abortFixLoop: vi.fn(() => undefined)
   },
@@ -215,6 +217,8 @@ const createDependencies = (): HostApplicationCommandDependencies => ({
     dismissLegacyMovePrompt: vi.fn(async () => undefined)
   },
   update: {
+    getInstaller: vi.fn(async () => null),
+    revealInstaller: vi.fn(async () => 'unavailable' as const),
     getAppInfo: vi.fn(() => ({ name: 'Open-Science', version: '1.0.0', copyright: 'Aipoch' })),
     getStatus: vi.fn(() => updateStatus),
     check: vi.fn(async () => updateStatus),
@@ -250,7 +254,7 @@ const commandByName = (name: string): ApplicationCommand<string, readonly unknow
 }
 
 describe('Host application commands', () => {
-  it('defines the exact 79 desktop request channels in their existing capability groups', () => {
+  it('defines the exact 82 desktop request channels in their existing capability groups', () => {
     const expected = RENDERER_CONTRACT_GROUPS.filter(({ capability }) =>
       HOST_CAPABILITIES.includes(capability as (typeof HOST_CAPABILITIES)[number])
     ).map(({ capability, contracts }) => {
@@ -298,7 +302,7 @@ describe('Host application commands', () => {
       .find(({ capability }) => capability === 'notifications')!
       .channels.push('notifications:get-desktop-availability', 'notifications:send-test')
     for (const group of expected) group.channels.sort()
-    expect(expected.flatMap(({ channels }) => channels)).toHaveLength(79)
+    expect(expected.flatMap(({ channels }) => channels)).toHaveLength(83)
     expect(
       hostApplicationCommandGroups.map(({ name, commands }) => ({
         capability: name,
@@ -314,7 +318,7 @@ describe('Host application commands', () => {
       {} as HostApplicationCommandDependencies
     )
 
-    expect(router.dispatcher.commandNames()).toHaveLength(79)
+    expect(router.dispatcher.commandNames()).toHaveLength(83)
     installation.uninstall()
     expect(router.dispatcher.commandNames()).toEqual([])
   })
@@ -331,6 +335,7 @@ describe('Host application commands', () => {
       origin: 'manual' as const
     }
     const reviewSession = { projectId: 'project-1', appSessionId: 'session-1' }
+    const reviewLog = { ...reviewSession, reviewId: 'review-1' }
     const parent = { parent: '/target' }
     const root = { parent: '/target', markOnboarding: true }
     const flushResponse = { requestId: 'flush-1', status: 'completed' as const }
@@ -435,6 +440,10 @@ describe('Host application commands', () => {
       hostApplicationCommands.reviewer.getForSession,
       invocation([reviewSession])
     )
+    await router.dispatcher.invoke(
+      hostApplicationCommands.reviewer.getReviewLog,
+      invocation([reviewLog])
+    )
     await router.dispatcher.invoke(hostApplicationCommands.reviewer.run, invocation([reviewRun]))
     await router.dispatcher.invoke(
       hostApplicationCommands.storage.acceptMissingDataRoot,
@@ -487,6 +496,8 @@ describe('Host application commands', () => {
     )
     await router.dispatcher.invoke(hostApplicationCommands.update.getAppInfo, invocation([]))
     await router.dispatcher.invoke(hostApplicationCommands.update.getStatus, invocation([]))
+    await router.dispatcher.invoke(hostApplicationCommands.update.getInstaller, invocation([]))
+    await router.dispatcher.invoke(hostApplicationCommands.update.revealInstaller, invocation([]))
     await router.dispatcher.invoke(hostApplicationCommands.update.recheck, invocation([]))
     await router.dispatcher.invoke(hostApplicationCommands.update.recover, invocation([]))
 
@@ -505,8 +516,11 @@ describe('Host application commands', () => {
       hostApplicationCommands.network.checkConnectivity,
       invocation([])
     )
-    for (const command of Object.values(hostApplicationCommands.localModels)) {
-      await router.dispatcher.invoke(command, invocation([]))
+    for (const [name, command] of Object.entries(hostApplicationCommands.localModels)) {
+      await router.dispatcher.invoke(
+        command,
+        invocation(name === 'setOcrLanguages' ? [['eng']] : [])
+      )
     }
     await router.dispatcher.invoke(
       hostApplicationCommands.backgroundResults.sessionActivity,
@@ -522,6 +536,7 @@ describe('Host application commands', () => {
     expect(dependencies.backgroundResults.projectActivity).toHaveBeenCalledWith({
       projectId: 'project'
     })
+    expect(dependencies.localModels.setOcrLanguages).toHaveBeenCalledWith(['eng'])
     expect(dependencies.localFs.listDir).toHaveBeenCalledWith('/data')
     expect(dependencies.localFs.readPreview).toHaveBeenCalledWith(previewRequest)
     expect(dependencies.notifications.takePendingOpenSession).toHaveBeenCalledWith(7)
@@ -542,6 +557,7 @@ describe('Host application commands', () => {
     expect(dependencies.remoteAccess.setMode).toHaveBeenCalledWith('remoteit')
     expect(dependencies.reviewer.run).toHaveBeenCalledWith(reviewRun)
     expect(dependencies.reviewer.getForSession).toHaveBeenCalledWith(reviewSession)
+    expect(dependencies.reviewer.getReviewLog).toHaveBeenCalledWith(reviewLog)
     expect(dependencies.reviewer.abort).toHaveBeenCalledWith(reviewSession)
     expect(dependencies.storage.acknowledgeDataRootHandoffFlush).toHaveBeenCalledWith(
       flushResponse,
@@ -691,7 +707,7 @@ describe('Host application commands', () => {
         .filter((channel): channel is string => channel !== null)
     )
 
-    expect(localOnlyChannels).toHaveLength(41)
+    expect(localOnlyChannels).toHaveLength(44)
     for (const channel of localOnlyChannels) {
       await expect(
         router.dispatcher.invoke(

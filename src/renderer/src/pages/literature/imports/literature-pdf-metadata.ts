@@ -1,5 +1,7 @@
+import type { LiteratureRendererApi, LiteratureRendererHost } from '../renderer-host'
 import {
   createLiteratureIdentifierUrl,
+  normalizeLiteratureIdentifierKey,
   normalizeLiteratureIdentifierValue,
   type LiteratureCreatorInput
 } from '@aipoch/literature-citations/contracts'
@@ -20,6 +22,13 @@ const draftTitles = new WeakMap<LiteratureItemInput, string>()
 // A terminal publication block is stronger evidence than a DOI somewhere in References.
 const PUBLICATION_DOI_PATTERN =
   /(?:^|\n)Accepted[^\n]*\b\d{4}\s*\nPublished[^\n]*\b\d{4}\s*\n(?:https?:\/\/(?:dx\.)?doi\.org\/|doi:\s*)?(10\.\d{4,9}\/[-._;()/:A-Z0-9]+)\s*$/iu
+
+// These prose heuristics belong to extraction, never to explicit identifier normalization.
+const extractedDoi = (value: string): string =>
+  normalizeLiteratureIdentifierValue('doi', value)
+    .replace(/Copyright(?:\s.*)?$/iu, '')
+    .replace(/[.,;:)}\]]+$/gu, '')
+    .trim()
 
 const comparableTitle = (text: string): string =>
   text
@@ -50,12 +59,15 @@ const prominentPdfTitle = (items: readonly PdfTextItem[]): string => {
 const DOI_CACHE_SIZE = 32
 const DOI_CACHE_MS = 5 * 60_000
 const doiCaches = new WeakMap<
-  typeof window.api.literature.lookupMetadata,
+  LiteratureRendererApi['literature']['lookupMetadata'],
   Map<string, { expires: number; result: Promise<LiteratureItemInput> }>
 >()
 
-const lookupPdfDoi = (doi: string): Promise<LiteratureItemInput> => {
-  const lookup = window.api.literature.lookupMetadata
+const lookupPdfDoi = (
+  api: Pick<LiteratureRendererApi, 'literature'>,
+  doi: string
+): Promise<LiteratureItemInput> => {
+  const lookup = api.literature.lookupMetadata
   let cache = doiCaches.get(lookup)
   if (!cache) {
     cache = new Map()
@@ -93,6 +105,7 @@ const hasMetadataValue = (value: unknown): boolean =>
       (typeof value !== 'object' || Object.keys(value).length > 0)
 
 const completeLiteraturePdfDraft = async (
+  api: Pick<LiteratureRendererApi, 'literature'>,
   draft: LiteratureItemInput,
   onNotice?: Notice
 ): Promise<LiteratureItemInput> => {
@@ -105,6 +118,7 @@ const completeLiteraturePdfDraft = async (
   for (const identifier of identifiers) {
     try {
       const resolved = await lookupPdfDoi(
+        api,
         identifier.scheme === 'pmid' ? `pmid:${identifier.value}` : identifier.value
       )
       const title = draftTitles.get(draft)
@@ -120,8 +134,8 @@ const completeLiteraturePdfDraft = async (
             resolved.identifiers.some(
               (remote) =>
                 remote.scheme === local.scheme &&
-                normalizeLiteratureIdentifierValue(remote.scheme, remote.value).toLowerCase() !==
-                  normalizeLiteratureIdentifierValue(local.scheme, local.value).toLowerCase()
+                normalizeLiteratureIdentifierKey(remote.scheme, remote.value) !==
+                  normalizeLiteratureIdentifierKey(local.scheme, local.value)
             )
         )
       if (conflictingIdentifier) continue
@@ -147,8 +161,8 @@ const completeLiteraturePdfDraft = async (
           !mergedIdentifiers.some(
             (local) =>
               local.scheme === remote.scheme &&
-              normalizeLiteratureIdentifierValue(local.scheme, local.value).toLowerCase() ===
-                normalizeLiteratureIdentifierValue(remote.scheme, remote.value).toLowerCase()
+              normalizeLiteratureIdentifierKey(local.scheme, local.value) ===
+                normalizeLiteratureIdentifierKey(remote.scheme, remote.value)
           )
         )
           mergedIdentifiers.push({ ...remote, isPrimary: false })
@@ -262,15 +276,15 @@ const parseLiteraturePdfMetadata = (
 ): Partial<LiteratureItemInput> => {
   const custom =
     typeof info.Custom === 'object' && info.Custom !== null
-      ? Object.values(info.Custom as Record<string, unknown>)
-      : []
-  const searchableText = `${[...Object.values(info), ...custom]
+      ? (info.Custom as Record<string, unknown>)
+      : {}
+  const searchableText = `${[...Object.values(info), ...Object.values(custom)]
     .filter((value) => typeof value === 'string')
     .join('\n')}\n${text.split(/(?:^|\n)\s*(?:references|bibliography)\s*(?:\n|$)/iu)[0]}`
-  const doi = searchableText
-    .match(DOI_PATTERN)
-    ?.map((value) => normalizeLiteratureIdentifierValue('doi', value))
-    .find(Boolean)
+  const embeddedDoi = [info.DOI, custom.DOI]
+    .map((value) => normalizeLiteratureIdentifierValue('doi', textValue(value)))
+    .find((value) => /^10\.\d{4,9}\/\S+$/u.test(value))
+  const doi = embeddedDoi ?? searchableText.match(DOI_PATTERN)?.map(extractedDoi).find(Boolean)
   const pmid = PMID_PATTERN.exec(searchableText)?.[1]
   const embeddedTitle = pdfInfoValue(info, 'Title')
   const title = meaningfulTitle(embeddedTitle) ? embeddedTitle : ''
@@ -296,16 +310,18 @@ const parseLiteraturePdfMetadata = (
 }
 
 const extractLiteraturePdfDraft = async (
+  host: Pick<LiteratureRendererHost, 'api' | 'loadPdf'>,
   file: File | PdfAnnotationSource,
   fallback: LiteratureItemInput,
   onNotice?: Notice
 ): Promise<LiteratureItemInput> => {
+  const { api, loadPdf } = host
   let resource: ManagedPreviewResource | undefined
   try {
     if ('kind' in file) {
       if (!file.projectId || !file.sourceFileId || file.kind === 'literature-attachment-version')
         throw new Error('Workspace PDF source is unavailable.')
-      resource = await window.api.previewResources.acquire({
+      resource = await api.previewResources.acquire({
         source: file.kind === 'upload-version' ? 'upload' : 'artifact',
         projectId: file.projectId,
         fileId: file.sourceFileId,
@@ -317,13 +333,9 @@ const extractLiteraturePdfDraft = async (
       onNotice?.({ textUnavailable: true })
       return fallback
     }
-    const loadingTask = resource
-      ? (await import('../../workspace/previews/managed-pdf-document')).createManagedPdfLoadingTask(
-          resource
-        )
-      : (await import('../../workspace/previews/pdfjs')).pdfjsLib.getDocument({
-          data: new Uint8Array(await (file as File).arrayBuffer())
-        })
+    const loadingTask = await loadPdf(
+      resource ? { resource } : { data: new Uint8Array(await (file as File).arrayBuffer()) }
+    )
     let document: Awaited<typeof loadingTask.promise>
     try {
       document = await loadingTask.promise
@@ -395,8 +407,8 @@ const extractLiteraturePdfDraft = async (
           }
           const doi = PUBLICATION_DOI_PATTERN.exec(text)?.[1]
           if (doi && firstPageTitle.length >= 20) {
-            const normalized = normalizeLiteratureIdentifierValue('doi', doi)
-            const resolved = await lookupPdfDoi(normalized)
+            const normalized = extractedDoi(doi)
+            const resolved = await lookupPdfDoi(api, normalized)
             // A valid DOI may belong to a cited paper. Require the complete prominent title,
             // not the embedded Title, a substring in the abstract, or a fuzzy title match.
             if (comparableTitle(resolved.title) === comparableTitle(firstPageTitle)) {
@@ -419,7 +431,7 @@ const extractLiteraturePdfDraft = async (
       await document.destroy()
     }
   } finally {
-    if (resource) await window.api.previewResources.release({ resourceId: resource.id })
+    if (resource) await api.previewResources.release({ resourceId: resource.id })
   }
 }
 

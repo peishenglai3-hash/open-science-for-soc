@@ -1,11 +1,9 @@
 import { latestTurnAnchor } from '../../../../shared/session-persistence'
 import {
   projectSessionActionability,
-  type ChatMessage,
-  type ChatSession,
-  type SessionActionabilityFacts,
-  type ToolActivity
-} from '@/stores/session-store'
+  type SessionActionabilityFacts
+} from '@/stores/session-actionability'
+import type { ChatMessage, ChatSession, ToolActivity } from '@/stores/session-store-contract'
 
 type TimelinePosition = {
   updatedAt: number
@@ -13,7 +11,12 @@ type TimelinePosition = {
 }
 
 type AgentLoadingPhase =
-  'hidden' | 'thinking' | 'interacting-with-tools' | 'waiting-for-approval' | 'waiting-for-response'
+  | 'hidden'
+  | 'preparing'
+  | 'thinking'
+  | 'interacting-with-tools'
+  | 'waiting-for-approval'
+  | 'waiting-for-response'
 
 const isLaterThan = (candidate: TimelinePosition, reference: TimelinePosition): boolean => {
   if (candidate.updatedAt !== reference.updatedAt) return candidate.updatedAt > reference.updatedAt
@@ -68,7 +71,7 @@ const getAgentThinkingStartedAt = (session: ChatSession | undefined): number | u
 // must not hide the only liveness signal during a silent gap before the next tool or text update.
 const getAgentLoadingPhase = (
   session: ChatSession | undefined,
-  facts: Pick<SessionActionabilityFacts, 'credentialPending'> = {}
+  facts: Pick<SessionActionabilityFacts, 'credentialPending'> & { sendPreparing?: boolean } = {}
 ): AgentLoadingPhase => {
   if (!session) return 'hidden'
   const actionability = projectSessionActionability(session, facts)
@@ -80,6 +83,8 @@ const getAgentLoadingPhase = (
   ) {
     return 'waiting-for-approval'
   }
+
+  if (facts.sendPreparing) return 'preparing'
 
   const hasLocalRun = Boolean(session.activeRun) && actionability.activity === 'running'
   if (!hasLocalRun && !session.agentPromptInFlight) return 'hidden'

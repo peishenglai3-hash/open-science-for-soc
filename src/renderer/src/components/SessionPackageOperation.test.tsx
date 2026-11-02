@@ -1,8 +1,10 @@
+import { ApplicationStartup } from './ApplicationStartup'
 import { drainWorkspaceRuntimeEventsForPersistence } from '@/lib/acp/useWorkspaceAgentRuntime'
 import { flushSessionPersistence } from '@/lib/session-persistence/session-persistence'
 import { useNavigationStore } from '@/stores/navigation-store'
 import { usePreviewWorkbenchStore } from '@/stores/preview-workbench-store'
 import { WEB_EVENT_SURFACE_ATTRIBUTE } from '../../../shared/web-event-connection'
+import { WEB_CALLER_LOCATION_ATTRIBUTE } from '../../../shared/web-caller-location'
 // @vitest-environment jsdom
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
@@ -66,63 +68,128 @@ const button = (text: string): HTMLButtonElement => {
   return result!
 }
 
-it('cancels a hidden export setup directly and waits for the owner to release the Session', async () => {
-  let finish!: () => void
-  const packageOperation = vi.fn(
-    () =>
-      new Promise<void>((resolve) => {
-        finish = resolve
+it.each(['cancelled', 'failed'] as const)(
+  'keeps the latest %s receipt result until a new operation takes over',
+  async (state) => {
+    const previous: PackageOperationSnapshot = {
+      id: 'old-import',
+      kind: 'import',
+      state: 'succeeded',
+      importFilename: 'old.science',
+      progress: { phase: 'importing' },
+      result: { imported: { projectId: 'p', sessionId: 's' } },
+      pendingImports: [{ id: 'queued', filename: 'queued.science' }]
+    }
+    const transfer = {
+      id: 'new-transfer',
+      filename: 'new.science',
+      state: 'receiving' as const,
+      completedBytes: 3,
+      totalBytes: 5
+    }
+    vi.stubGlobal('api', { sessions: { packageOperation: vi.fn(async () => undefined) } })
+    usePackageOperationStore.getState().receive(previous)
+    usePackageOperationStore.getState().receive({ ...previous, browserTransfers: [transfer] })
+    await act(async () => root.render(<SessionPackageOperation />))
+    await act(async () =>
+      usePackageOperationStore
+        .getState()
+        .receive({ ...previous, browserTransfers: [{ ...transfer, state }] })
+    )
+    expect(document.querySelector('[title="new.science"]')).not.toBeNull()
+    expect(document.body.textContent).toContain(
+      state === 'failed' ? 'Package operation failed' : 'Transfer cancelled'
+    )
+    expect(document.body.textContent).not.toContain('old.science')
+    expect(document.body.textContent).not.toContain('Session imported')
+    expect(document.querySelector('[aria-label="Waiting packages (1)"]')).not.toBeNull()
+    // Expiring the transport tombstone must not resurrect the older result.
+    await act(async () =>
+      usePackageOperationStore.getState().receive({ ...previous, browserTransfers: [] })
+    )
+    expect(document.querySelector('[title="new.science"]')).not.toBeNull()
+    await act(async () =>
+      usePackageOperationStore.getState().receive({
+        ...previous,
+        id: 'next-import',
+        importFilename: 'next.science',
+        state: 'running',
+        progress: { phase: 'validating' },
+        browserTransfers: [{ ...transfer, state }]
       })
-  )
-  vi.stubGlobal('api', { sessions: { packageOperation } })
-  usePackageOperationStore.setState({ operation: snapshot, open: false })
-  await act(async () => root.render(<PackageOperationIndicator />))
-  expect(button('Continue setup')).toBeDefined()
-  await act(async () => button('Cancel').click())
-  expect(packageOperation).toHaveBeenCalledExactlyOnceWith({
-    action: 'cancel',
-    operationId: snapshot.id
-  })
-  expect(button('Cancel').disabled).toBe(true)
-  expect(
-    sessionExportLocked(usePackageOperationStore.getState().operation, { id: 's', projectId: 'p' })
-  ).toBe(true)
-  await act(async () => {
-    usePackageOperationStore.getState().receive({ ...snapshot, state: 'cancelling' })
-    finish()
-  })
-  expect(button('Cancel').disabled).toBe(true)
-  expect(document.body.textContent).toContain('Cancelling and cleaning up…')
-  await act(async () =>
-    usePackageOperationStore.getState().receive({ ...snapshot, state: 'cancelled' })
-  )
-  expect(
-    sessionExportLocked(usePackageOperationStore.getState().operation, { id: 's', projectId: 'p' })
-  ).toBe(false)
-  expect(
-    [...document.querySelectorAll('button')].some((item) => item.textContent === 'Cancel')
-  ).toBe(false)
-})
+    )
+    expect(document.querySelector('[title="next.science"]')).not.toBeNull()
+    await act(async () =>
+      usePackageOperationStore.getState().receive({
+        ...previous,
+        id: 'next-import',
+        importFilename: 'next.science',
+        browserTransfers: [{ ...transfer, state }]
+      })
+    )
+    expect(document.querySelector('[title="next.science"]')).not.toBeNull()
+    expect(document.body.textContent).toContain('Session imported')
+  }
+)
 
-it('keeps failed background cancellation visible and retryable without discarding export choices', async () => {
-  const packageOperation = vi.fn().mockRejectedValue(new Error('Could not reach the application.'))
-  vi.stubGlobal('api', { sessions: { packageOperation } })
+it.each([false, true])(
+  'releases cached receipt presentation after handoff or cleanup (cleanup: %s)',
+  async (cleanupPending) => {
+    const operation: PackageOperationSnapshot = {
+      id: 'export-owner',
+      kind: 'export',
+      state: 'running',
+      progress: { phase: 'compressing' },
+      pendingImports: [{ id: 'queued', filename: 'queued.science' }]
+    }
+    const transfer = {
+      id: 'receipt',
+      filename: 'receipt.science',
+      state: 'receiving' as const,
+      completedBytes: 5,
+      totalBytes: 5,
+      cleanupPending
+    }
+    vi.stubGlobal('api', { sessions: { packageOperation: vi.fn(async () => undefined) } })
+    usePackageOperationStore.getState().receive(operation)
+    usePackageOperationStore.getState().receive({ ...operation, browserTransfers: [transfer] })
+    await act(async () => root.render(<SessionPackageOperation />))
+    expect(document.body.textContent).toContain('receipt.science')
+    await act(async () =>
+      usePackageOperationStore.getState().receive({ ...operation, browserTransfers: [] })
+    )
+    await act(async () =>
+      usePackageOperationStore
+        .getState()
+        .receive({ ...operation, state: 'succeeded', browserTransfers: [] })
+    )
+    expect(document.body.textContent).not.toContain('receipt.science')
+    expect(document.body.textContent).toContain('Session package exported')
+    expect(document.querySelector('[aria-label="Waiting packages (1)"]')).not.toBeNull()
+  }
+)
+
+it('opens hidden export setup from the compact control without discarding choices', async () => {
   usePackageOperationStore.setState({
     operation: snapshot,
     open: false,
     excludedStorageKeys: ['large']
   })
   await act(async () => root.render(<PackageOperationIndicator />))
-  await act(async () => button('Cancel').click())
-  expect(document.querySelector('[role="alert"]')?.textContent).toContain(
-    'Could not reach the application.'
-  )
-  expect(button('Cancel').disabled).toBe(false)
-  expect(usePackageOperationStore.getState().excludedStorageKeys).toEqual(['large'])
-  await act(async () => button('Continue setup').click())
+  expect(document.querySelector('progress, [role="progressbar"]')).toBeNull()
+  expect(
+    [...document.querySelectorAll('button')].some((item) => item.textContent === 'Cancel')
+  ).toBe(false)
+  act(() => button('Continue setup').click())
   expect(usePackageOperationStore.getState().open).toBe(true)
+  expect(usePackageOperationStore.getState().excludedStorageKeys).toEqual(['large'])
 })
 beforeEach(() => {
+  vi.stubGlobal(
+    'matchMedia',
+    vi.fn(() => ({ matches: false }))
+  )
+  usePackageOperationStore.setState({ browserReceipt: undefined })
   const container = document.createElement('div')
   document.body.append(container)
   root = createRoot(container)
@@ -134,6 +201,30 @@ beforeEach(() => {
     selectionPreset: 'full',
     threshold: '256'
   })
+})
+
+it('releases measured layout when the dialog changes to a fork', async () => {
+  const height = vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(320)
+  const disconnect = vi.fn()
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      observe = vi.fn()
+      disconnect = disconnect
+    }
+  )
+  try {
+    const running = { ...snapshot, state: 'running' as const }
+    usePackageOperationStore.getState().receive(running)
+    await act(async () => root.render(<SessionPackageOperation />))
+    const panel = document.querySelector<HTMLElement>('[role="dialog"]')!
+    expect(parseFloat(panel.style.height)).toBeGreaterThan(320)
+    await act(async () => usePackageOperationStore.getState().receive({ ...running, kind: 'fork' }))
+    expect(panel.style.height).toBe('')
+    expect(disconnect).toHaveBeenCalledOnce()
+  } finally {
+    height.mockRestore()
+  }
 })
 
 it('offers full and compact export without exposing customization and preserves required evidence', async () => {
@@ -230,8 +321,15 @@ it('keeps speed settings collapsed and changes the current operation budget', as
   })
   expect(document.body.textContent).toContain('128.0 MiB/s')
   expect(document.body.textContent).toContain('256.0 MiB/s')
+  expect(document.body.textContent).toContain('512.0 MiB/s')
+  expect(document.body.textContent).toContain('1.0 GiB/s')
+  for (const rate of ['4.0 MiB/s', '16.0 MiB/s', '64.0 MiB/s']) {
+    expect(
+      [...document.querySelectorAll('[role="option"]')].some((item) => item.textContent === rate)
+    ).toBe(false)
+  }
   const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(
-    (item) => item.textContent === '4.0 MiB/s'
+    (item) => item.textContent === '1.0 GiB/s'
   )!
   expect(option).toBeDefined()
   await act(async () => {
@@ -240,9 +338,59 @@ it('keeps speed settings collapsed and changes the current operation budget', as
   expect(packageOperation).toHaveBeenCalledWith({
     action: 'set-speed',
     operationId: operation.id,
-    bytesPerSecond: 4 * 1024 ** 2
+    bytesPerSecond: 1024 ** 3
   })
 })
+
+it.each([4, 16, 64])(
+  'displays a restored %i MiB/s budget without restoring its preset',
+  async (rate) => {
+    const operation: PackageOperationSnapshot = {
+      id: 'restored-transfer',
+      kind: 'import',
+      state: 'running',
+      progress: { phase: 'validating' },
+      transferBytesPerSecond: rate * 1024 ** 2
+    }
+    const packageOperation = vi.fn(async () => operation)
+    vi.stubGlobal('api', {
+      sessions: { packageOperation, onPackageOperation: () => () => undefined }
+    })
+    usePackageOperationStore.setState({ operation, open: true })
+    await act(async () => root.render(<SessionPackageOperation />))
+    const select = document.querySelector<HTMLElement>('[role="combobox"]')!
+    expect(select.textContent).toBe(`${rate}.0 MiB/s`)
+    expect(packageOperation).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'set-speed' })
+    )
+    Element.prototype.scrollIntoView ??= () => undefined
+    await act(async () => {
+      select.closest('details')!.open = true
+      select.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    })
+    const options = [...document.querySelectorAll<HTMLElement>('[role="option"]')]
+    expect(options.map((item) => item.textContent)).toEqual([
+      'Auto',
+      '128.0 MiB/s',
+      '256.0 MiB/s',
+      '512.0 MiB/s',
+      '1.0 GiB/s'
+    ])
+    await act(async () => options.find((item) => item.textContent === 'Auto')!.click())
+    expect(packageOperation).toHaveBeenCalledWith({
+      action: 'set-speed',
+      operationId: operation.id,
+      bytesPerSecond: null
+    })
+    await act(async () =>
+      usePackageOperationStore.getState().receive({
+        ...operation,
+        transferBytesPerSecond: undefined
+      })
+    )
+    expect(select.textContent).toBe('Auto')
+  }
+)
 
 it('does not relock the source Session while retrying temporary cleanup', () => {
   const session = { id: 's', projectId: 'p' }
@@ -336,7 +484,7 @@ it.each(['confirming', 'choosing-location'] as const)(
       }
     })
     await act(async () => root.render(<SessionPackageOperation />))
-    expect(document.body.textContent).toContain('Waiting for you')
+    expect(document.body.textContent).not.toContain('Waiting for you')
     expect(document.body.textContent).toContain(
       phase === 'confirming'
         ? 'Review the package summary before importing.'
@@ -398,17 +546,32 @@ it('distinguishes import checks from the confirmed transfer, including backgroun
       </>
     )
   )
-  expect(document.querySelector('[aria-current="step"]')?.textContent).toContain('Check package')
-  expect(document.body.textContent).toContain('No Session has been created yet.')
+  expect(document.querySelector('[aria-current="step"]')).toBeNull()
+  expect(document.body.textContent).not.toContain('No Session has been created yet.')
   expect(document.body.textContent).toContain('1.0 KiB / 2.0 KiB')
   expect(document.querySelector('[role="progressbar"], progress')).toBeNull()
   act(() => usePackageOperationStore.getState().setOpen(false))
   expect(document.querySelector('[role="status"]')?.textContent).toBe('Checking Session package…')
-  expect(document.body.textContent).toContain('Disk activity: 1.0 KiB/s')
+  expect(document.body.textContent).not.toContain('Disk activity: 1.0 KiB/s')
+  act(() =>
+    usePackageOperationStore.getState().receive({
+      ...operation,
+      progress: { phase: 'validating', completedBytes: 1024, totalBytes: 2048 }
+    })
+  )
+  expect(document.body.textContent).not.toContain('Reading package…')
+  act(() =>
+    usePackageOperationStore.getState().receive({
+      ...operation,
+      progress: { phase: 'validating', completedFiles: 2, totalFiles: 10 }
+    })
+  )
+  expect(document.body.textContent).not.toContain('Checking 2 of 10 files…')
+  expect(document.body.textContent).not.toContain('1.0 KiB / 2.0 KiB')
   act(() =>
     usePackageOperationStore.getState().receive({ ...operation, progress: { phase: 'validating' } })
   )
-  expect(document.body.textContent).toContain('Validating package…')
+  expect(document.body.textContent).not.toContain('Validating package…')
   expect(document.body.textContent).not.toContain('1.0 KiB / 2.0 KiB')
   expect(document.querySelector('[role="dialog"]')).toBeNull()
   act(() =>
@@ -428,7 +591,7 @@ it('distinguishes import checks from the confirmed transfer, including backgroun
     })
   )
   expect(document.querySelector('[role="dialog"]')).not.toBeNull()
-  expect(document.querySelector('[aria-current="step"]')?.textContent).toContain('Review contents')
+  expect(document.querySelector('[aria-current="step"]')).toBeNull()
   expect(document.querySelector('[role="progressbar"], progress')).toBeNull()
   act(() =>
     usePackageOperationStore.getState().receive({
@@ -436,7 +599,7 @@ it('distinguishes import checks from the confirmed transfer, including backgroun
       progress: { phase: 'importing', completedBytes: 1024, totalBytes: 2048 }
     })
   )
-  expect(document.querySelector('[aria-current="step"]')?.textContent).toContain('Import')
+  expect(document.querySelector('[role="status"]')?.textContent).toBe('Importing research…')
   expect(document.querySelector('progress')?.getAttribute('aria-valuetext')).toBe(
     'Importing research…: 50%'
   )
@@ -488,13 +651,13 @@ it('distinguishes saving from package creation and shows the exported path', asy
   })
   usePackageOperationStore.setState({ operation, open: true })
   await act(async () => root.render(<SessionPackageOperation />))
-  expect(document.querySelector('[aria-current="step"]')?.textContent).toContain('Create package')
+  expect(document.querySelector('[role="status"]')?.textContent).toBe('Compressing package…')
   act(() =>
     usePackageOperationStore
       .getState()
       .receive({ ...operation, progress: { phase: 'saving', completedBytes: 80, totalBytes: 100 } })
   )
-  expect(document.querySelector('[aria-current="step"]')?.textContent).toContain('Save package')
+  expect(document.querySelector('[role="status"]')?.textContent).toBe('Saving package…')
   expect(document.querySelector('progress')?.getAttribute('aria-valuetext')).toBe(
     'Saving package…: 80%'
   )
@@ -512,6 +675,8 @@ afterEach(() => {
   act(() => root.unmount())
   document.body.innerHTML = ''
   vi.unstubAllGlobals()
+  document.documentElement.removeAttribute(WEB_EVENT_SURFACE_ATTRIBUTE)
+  document.documentElement.removeAttribute(WEB_CALLER_LOCATION_ATTRIBUTE)
 })
 
 it('starts with a simple export summary and reveals optional controls on request', async () => {
@@ -823,7 +988,7 @@ it('keeps import progress available when hidden and waits for cancellation clean
   act(() => button('Run in background').click())
   expect(document.querySelector('[role="dialog"]')).toBeNull()
   expect(document.body.textContent).toContain('Importing research…')
-  expect(document.querySelector('button[title="Importing research…"]')).toBeNull()
+  expect(document.querySelector('button[title="Importing research…"]')).not.toBeNull()
   act(() => button('View progress').click())
   await act(async () => button('Cancel').click())
   expect(request).toHaveBeenLastCalledWith({ action: 'cancel', operationId: 'import' })
@@ -1140,8 +1305,9 @@ it('keeps import confirmation in one dialog with omissions collapsed', async () 
   })
 })
 
-it('does not claim desktop import events on a Web client', async () => {
+it('does not claim desktop import events on a remote Web client', async () => {
   document.documentElement.setAttribute(WEB_EVENT_SURFACE_ATTRIBUTE, 'true')
+  document.documentElement.setAttribute(WEB_CALLER_LOCATION_ATTRIBUTE, 'remote')
   const subscribe = vi.fn(() => () => undefined)
   const query = vi.fn(async () => null)
   vi.stubGlobal('api', { sessions: { packageOperation: query, onPackageOperation: subscribe } })
@@ -1152,6 +1318,63 @@ it('does not claim desktop import events on a Web client', async () => {
     expect(document.querySelector('[role="dialog"]')).toBeNull()
   } finally {
     document.documentElement.removeAttribute(WEB_EVENT_SURFACE_ATTRIBUTE)
+    document.documentElement.removeAttribute(WEB_CALLER_LOCATION_ATTRIBUTE)
+  }
+})
+
+it('renders the operation dialog for a local Web client', async () => {
+  document.documentElement.setAttribute(WEB_EVENT_SURFACE_ATTRIBUTE, 'true')
+  document.documentElement.setAttribute(WEB_CALLER_LOCATION_ATTRIBUTE, 'local')
+  const subscribe = vi.fn(() => () => undefined)
+  const operation: PackageOperationSnapshot = {
+    id: 'local-web',
+    kind: 'export',
+    state: 'running',
+    progress: { phase: 'copying' }
+  }
+  const query = vi.fn(async () => operation)
+  vi.stubGlobal('api', { sessions: { packageOperation: query, onPackageOperation: subscribe } })
+  usePackageOperationStore.setState({ operation, open: true })
+  try {
+    await act(async () => root.render(<SessionPackageOperation />))
+    expect(subscribe).toHaveBeenCalled()
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull()
+  } finally {
+    document.documentElement.removeAttribute(WEB_EVENT_SURFACE_ATTRIBUTE)
+    document.documentElement.removeAttribute(WEB_CALLER_LOCATION_ATTRIBUTE)
+  }
+})
+
+it('saves a local Web export result to the browser from the footer button', async () => {
+  document.documentElement.setAttribute(WEB_EVENT_SURFACE_ATTRIBUTE, 'true')
+  document.documentElement.setAttribute(WEB_CALLER_LOCATION_ATTRIBUTE, 'local')
+  const saveManagedFile = vi.fn(async () => ({ saved: true }))
+  const operation: PackageOperationSnapshot = {
+    id: 'export-done',
+    kind: 'export',
+    state: 'succeeded',
+    progress: { phase: 'saving' },
+    result: { filePath: 'C:\\tmp\\research.science' }
+  }
+  vi.stubGlobal('api', {
+    sessions: {
+      packageOperation: vi.fn(async () => operation),
+      onPackageOperation: () => () => undefined
+    },
+    saveManagedFile
+  })
+  usePackageOperationStore.setState({ operation, open: true })
+  try {
+    await act(async () => root.render(<SessionPackageOperation />))
+    await act(async () => button('Download research.science').click())
+    expect(saveManagedFile).toHaveBeenCalledExactlyOnceWith({
+      source: 'local',
+      path: 'C:\\tmp\\research.science',
+      suggestedName: 'research.science'
+    })
+  } finally {
+    document.documentElement.removeAttribute(WEB_EVENT_SURFACE_ATTRIBUTE)
+    document.documentElement.removeAttribute(WEB_CALLER_LOCATION_ATTRIBUTE)
   }
 })
 
@@ -1171,51 +1394,66 @@ it('does not navigate when restoring a completed import snapshot', async () => {
   expect(navigate).not.toHaveBeenCalled()
 })
 
-it('navigates once after this desktop window confirms an import', async () => {
-  const operation: PackageOperationSnapshot = {
-    id: 'confirmed-import',
-    kind: 'import',
-    state: 'awaiting-selection',
-    progress: { phase: 'confirming' },
-    importTarget: { projectId: 'target' },
-    importPreview: {
-      title: 'Source',
-      projectName: 'Source',
-      branchCount: 1,
-      messageCount: 1,
-      fileCount: 0,
-      totalBytes: 1,
-      omissions: []
+it.each([false, true])(
+  'navigates once after confirmation even with another receipt (%s)',
+  async (receiving) => {
+    const operation: PackageOperationSnapshot = {
+      id: 'confirmed-import',
+      kind: 'import',
+      state: 'awaiting-selection',
+      progress: { phase: 'confirming' },
+      importTarget: { projectId: 'target' },
+      importPreview: {
+        title: 'Source',
+        projectName: 'Source',
+        branchCount: 1,
+        messageCount: 1,
+        fileCount: 0,
+        totalBytes: 1,
+        omissions: []
+      }
     }
-  }
-  const navigate = vi.spyOn(useNavigationStore.getState(), 'openSession').mockReturnValue(true)
-  vi.stubGlobal('api', {
-    sessions: {
-      packageOperation: async () => operation,
-      onPackageOperation: () => () => undefined
-    },
-    projects: {
-      list: async () => [{ id: 'target', name: 'My research', createdAt: 1, updatedAt: 1 }]
+    const navigate = vi.spyOn(useNavigationStore.getState(), 'openSession').mockReturnValue(true)
+    navigate.mockClear()
+    vi.stubGlobal('api', {
+      sessions: {
+        packageOperation: async () => operation,
+        onPackageOperation: () => () => undefined
+      },
+      projects: {
+        list: async () => [{ id: 'target', name: 'My research', createdAt: 1, updatedAt: 1 }]
+      }
+    })
+    usePackageOperationStore.setState({ operation, open: true })
+    await act(async () => root.render(<SessionPackageOperation />))
+    await act(async () => button('Import').click())
+    const completed: PackageOperationSnapshot = {
+      ...operation,
+      state: 'succeeded',
+      importPreview: undefined,
+      result: { imported: { projectId: 'target', sessionId: 'imported' } },
+      browserTransfers: receiving
+        ? [
+            {
+              id: 'another-receipt',
+              filename: 'another.science',
+              state: 'receiving',
+              completedBytes: 2,
+              totalBytes: 10
+            }
+          ]
+        : []
     }
-  })
-  usePackageOperationStore.setState({ operation, open: true })
-  await act(async () => root.render(<SessionPackageOperation />))
-  await act(async () => button('Import').click())
-  const completed: PackageOperationSnapshot = {
-    ...operation,
-    state: 'succeeded',
-    importPreview: undefined,
-    result: { imported: { projectId: 'target', sessionId: 'imported' } }
+    await act(async () => usePackageOperationStore.getState().receive(completed))
+    await act(async () => usePackageOperationStore.getState().receive(completed))
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(
+      'target',
+      'imported',
+      'user',
+      expect.any(Function)
+    )
   }
-  await act(async () => usePackageOperationStore.getState().receive(completed))
-  await act(async () => usePackageOperationStore.getState().receive(completed))
-  expect(navigate).toHaveBeenCalledExactlyOnceWith(
-    'target',
-    'imported',
-    'user',
-    expect.any(Function)
-  )
-})
+)
 
 it.each(['before-completion', 'during-project-refresh'])(
   'does not reclaim navigation %s after import confirmation',
@@ -1286,6 +1524,84 @@ it('restores a hidden transfer only for an explicit presentation request', () =>
   store.receive({ ...operation, presentationRevision: 1 })
   expect(usePackageOperationStore.getState().open).toBe(true)
 })
+
+it('keeps a hidden selection closed across snapshots and opens a newly required step', () => {
+  const store = usePackageOperationStore.getState()
+  store.receive(snapshot)
+  store.setOpen(false)
+  store.receive({ ...snapshot, ioBytesPerSecond: 1024 })
+  expect(usePackageOperationStore.getState().open).toBe(false)
+  const presented = { ...snapshot, presentationRevision: 1 }
+  store.receive(presented)
+  expect(usePackageOperationStore.getState().open).toBe(true)
+  store.setOpen(false)
+  store.receive({ ...presented, state: 'running', progress: { phase: 'preparing' } })
+  expect(usePackageOperationStore.getState().open).toBe(false)
+  store.receive(presented)
+  expect(usePackageOperationStore.getState().open).toBe(true)
+  store.setOpen(false)
+  store.receive({ ...presented, progress: { phase: 'confirming' } })
+  expect(usePackageOperationStore.getState().open).toBe(true)
+})
+
+it('retains one export dialog and its task context through completion and cleanup', async () => {
+  usePackageOperationStore.getState().receive(snapshot)
+  await act(async () => root.render(<SessionPackageOperation />))
+  const dialog = document.querySelector('[role="dialog"]')!
+  const description = document.getElementById(dialog.getAttribute('aria-describedby')!)!
+  for (const next of [
+    { state: 'running', progress: { phase: 'choosing-location' } },
+    { state: 'running', progress: { phase: 'preparing' } },
+    { state: 'running', progress: { phase: 'copying' } },
+    { state: 'running', progress: { phase: 'validating' } },
+    { state: 'running', progress: { phase: 'compressing' } },
+    { state: 'running', progress: { phase: 'saving' } },
+    { state: 'running', progress: { phase: 'cleaning' } },
+    { state: 'succeeded', progress: { phase: 'cleaning' } }
+  ] satisfies Partial<PackageOperationSnapshot>[]) {
+    await act(async () => usePackageOperationStore.getState().receive({ ...snapshot, ...next }))
+    expect(document.querySelector('[role="dialog"]')).toBe(dialog)
+    expect(dialog.querySelector('ol')).toBeNull()
+    expect(description.textContent).toBe('Research history is always included.')
+    expect(usePackageOperationStore.getState().open).toBe(true)
+    if (next.progress.phase === 'preparing') {
+      expect(dialog.textContent).toContain('Preparing package…')
+      expect(dialog.textContent).not.toContain('Waiting for a save location…')
+      expect(dialog.querySelector('[role="status"]')?.textContent).toBe('Preparing package…')
+    }
+  }
+  expect(dialog.querySelector('[role="status"]')?.textContent).toBe('Session package exported')
+})
+
+for (const kind of ['export', 'import'] as const) {
+  const phases =
+    kind === 'import'
+      ? (['copying', 'validating', 'importing', 'cleaning'] as const)
+      : (['copying', 'compressing', 'saving', 'cleaning'] as const)
+  for (const phase of phases) {
+    it.each(['failed', 'cancelled', 'cancelling'] as const)(
+      `shows the ${kind} outcome without redundant steps when %s during ${phase}`,
+      async (state) => {
+        usePackageOperationStore.getState().receive({
+          ...snapshot,
+          kind,
+          state,
+          progress: { phase }
+        })
+        usePackageOperationStore.getState().setOpen(true)
+        await act(async () => root.render(<SessionPackageOperation />))
+        expect(document.querySelector('[aria-label="Package steps"]')).toBeNull()
+        expect(document.querySelector('[role="status"]')?.textContent).toBe(
+          state === 'cancelling'
+            ? 'Cancelling and cleaning up…'
+            : state === 'failed'
+              ? 'Package operation failed'
+              : 'Package operation cancelled'
+        )
+      }
+    )
+  }
+}
 
 it.each([
   { state: 'running' as const, cleanupPending: false, canOpenNext: false },
@@ -1437,7 +1753,7 @@ it('includes Literature PDFs in Full, excludes them in Essential, and selects th
   usePackageOperationStore.getState().receive(operation)
   await act(async () => root.render(<SessionPackageOperation />))
   expect(usePackageOperationStore.getState().excludedStorageKeys).toEqual([file.storageKey])
-  expect(document.body.textContent).toContain('Literature metadata is always included.')
+  expect(document.body.textContent).not.toContain('Literature metadata is always included.')
   await act(async () =>
     document.querySelector<HTMLInputElement>('input[aria-label="Full export"]')!.click()
   )
@@ -1647,4 +1963,770 @@ it('requires explicit opt-in before exporting notes shared across projects', asy
   expect(request).toHaveBeenLastCalledWith(
     expect.objectContaining({ action: 'select', includePdfNotes: true })
   )
+})
+
+it('shows isolated browser receipt progress and cancels the selected transfer without cancelling export', async () => {
+  const operation: PackageOperationSnapshot = {
+    ...snapshot,
+    state: 'running',
+    progress: { phase: 'copying' },
+    files: undefined,
+    browserTransfers: [
+      {
+        id: 'browser-a',
+        filename: 'waiting.science',
+        state: 'waiting',
+        completedBytes: 0,
+        totalBytes: 10
+      },
+      {
+        id: 'browser-b',
+        filename: 'receiving.science',
+        state: 'receiving',
+        completedBytes: 5,
+        totalBytes: 10
+      }
+    ]
+  }
+  const packageOperation = vi.fn(async () => operation)
+  vi.stubGlobal('api', {
+    sessions: { packageOperation, onPackageOperation: () => () => undefined }
+  })
+  usePackageOperationStore.getState().receive(operation)
+  await act(async () => root.render(<SessionPackageOperation />))
+  expect(document.body.textContent).toContain('Waiting for browser…')
+  expect(document.body.textContent).toContain('Receiving package…')
+  const receiving = document.querySelector('[aria-label="receiving.science"]')!
+  expect(receiving.textContent).toContain('50%')
+  expect(receiving.textContent).toContain('5 B / 10 B')
+  await act(async () => (receiving.querySelector('button') as HTMLButtonElement).click())
+  expect(packageOperation).toHaveBeenCalledWith({
+    action: 'cancel-browser-transfer',
+    operationId: operation.id,
+    transferId: 'browser-b'
+  })
+  expect(packageOperation).not.toHaveBeenCalledWith({ action: 'cancel', operationId: operation.id })
+})
+
+it('opens newly launched receipt progress even after the previous package dialog was dismissed', () => {
+  const previous: PackageOperationSnapshot = { ...snapshot, state: 'succeeded', files: undefined }
+  const store = usePackageOperationStore.getState()
+  store.receive(previous)
+  store.dismiss()
+  store.receive({
+    ...previous,
+    browserTransfers: [
+      {
+        id: 'new-browser-transfer',
+        filename: 'new.science',
+        state: 'waiting',
+        completedBytes: 0,
+        totalBytes: 5
+      }
+    ]
+  })
+  expect(usePackageOperationStore.getState().open).toBe(true)
+})
+
+it('shows native preparation before backend readiness and keeps one dialog through fast receipt', async () => {
+  const preparing: PackageOperationSnapshot = {
+    id: 'launch',
+    kind: 'import',
+    state: 'running',
+    browserReceiptOnly: true,
+    progress: { phase: 'preparing' },
+    browserTransfers: [
+      {
+        id: 'transfer',
+        filename: 'startup.science',
+        state: 'preparing',
+        completedBytes: 0,
+        totalBytes: 10
+      }
+    ]
+  }
+  let notify!: (value: PackageOperationSnapshot) => void
+  let runtimeReady!: (value: { phase: 'ready' }) => void
+  let databaseReady!: (value: { phase: 'ready' }) => void
+  const backend = vi.fn()
+  const cancel = vi.fn(async () => undefined)
+  vi.stubGlobal('api', {
+    runtimeStartup: {
+      getState: () => new Promise(() => undefined),
+      onStateChanged: (listener: typeof runtimeReady) => {
+        runtimeReady = listener
+        return () => undefined
+      }
+    },
+    databaseStartup: {
+      getState: async () => ({ phase: 'checking' }),
+      onStateChanged: (listener: typeof databaseReady) => {
+        databaseReady = listener
+        return () => undefined
+      }
+    },
+    packagePresentation: {
+      getState: async () => preparing,
+      onStateChanged: (listener: typeof notify) => {
+        notify = listener
+        return () => undefined
+      },
+      cancelTransfer: cancel
+    },
+    sessions: { packageOperation: backend }
+  })
+  await act(async () =>
+    root.render(
+      <ApplicationStartup>
+        <div data-testid="workspace" />
+      </ApplicationStartup>
+    )
+  )
+  expect(document.querySelector('[data-testid=workspace]')).toBeNull()
+  expect(document.body.textContent).toContain('Preparing to receive package…')
+  expect(document.body.textContent).toContain('startup.science')
+  expect(backend).not.toHaveBeenCalled()
+  const dialog = document.querySelector('[role="dialog"]')
+  await act(async () => button('Cancel transfer').click())
+  expect(cancel).toHaveBeenCalledWith('transfer')
+  for (const state of ['waiting', 'receiving'] as const) {
+    await act(async () =>
+      notify({
+        ...preparing,
+        browserTransfers: [
+          {
+            ...preparing.browserTransfers![0],
+            state,
+            completedBytes: state === 'receiving' ? 5 : 0
+          }
+        ]
+      })
+    )
+    expect(document.querySelector('[role="dialog"]')).toBe(dialog)
+  }
+  expect(document.body.textContent).toContain('50%')
+  await act(async () =>
+    notify({
+      id: 'import',
+      kind: 'import',
+      state: 'running',
+      progress: { phase: 'validating' },
+      browserTransfers: []
+    })
+  )
+  expect(document.querySelector('[role="dialog"]')).toBe(dialog)
+  expect(document.body.textContent).toContain('Validating package…')
+  expect(document.body.textContent).not.toContain('Transfer cancelled')
+  await act(async () => runtimeReady({ phase: 'ready' }))
+  expect(document.querySelector('[data-testid=workspace]')).toBeNull()
+  await act(async () => databaseReady({ phase: 'ready' }))
+  expect(document.querySelector('[data-testid=workspace]')).not.toBeNull()
+  expect(document.querySelector('[role=dialog]')).toBe(dialog)
+})
+
+it('does not rewind a newer validation event to a stale preparing snapshot on late mount', async () => {
+  let resolve!: (value: PackageOperationSnapshot) => void
+  let notify!: (value: PackageOperationSnapshot) => void
+  vi.stubGlobal('api', {
+    packagePresentation: {
+      getState: () =>
+        new Promise<PackageOperationSnapshot>((done) => {
+          resolve = done
+        }),
+      onStateChanged: (listener: typeof notify) => {
+        notify = listener
+        return () => undefined
+      }
+    }
+  })
+  await act(async () => root.render(<SessionPackageOperation />))
+  const validating: PackageOperationSnapshot = {
+    id: 'fast',
+    kind: 'import',
+    state: 'running',
+    progress: { phase: 'validating' }
+  }
+  await act(async () => notify(validating))
+  await act(async () => resolve({ ...validating, progress: { phase: 'preparing' } }))
+  expect(document.body.textContent).toContain('Validating package…')
+  expect(usePackageOperationStore.getState().operation).toEqual(validating)
+})
+
+it('shows an explicit startup error for a pending browser package', async () => {
+  vi.stubGlobal('api', {
+    packagePresentation: {
+      getState: async () => ({
+        id: 'failed-launch',
+        kind: 'import',
+        state: 'failed',
+        browserReceiptOnly: true,
+        progress: { phase: 'preparing' },
+        browserTransfers: [
+          {
+            id: 'failed-transfer',
+            filename: 'failed.science',
+            state: 'failed',
+            completedBytes: 0,
+            totalBytes: 10
+          }
+        ]
+      }),
+      onStateChanged: () => () => undefined
+    }
+  })
+  await act(async () => root.render(<SessionPackageOperation />))
+  expect(document.body.textContent).toContain(
+    'Unable to prepare browser import. Resolve the startup error and try again.'
+  )
+  expect(document.body.textContent).toContain('failed.science')
+})
+
+it.each(['cancelled', 'succeeded', 'failed'] as const)(
+  'shows the new receipt instead of a previous %s import without changing queue ownership',
+  async (state) => {
+    const previous: PackageOperationSnapshot = {
+      id: 'old-operation',
+      kind: 'import',
+      state,
+      importFilename: 'previous.science',
+      progress: { phase: 'importing' },
+      error: state === 'failed' ? 'Previous import failed' : undefined,
+      result:
+        state === 'succeeded'
+          ? { imported: { projectId: 'old-project', sessionId: 'old-session' } }
+          : undefined,
+      pendingImports: [{ id: 'queued', filename: 'queued.science' }],
+      browserTransfers: [
+        {
+          id: 'old-transfer',
+          filename: 'old-transfer.science',
+          state: 'cancelled',
+          completedBytes: 0,
+          totalBytes: 10
+        },
+        {
+          id: 'new-transfer',
+          filename: 'current.science',
+          state: 'receiving',
+          completedBytes: 5,
+          totalBytes: 10
+        }
+      ]
+    }
+    const request = vi.fn(async () => previous)
+    vi.stubGlobal('api', { sessions: { packageOperation: request } })
+    usePackageOperationStore.getState().receive(previous)
+    await act(async () => root.render(<SessionPackageOperation />))
+    const dialog = document.querySelector('[role=dialog]')!
+    expect(dialog.querySelector('[title="current.science"]')).not.toBeNull()
+    expect(dialog.textContent).not.toContain('previous.science')
+    expect(dialog.textContent).not.toContain('old-transfer.science')
+    expect(dialog.textContent).not.toContain('Package operation cancelled')
+    expect(dialog.textContent).not.toContain('Session imported')
+    expect(dialog.textContent).not.toContain('Previous import failed')
+    expect(dialog.textContent).toContain('Receiving package…')
+    expect(dialog.textContent).toContain('5 B / 10 B')
+    expect(usePackageOperationStore.getState().operation).toBe(previous)
+    await act(async () =>
+      (document.querySelector('[aria-label="Waiting packages (1)"]') as HTMLButtonElement).click()
+    )
+    expect(document.body.textContent).toContain('queued.science')
+    await act(async () => button('Open next package').click())
+    expect(request).toHaveBeenLastCalledWith({
+      action: 'next-import',
+      operationId: 'old-operation'
+    })
+  }
+)
+
+it('keeps an active import and separate transfers while hiding settled receipt rows', async () => {
+  const current: PackageOperationSnapshot = {
+    id: 'active-import',
+    kind: 'import',
+    state: 'running',
+    importFilename: 'validating.science',
+    progress: { phase: 'validating' },
+    pendingImports: [{ id: 'queue-1', filename: 'queued.science' }],
+    browserTransfers: [
+      {
+        id: 'settled',
+        filename: 'settled.science',
+        state: 'cancelled',
+        completedBytes: 0,
+        totalBytes: 10
+      },
+      {
+        id: 'receiver-a',
+        filename: 'receiving.science',
+        state: 'receiving',
+        completedBytes: 3,
+        totalBytes: 10
+      },
+      {
+        id: 'receiver-b',
+        filename: 'waiting.science',
+        state: 'waiting',
+        completedBytes: 0,
+        totalBytes: 10
+      }
+    ]
+  }
+  const request = vi.fn(async () => current)
+  vi.stubGlobal('api', { sessions: { packageOperation: request } })
+  usePackageOperationStore.getState().receive(current)
+  await act(async () => root.render(<SessionPackageOperation />))
+  expect(document.body.textContent).toContain('Validating package…')
+  expect(document.querySelector('[title="validating.science"]')).not.toBeNull()
+  expect(document.body.textContent).not.toContain('settled.science')
+  expect(document.querySelector('[aria-label="receiving.science"]')?.textContent).toContain('30%')
+  const waiting = document.querySelector('[aria-label="waiting.science"]')!
+  await act(async () => (waiting.querySelector('button') as HTMLButtonElement).click())
+  expect(request).toHaveBeenLastCalledWith({
+    action: 'cancel-browser-transfer',
+    operationId: 'active-import',
+    transferId: 'receiver-b'
+  })
+  expect(usePackageOperationStore.getState().operation).toBe(current)
+})
+
+it('keeps previous cleanup available while presenting the new receipt as the primary task', async () => {
+  const current: PackageOperationSnapshot = {
+    id: 'cleanup-owner',
+    kind: 'import',
+    state: 'cancelled',
+    importFilename: 'cleanup.science',
+    cleanupPending: true,
+    progress: { phase: 'cleaning' },
+    pendingImports: [{ id: 'queued', filename: 'queued.science' }],
+    browserTransfers: [
+      {
+        id: 'new-transfer',
+        filename: 'new.science',
+        state: 'waiting',
+        completedBytes: 0,
+        totalBytes: 10
+      }
+    ]
+  }
+  const request = vi.fn(async () => current)
+  vi.stubGlobal('api', { sessions: { packageOperation: request } })
+  usePackageOperationStore.getState().receive(current)
+  await act(async () => root.render(<SessionPackageOperation />))
+  expect(document.querySelector('[title="new.science"]')).not.toBeNull()
+  expect(document.body.textContent).not.toContain('Package operation cancelled')
+  expect(document.body.textContent).toContain('Some temporary files could not be removed.')
+  await act(async () => button('Retry cleanup').click())
+  expect(request).toHaveBeenLastCalledWith({
+    action: 'retry-cleanup',
+    operationId: 'cleanup-owner'
+  })
+})
+
+it('keeps one task context from a new receipt through destination selection and explicit confirmation', async () => {
+  const request = vi.fn(async () => null)
+  vi.stubGlobal('api', {
+    sessions: { packageOperation: request },
+    projects: {
+      list: async () => [{ id: 'target', name: 'Destination', createdAt: 1, updatedAt: 1 }]
+    }
+  })
+  const previous: PackageOperationSnapshot = {
+    id: 'previous-export',
+    kind: 'export',
+    state: 'succeeded',
+    progress: { phase: 'saving' },
+    result: { filePath: '/previous.science' }
+  }
+  usePackageOperationStore.getState().receive(previous)
+  await act(async () =>
+    root.render(
+      <>
+        <SessionPackageOperation />
+        <PackageOperationIndicator />
+        <PackageExportProgressButton />
+      </>
+    )
+  )
+  let dialog: Element | null = null
+  for (const [state, status] of [
+    ['preparing', 'Preparing to receive package…'],
+    ['waiting', 'Waiting for browser…'],
+    ['receiving', 'Receiving package…']
+  ] as const) {
+    await act(async () =>
+      usePackageOperationStore.getState().receive({
+        ...previous,
+        browserTransfers: [
+          {
+            id: 'transfer',
+            filename: 'current.science',
+            state,
+            completedBytes: state === 'receiving' ? 4 : 0,
+            totalBytes: 10
+          }
+        ]
+      })
+    )
+    await act(async () => usePackageOperationStore.getState().setOpen(true))
+    dialog ??= document.querySelector('[role=dialog]')
+    expect(document.querySelector('[role=dialog]')).toBe(dialog)
+    expect(dialog?.querySelector('h2')?.textContent).toBe('Import Session package')
+    expect(document.querySelector('[title="current.science"]')).not.toBeNull()
+    expect(document.body.textContent).not.toContain('Session package exported')
+    expect(dialog?.textContent).toContain(status)
+    expect(dialog?.querySelector('[aria-label="Package steps"]')).toBeNull()
+    if (state === 'receiving') expect(dialog?.textContent).toContain('40%')
+  }
+  await act(async () => usePackageOperationStore.getState().setOpen(false))
+  expect(document.querySelector('[aria-label="Package progress"]')?.textContent).toContain(
+    'Receiving package…'
+  )
+  expect(document.body.textContent).not.toContain('Session package exported')
+  const importing: PackageOperationSnapshot = {
+    id: 'current-import',
+    kind: 'import',
+    state: 'running',
+    importFilename: 'current.science',
+    importRequestId: 'file-current',
+    progress: { phase: 'validating' },
+    browserTransfers: []
+  }
+  await act(async () => usePackageOperationStore.getState().receive(importing))
+  dialog = document.querySelector('[role=dialog]')
+  expect(document.body.textContent).toContain('Validating package…')
+  expect(dialog?.querySelector('[aria-label="Package steps"]')).toBeNull()
+  await act(async () =>
+    usePackageOperationStore
+      .getState()
+      .receive({ ...importing, state: 'awaiting-selection', progress: { phase: 'selecting' } })
+  )
+  expect(document.querySelector('[role=dialog]')).toBe(dialog)
+  expect(button('Continue').disabled).toBe(true)
+  await act(async () => (document.querySelector('input[value=target]') as HTMLInputElement).click())
+  await act(async () => button('Continue').click())
+  expect(request).toHaveBeenLastCalledWith({
+    action: 'select-project',
+    operationId: 'current-import',
+    target: { projectId: 'target' }
+  })
+  await act(async () =>
+    usePackageOperationStore.getState().receive({
+      ...importing,
+      state: 'awaiting-selection',
+      progress: { phase: 'confirming' },
+      importTarget: { projectId: 'target' },
+      importPreview: {
+        title: 'Research',
+        projectName: 'Source',
+        branchCount: 1,
+        messageCount: 1,
+        fileCount: 0,
+        totalBytes: 10,
+        omissions: []
+      }
+    })
+  )
+  expect(document.querySelector('[role=dialog]')).toBe(dialog)
+  expect(request).not.toHaveBeenCalledWith(expect.objectContaining({ action: 'confirm-import' }))
+  await act(async () => button('Import').click())
+  expect(request).toHaveBeenLastCalledWith(
+    expect.objectContaining({ action: 'confirm-import', operationId: 'current-import' })
+  )
+})
+
+it('can hide a cancelled receipt while its cleanup is pending', async () => {
+  const operation: PackageOperationSnapshot = {
+    id: 'receipt-owner',
+    kind: 'import',
+    state: 'running',
+    browserReceiptOnly: true,
+    progress: { phase: 'preparing' },
+    browserTransfers: [
+      {
+        id: 'receipt',
+        filename: 'cleanup.science',
+        state: 'cancelled',
+        cleanupPending: true,
+        completedBytes: 2,
+        totalBytes: 10
+      }
+    ]
+  }
+  vi.stubGlobal('api', { sessions: { packageOperation: vi.fn(async () => operation) } })
+  usePackageOperationStore.getState().receive(operation)
+  await act(async () => root.render(<SessionPackageOperation />))
+  expect(button('Retry cleanup')).toBeDefined()
+  await act(async () =>
+    (document.querySelector('[aria-label="Hide progress"]') as HTMLButtonElement)?.click()
+  )
+  expect(usePackageOperationStore.getState().open).toBe(false)
+})
+
+it('groups verified duplicate evidence and retains expandable source paths', async () => {
+  const checksum = 'a'.repeat(64)
+  const paths = [
+    'execution-file-evidence/p/s/activity-a/blobs/sha256-a',
+    'execution-file-evidence/p/s/activity-b/blobs/sha256-a',
+    'artifacts/p/s/result.csv'
+  ]
+  const inventory: PackageOperationSnapshot = {
+    ...snapshot,
+    files: [],
+    summary: {
+      metadataBytes: 0,
+      retainedFiles: paths.map((storageKey) => ({
+        storageKey,
+        filename: storageKey,
+        sizeBytes: 1024 * 1024,
+        checksum
+      }))
+    }
+  }
+  vi.stubGlobal('api', {
+    sessions: {
+      onPackageOperation: () => () => undefined,
+      packageOperation: vi.fn(async () => inventory)
+    }
+  })
+  await act(async () =>
+    root.render(
+      <>
+        <PackageOperationIndicator />
+        <SessionPackageOperation />
+      </>
+    )
+  )
+  act(() => button('Customize contents').click())
+  act(() => button('View files').click())
+  const details = document.querySelector('details')!
+  expect(details).not.toBeNull()
+  expect(details.querySelector('summary')?.textContent).toContain('×3')
+  for (const path of paths) expect(details.textContent).toContain(path)
+  expect(document.body.textContent).toContain('1.0 MiB')
+  expect(document.body.textContent).not.toContain('2.0 MiB')
+  for (const category of ['Artifacts1', 'Execution evidence1', 'All1']) {
+    act(() => button(category).click())
+    const requiredFiles = button(category).closest('section')!
+    expect(requiredFiles.querySelectorAll('details')).toHaveLength(1)
+    for (const path of paths)
+      expect(requiredFiles.querySelector('details')?.textContent).toContain(path)
+  }
+})
+
+it('shows weighted overall import progress through checking, publication and success', async () => {
+  const operation: PackageOperationSnapshot = {
+    id: 'weighted-import',
+    kind: 'import',
+    state: 'running',
+    importFilename: 'research.science',
+    progress: { phase: 'validating', importStage: 'prepare-preview', overallPercent: 21 }
+  }
+  vi.stubGlobal('api', {
+    sessions: { packageOperation: async () => operation, onPackageOperation: () => () => undefined }
+  })
+  usePackageOperationStore.setState({ operation, open: true })
+  await act(async () => root.render(<SessionPackageOperation />))
+  const bar = (): Element | null => document.querySelector('[role="progressbar"]')
+  expect(bar()?.getAttribute('aria-valuenow')).toBe('21')
+  expect(document.body.textContent).toContain('Preparing package preview…')
+  expect(document.body.textContent).not.toContain('Stage 3 of 9')
+  expect(bar()?.getAttribute('aria-label')).toBe('Overall import progress (estimated)')
+  act(() =>
+    usePackageOperationStore.getState().receive({
+      ...operation,
+      progress: { phase: 'importing', importStage: 'publish', overallPercent: 99 }
+    })
+  )
+  expect(bar()?.getAttribute('aria-valuenow')).toBe('99')
+  expect(document.body.textContent).toContain('Finishing import…')
+  act(() =>
+    usePackageOperationStore.getState().receive({
+      ...operation,
+      state: 'succeeded',
+      progress: { phase: 'importing', importStage: 'publish', overallPercent: 99 }
+    })
+  )
+  expect(bar()?.getAttribute('aria-valuenow')).toBe('100')
+  act(() =>
+    usePackageOperationStore
+      .getState()
+      .receive({ ...operation, state: 'cancelling', progress: { phase: 'cleaning' } })
+  )
+  expect(bar()).toBeNull()
+})
+
+it('keeps a catalog download cancellable after leaving home and retains its manually opened dialog', async () => {
+  const download: PackageOperationSnapshot = {
+    id: 'catalog-download',
+    kind: 'import',
+    state: 'running',
+    progress: { phase: 'preparing' },
+    useCaseDownload: { slug: 'research', completedBytes: 35, totalBytes: 100 }
+  }
+  const request = vi.fn(async () => download)
+  vi.stubGlobal('api', {
+    sessions: { packageOperation: request, onPackageOperation: () => () => undefined }
+  })
+  useNavigationStore.setState({ view: 'home' })
+  usePackageOperationStore.getState().receive(download)
+  await act(async () =>
+    root.render(
+      <>
+        <PackageOperationIndicator />
+        <SessionPackageOperation />
+      </>
+    )
+  )
+  expect(document.body.textContent).not.toContain('Downloading 35%')
+  await act(async () => useNavigationStore.setState({ view: 'workspace' }))
+  expect(document.body.textContent).toContain('Downloading 35%')
+  await act(async () => button('View progress').click())
+  expect(document.querySelector('[role="dialog"]')).not.toBeNull()
+  await act(async () =>
+    usePackageOperationStore.getState().receive({
+      ...download,
+      useCaseDownload: { ...download.useCaseDownload!, completedBytes: 40 }
+    })
+  )
+  expect(document.querySelector('[role="dialog"]')).not.toBeNull()
+  expect(document.body.textContent).toContain('Downloading 40%')
+  await act(async () => button('Cancel').click())
+  expect(request).toHaveBeenCalledWith({ action: 'cancel', operationId: 'catalog-download' })
+  useNavigationStore.setState({ view: 'home' })
+})
+
+it('releases a failed local Web upload when explicitly closing its result', async () => {
+  document.documentElement.setAttribute(WEB_EVENT_SURFACE_ATTRIBUTE, 'true')
+  document.documentElement.setAttribute(WEB_CALLER_LOCATION_ATTRIBUTE, 'local')
+  const failed: PackageOperationSnapshot = {
+    id: 'failed-upload',
+    kind: 'import',
+    state: 'failed',
+    progress: { phase: 'importing' },
+    importRequestId: 'upload-1',
+    error: 'Import failed'
+  }
+  const respond = vi.fn(async () => failed)
+  vi.stubGlobal('api', {
+    sessions: {
+      onPackageOperation: () => () => undefined,
+      packageOperation: respond
+    }
+  })
+  usePackageOperationStore.setState({ operation: failed, open: true })
+  await act(async () => root.render(<SessionPackageOperation />))
+  respond.mockClear()
+  await act(async () => button('Close').click())
+  expect(respond).toHaveBeenCalledWith({
+    action: 'discard-import',
+    operationId: 'failed-upload',
+    requestId: 'upload-1'
+  })
+  expect(usePackageOperationStore.getState().dismissedId).toBe('failed-upload')
+})
+
+it('uses the browser picker to choose another package after a local Web import fails', async () => {
+  document.documentElement.setAttribute(WEB_EVENT_SURFACE_ATTRIBUTE, 'true')
+  document.documentElement.setAttribute(WEB_CALLER_LOCATION_ATTRIBUTE, 'local')
+  const failed: PackageOperationSnapshot = {
+    id: 'failed-upload',
+    kind: 'import',
+    state: 'failed',
+    progress: { phase: 'validating' },
+    importRequestId: 'upload-1',
+    error: 'Import failed'
+  }
+  const importPackage = vi.fn()
+  vi.stubGlobal('api', {
+    sessions: {
+      importPackage,
+      onPackageOperation: () => () => undefined,
+      packageOperation: async () => failed
+    }
+  })
+  usePackageOperationStore.setState({ operation: failed, open: true })
+  await act(async () => root.render(<SessionPackageOperation />))
+  await act(async () => button('Choose another package').click())
+  const picker = document.querySelector<HTMLInputElement>('input[type="file"]')
+  expect(picker).not.toBeNull()
+  await act(async () => {
+    picker!.dispatchEvent(new Event('cancel'))
+  })
+  expect(importPackage).not.toHaveBeenCalled()
+})
+
+it.each(['cancelled', 'succeeded'] as const)(
+  'removes the background indicator after %s without dismissing the dialog result',
+  async (state) => {
+    const operation: PackageOperationSnapshot = {
+      id: 'completed-import',
+      kind: 'import',
+      state,
+      progress: { phase: 'importing' }
+    }
+    usePackageOperationStore.setState({ operation, open: false })
+    await act(async () => root.render(<PackageOperationIndicator />))
+    expect(document.querySelector('[aria-label="Package progress"]')).toBeNull()
+    expect(usePackageOperationStore.getState().operation).toBe(operation)
+    act(() =>
+      usePackageOperationStore.setState({ operation: { ...operation, cleanupPending: true } })
+    )
+    expect(document.querySelector('[aria-label="Package progress"]')).not.toBeNull()
+  }
+)
+
+it('keeps a completed imported result available in the background', async () => {
+  const operation: PackageOperationSnapshot = {
+    id: 'completed-import',
+    kind: 'import',
+    state: 'succeeded',
+    progress: { phase: 'importing' },
+    result: { imported: { projectId: 'project', sessionId: 'session' } }
+  }
+  usePackageOperationStore.setState({ operation, open: false })
+  await act(async () => root.render(<PackageOperationIndicator iconOnly />))
+  const indicator = document.querySelector('[aria-label="Package progress"]')
+  expect(indicator).not.toBeNull()
+  await act(async () => (indicator?.querySelector('button') as HTMLButtonElement).click())
+  expect(usePackageOperationStore.getState().open).toBe(true)
+})
+
+it.each(['running', 'cancelling', 'failed', 'awaiting-selection'] as const)(
+  'keeps %s background imports discoverable',
+  async (state) => {
+    usePackageOperationStore.setState({
+      operation: { id: 'import', kind: 'import', state, progress: { phase: 'importing' } },
+      open: false
+    })
+    await act(async () => root.render(<PackageOperationIndicator />))
+    expect(document.querySelector('[aria-label="Package progress"]')).not.toBeNull()
+  }
+)
+
+it.each([
+  { pendingImports: [{ id: 'next', filename: 'next.science' }] },
+  { importQueueFull: true },
+  {
+    result: {
+      recovery: {
+        projectId: 'p',
+        sessionId: 's',
+        operationId: 'import',
+        outcome: 'unconfirmed' as const
+      }
+    }
+  }
+])('preserves attention needed after a terminal import: %j', async (attention) => {
+  usePackageOperationStore.setState({
+    operation: {
+      id: 'import',
+      kind: 'import',
+      state: 'succeeded',
+      progress: { phase: 'importing' },
+      ...attention
+    },
+    open: false
+  })
+  await act(async () => root.render(<PackageOperationIndicator />))
+  expect(document.querySelector('[aria-label="Package progress"]')).not.toBeNull()
 })

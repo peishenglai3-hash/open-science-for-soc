@@ -262,6 +262,10 @@ roles remain explicit in the tables above.
 
 ### PDF reading and annotations
 
+- PDF reading order is automatic. The reader shows no manual body-region configuration panel or overlays. Extraction uses complete PDF logical structure when available, then page layout; ambiguous untagged layouts retain native order. Historical manual body selections no longer control extraction.
+
+- All single-page PDFs, including Literature attachments, use an image-style preview with centered fit, pan and zoom controls. Hide reading tabs, annotations, translation, search and page navigation; do not offer a full-reader switch. Existing saved annotations and translations remain stored. Multi-page PDFs retain the complete reader.
+
 - PDF floating toolbars use 28px fine-pointer buttons, at least 24px-wide split disclosures, compact gaps and 44px coarse-pointer targets. Keep selected states, focus indicators and tooltips. Notes & Annotations uses 32px controls, 12px utility text and 4px vertical toolbar padding, matching Replay density.
 - Completed PDF analysis shows the figures/tables directly, including cached results on reopen, with a screen-reader completion announcement. Keep analysis options (parallel pages and explicit re-analysis) in the result header's overflow popover, or beside the empty-result message. Loading, active progress, cancellation, partial results and failures retain their existing visible feedback and recovery actions.
 
@@ -338,6 +342,47 @@ roles remain explicit in the tables above.
 - Loading commands expose `aria-busy` and preserve their existing disabled rules. Reduced motion disables the content animation and nested spinner rotation. Dense navigation, selection, send/stop and cancellation controls retain immediate feedback.
 - The Home update action reveals its label on hover and keyboard focus over 200ms. Touch, download progress and failures keep the label visible. Clicking always opens the existing update dialog once; revealing a label adds no disclosure state. The Session update action retains its persistent label.
 
+### SplitButton
+
+Use `@/components/ui/split-button` for a primary action with a separate dropdown arrow.
+Compose `SplitButtonGroup`, `SplitButtonPrimary`, `SplitButtonTrigger` and `SplitButtonContent`
+inside `SplitButton`. Labels arrive translated from the caller.
+
+```tsx
+<SplitButton disabled={disabled} busy={busy} hideMenu={!hasAlternatives}>
+  <SplitButtonGroup>
+    <SplitButtonPrimary className="border-0" onClick={onPrimary}>
+      {primaryLabel}
+    </SplitButtonPrimary>
+    <SplitButtonTrigger className="border-0" size="icon" aria-label={optionsLabel}>
+      <ChevronDown aria-hidden="true" />
+    </SplitButtonTrigger>
+  </SplitButtonGroup>
+  <SplitButtonContent matchWidth align="end">
+    <DropdownMenuItem onSelect={onAlternative}>{alternativeLabel}</DropdownMenuItem>
+  </SplitButtonContent>
+</SplitButton>
+```
+
+- Default `kind="menu"` accepts existing `DropdownMenuItem` and radio items. Use
+  `kind="popover"` for search, session pickers and custom panels; retain their focus and keyboard
+  behavior. Options, selection, hover/pinning and effects belong to the caller.
+- Use `open` / `onOpenChange` for controlled state, or `defaultOpen` for uncontrolled state.
+  Root `disabled` or `busy` disables both buttons; each segment also accepts `disabled`.
+  `hideMenu` removes the arrow and panel when only the primary action is needed.
+- Both segments accept Button props, including `variant`, `size`, `className`, `ref` and
+  `asChild`. Preserve existing colors and icons; custom filled segments use `border-0` to avoid
+  transparent gaps. Keep the shared separator and neutral panel background.
+- Use `matchWidth` for short menus. Give larger panels their own width and `align="start"` or
+  `"end"`; content retains positioning, collision, portal `container` and layer props.
+  The component handles connected corners, final placement and reversible 240/160 ms animation.
+  Let the component manage panel mounting; do not conditionally render or key content by `open`,
+  or override its animation.
+- Examples: [QuestionSkipButton](../src/renderer/src/pages/workspace/QuestionSkipButton.tsx)
+  for actions, [PermissionScopeButton](../src/renderer/src/pages/workspace/PermissionScopeButton.tsx)
+  for radio choices, and [LibraryChatButton](../src/renderer/src/pages/workspace/previews/LibraryChatButton.tsx)
+  for search and hover/pinning. Preserve the Tooltip focus guard described in `AGENTS.md`.
+
 ### External Link
 
 - Ordinary external text links use the shared `ExternalTextLink` component: an underlined `text-primary` label trailed by a lucide `ArrowUpRight` icon. Do not use a bare `<a>` or a Unicode `↗` for those links. Specialized branded controls (the GitHub badge), actionable consent flows (startup issue submission), and Agent Markdown links retain their own owners, accessible names, activation checks and navigation policy; their different visual treatment is intentional. This exception does not cover ordinary help, documentation or resource links.
@@ -392,6 +437,7 @@ roles remain explicit in the tables above.
 
 - Use DropdownMenu for action menus, Popover for lightweight auxiliary layers, and Select for single-value selection.
 - `DropdownMenuContent`: `overscroll-contain rounded-[15px] border border-border bg-popover p-1.5 text-popover-foreground shadow-menu`; `shadow-menu` is `0 2px 8px rgb(0 0 0 / 0.08)`. Popovers may keep their domain-specific layout.
+- Shared `PopoverContent` uses `border border-border bg-popover text-popover-foreground shadow-menu`. Nested notices, forms and secondary copy use normal foreground and muted tokens; do not depend on inverse Tooltip colors. Compact Tooltips retain the shared theme-aware inverse treatment; callers must not replace it with fixed black/white colors.
 - Shared menu label: `px-2 py-1 text-xs text-muted-foreground`.
 - Shared menu items have `min-h-8`, 8px horizontal padding and 6px vertical padding; labels may wrap without a forced 32px height.
 - Shared item hover / keyboard highlight: `bg-muted text-foreground`; disabled items are non-interactive at `opacity-50`.
@@ -604,6 +650,14 @@ The upper-right pin toggles the current Session through the shared Session contr
 - User bubble: `ml-auto max-w-[90%] md:max-w-[min(85%,56rem)] rounded-2xl bg-bg-300 px-3.5 py-2 md:px-4 md:py-2.5 text-sm md:text-[15px] text-message-user-text`.
 - Assistant wrapper: `w-full max-w-[56rem] text-sm md:text-[15px] leading-relaxed text-text-000`.
 - Message metadata uses `text-[11px] text-text-000/70 tabular-nums` below the content so timestamps and elapsed status meet WCAG contrast on workspace surfaces. Visible timestamp formatting follows the selected interface language: User Messages show `Sent ...`, completed Agent Messages show `Completed ...`, and failed Agent Messages show `Failed ...`. Terminal timestamps are persisted separately from mutable record update times. Treat the Agent footer as Turn-level metadata: render it after the last visible Message, Tool activity, Plan record, compaction record, handoff, or inline Subagent update explicitly owned by that Prompt, rather than nesting it inside the final Agent Message fragment. Agent footers keep terminal time, elapsed time, and `Calls` on one line without a separator (`Completed ... Elapsed 2m 5s Calls`). `Calls` uses a dashed underline and reveals a compact Context-window-style popover on pointer hover or keyboard focus. The popover has a proportional color bar above its token rows and a divided `Total` row below them. When an adapter reports a reliable agentic model-call count, show `1 call` or `N calls` as smaller muted text aligned to the right of the popover title; omit it rather than estimating when unavailable. Show Input, Cache, and Output when only aggregate cache data is available; split Cache into Cache read and Cache write, with distinct colors and bar segments, only when the agent reports both categories. The displayed categories are mutually exclusive and `Total` is their sum.
+- Settled Main conversation turns collapse intermediate Agent messages and tool activity behind a
+  keyboard-accessible “previous messages” disclosure. Count only hidden Agent messages, excluding
+  tool activity and the final visible reply; tool-only turns remain expanded. Keep the final reply and completion actions
+  visible. Failed turns retain a failure label, partial reply and existing error/recovery surfaces;
+  running, waiting, cancelled and interrupted turns remain expanded. Group only explicitly owned
+  rows with a reliable persisted turn outcome; ambiguous legacy history stays visible. Expansion is
+  transient and scoped to the Session and active branch. Search, annotations and native find reveal
+  hidden content before locating it. Isolated Subagent transcripts retain their existing behavior.
 - Agent loading surface is transparent and keeps `px-3 py-2` for stable transcript geometry; elapsed and status text use `text-text-000/70`, while the brand indicator uses `text-text-300`. A silent foreground prompt shows `[indicator] · Thinking` with elapsed time and the existing slow-response hint. Active tools show `[indicator] · Interacting with tools` without a timer. Permission and Plan approval waits show `[indicator] · Waiting for your approval`; pending credential requests and ask-user elicitation show `[indicator] · Waiting for your response`. User waits take precedence over visible assistant output and remain untimed until resolved. Outside those waits, visible assistant text or images hide the indicator; when the current tool transitions to a terminal state, Thinking returns with a fresh timer until the next visible output. Runtime stop, failure, disconnect, and compaction clear the transient indicator state. Historical, duplicate, and late tool events must not revive it or reorder the activity timeline.
 - User Message copy and edit actions sit immediately left of the bubble and use the standard inline-action opacity transition on row hover or keyboard focus. When editing creates multiple Branches, keep the Branch navigation persistently visible at the right end of the metadata footer below the bubble, after the sent time, with previous/next controls around a Branch icon and the current/total count. Let the footer wrap on narrow surfaces so the navigation remains the final bottom row without colliding with the sent time.
 - Tool row: `h-8 rounded-lg px-2 text-[13px] hover:bg-foreground/[0.04]`.
@@ -672,6 +726,10 @@ The upper-right pin toggles the current Session through the shared Session contr
   cancellation, or edit failures keep
   the row and show a recoverable inline error.
 - Queued messages are transient and Session-scoped. They are not persisted across renderer restart.
+  A collapsed queue still announces items needing attention. Removing an unsent item offers an
+  eight-second Undo action, retaining its captured target and attachments until restored or expired.
+  Closing with unsent queued messages requires an explicit decision to review them or force quit;
+  messages already appended to the transcript do not count as unsent.
   Bind each item to its admission Message Branch and block branch switching
   while that Session has queued work; inline message edits remain available and enter the queue as revisions so a later dispatch cannot silently retarget it. Pause queue
   dispatch while a visible root or delegated Permission request is pending. Keep the Permission
@@ -711,6 +769,7 @@ The upper-right pin toggles the current Session through the shared Session contr
   approval, Ask-User elicitation, or Plan approval owns the composer lane, hide the Notebook, jobs,
   and Plan status chrome above it. Restore that status chrome only with the ordinary composer.
 - Textarea: `min-h-[36px] max-h-[200px] py-1.5 text-[15px] leading-relaxed text-text-000 placeholder:text-text-100`.
+- Empty composers show an **Input help** ghost icon action beside the placeholder. Its popover and the editor's `aria-describedby` expose the same complete platform-specific command list (`/` for Skills, `@` for files and Library, `#` for Sessions, global search, and history navigation). Hide the action once content exists; narrow and assistive-technology users must not depend on a truncated placeholder.
 - Toolbar action buttons are `h-8 w-8`; send uses `bg-primary text-primary-foreground hover:bg-primary/80`, cancel uses `bg-bg-200 text-text-000 hover:bg-bg-300`.
 - Read-only state: apply `opacity-50` to the input content and action area as a whole, but do not shrink the layout.
 - Drag-and-drop state: use `ring-ring/50`, `border-ring/50`, or a semantic success token. Do not hardcode a new green.
@@ -720,6 +779,9 @@ The upper-right pin toggles the current Session through the shared Session contr
   filenames. Ordinary files use the existing composer intake and remain draft attachments until
   submission; one `.science` package opens the existing Project import flow. Reject mixed package
   batches without partially attaching or importing. Respect blocked composer and Project availability.
+- Reject native drops containing folders before attachment staging or package import, including
+  folders named with a `.science` suffix. Add nothing from that batch, preserve existing attachments,
+  and show a dismissible notice directing the user to select files inside the folder instead.
 - Project Home also accepts one `.science` package across its content area with the same bounded
   overlay. Dropping opens the existing destination Project picker, followed by the existing import
   preview and confirmation; Home does not preselect the previously visited Project.
@@ -820,7 +882,7 @@ The upper-right pin toggles the current Session through the shared Session contr
   follow the same Session-number lookup as ASCII digits. This policy applies to the local Session
   title catalog, not the separate Artifact filename search.
 - List row: `h-10 rounded-lg px-3 hover:bg-accent hover:text-accent-foreground`.
-- Inline more actions: default `opacity-0`, then `opacity-100` on hover or focus-visible.
+- Inline more actions use opacity reveal only in `(hover:hover) and (pointer:fine)`. Coarse pointers keep the action visible with a 44px target (`size-11`); desktop retains `size-7` and the hover/focus/open behavior.
 
 ### Onboarding
 
@@ -831,6 +893,7 @@ The upper-right pin toggles the current Session through the shared Session contr
 - Work surface: one shadcn `Card`, `min-h-[420px] gap-0 rounded-lg bg-bg-000 py-0 shadow-card ring-1 ring-border-200`; do not nest visual cards inside it.
 - Current step uses `bg-primary text-primary-foreground`; completed and inactive labels remain neutral.
 - Commands use shadcn `Button`; primary commands inherit the shared deep-green `primary` variant.
+- If the default data location cannot be loaded and no custom location is selected, keep Continue disabled and preserve Retry, Back, and Browse. A confirmed custom location may still use the existing restart confirmation; never treat an unknown location as an implicit default.
 - ProviderForm field guidance uses the shared `FieldHelp` component next to the field label. It accepts only `content: ReactNode`; field types and copy mappings remain owned by the form.
 - `FieldHelp` uses a neutral shadcn `Button variant="ghost" size="icon-xs"`, overridden to `size-[18px] rounded-full bg-transparent text-muted-foreground/50`. Hover, keyboard focus, and open states use `bg-muted text-foreground`; it uses Lucide `CircleHelp` and never uses `primary`.
 - Provider type, Base URL, API key, and Supported models descriptions live only in the shared shadcn `Tooltip` (`max-w-[280px] px-3 py-2 text-xs leading-5 whitespace-normal`); do not render helper copy below those controls. Validation errors remain inline below their inputs.
@@ -844,6 +907,7 @@ The upper-right pin toggles the current Session through the shared Session contr
 - Top tabs: `h-11 px-2`, active tab `h-8 rounded-md bg-accent`.
 - Activity stream: `ScrollArea className="min-w-0 flex-1"`.
 - Composer: fixed to the bottom of the activity stream and constrained to `max-w-4xl`, with the composer text track aligned to the message content.
+- While the root turn is busy, the composer primary-action slot shows Stop for an empty or unavailable draft and switches to an upward-arrow queue action when the draft can be submitted. Clicking the arrow or pressing Enter adds the draft to the message queue; clearing or successfully queueing the draft restores Stop. Keep Stop in the options menu while the queue action occupies the primary slot. Retain the same two-control width (primary action and options) so the model picker and pointer targets do not shift. Pending Stop shows progress and blocks duplicate cancellation and queue submission.
 - Right viewer area: `border-l border-border/20`.
 - Side chat headers follow Replay chrome: a compact title/information popover on the left and ghost icon actions for the main Session, full screen, and close on the right. The information popover identifies the owning Session; it does not represent the exact conversation context snapshot. Reuse tool-panel expansion so draft, transcript and running state survive layout changes; returning to the main Session collapses the expanded surface.
 - Desktop side-panel dividers reveal a centered, full-height 2px `text-200` line on hover,
@@ -858,6 +922,7 @@ The upper-right pin toggles the current Session through the shared Session contr
 - Conversation panel shell: `bg-bg-10 p-2 pl-4`.
 - Composer area uses a top fade `bg-gradient-to-t from-bg-10 to-bg-10/0`.
 - Message scroller and preview panel both use `bg-bg-10`.
+- The **First message** shortcut reveals after upward scrolling and auto-hides after idle. Hover or focus-within pauses that timeout; pointer leave or focus exit resumes it. Never hide a focused control or move it to `tabIndex=-1` while it remains the active element.
 
 #### Composer skill selector
 
@@ -877,6 +942,11 @@ The upper-right pin toggles the current Session through the shared Session contr
 - Put hostname validation beside the input, distinguish Add to list from Save changes, and report
   unsaved changes through the shared leave guard. Save blocks concurrent edits; errors retain drafts.
   Explain that saving resets protected connections. Inactive protection gets an explicit scope notice.
+- Custom public domains accept exact hostnames, leading `*.` rules, and pasted HTTP(S) URLs.
+  URL input saves only the hostname, preserving subdomain labels such as `www`; scheme, port,
+  path, query and fragment are discarded. Wildcards cover every descendant subdomain but not the
+  root domain, which must be added separately. Explicit ask rules and private-address blocks remain
+  effective. Existing exact-host settings need no migration; older versions may drop wildcard rules.
 - Trusted private services have a separate local-only flow: exact hostname and port, DNS review,
   displayed address set and installation-wide data-sending consequence, then explicit Add and Save.
   Input edits invalidate prior reviews; late results cannot restore them. Saved rules support review
@@ -904,6 +974,7 @@ The upper-right pin toggles the current Session through the shared Session contr
 - Network > Proxy is a breadcrumb-backed second-level form. It offers System (the historical default), Manual, and Direct modes; Manual uses a labeled proxy URL, optional bypass rules, blur/save validation, and explicit rejection of embedded credentials. System keeps per-request OS/PAC resolution inside Electron while new agent processes inherit only the proxy environment present when Open-Science started; Manual supplies a fixed proxy to both stacks, and Direct clears proxy variables. Saving reports inline loading, error, or quiet success and explains that only new requests and processes adopt the change; live agents, notebook kernels, and installers are not restarted.
 - Select fields use `Select`, with a `32px` trigger height.
 - A visible Settings search or filter field owns the platform search shortcut: `Cmd+K` on macOS and `Ctrl+K` on Windows/Linux focus it without selecting or clearing its value. The topmost nested Settings dialog wins over a search behind it; hidden or disabled searches do not intercept the shortcut. Persistent list-toolbars show the shortcut as right-aligned keycaps inside the field, while transient searches such as runtime-package and Specialist capability filters expose the same behavior through `aria-keyshortcuts` without repeating the visual hint.
+- The first Escape in Settings search closes the result list but preserves input focus and does not reopen it until typing or ArrowDown. A later Escape follows ordinary dialog dismissal; IME composition keeps priority.
 
 #### Resource identity and display names
 
@@ -1011,7 +1082,8 @@ The upper-right pin toggles the current Session through the shared Session contr
 - `storageRoot` is the historical code name for this fixed, non-relocatable `configRoot`; it is not the user-selectable `dataRoot`. Personal and Imported source packages, Settings, and the app-owned agent profiles live below `configRoot`. `dataRoot` holds relocatable artifacts, notebooks, and rebuildable compute/runtime assets and does not participate in user-Skill discovery.
 - Personal and Imported directories are the writable source of truth. The app scans those two sources into one central catalog; agent frameworks do not independently scan them in place. The user-Skill catalog observer watches `<configRoot>/skills`, coalesces bursts to at most one running and one pending reconciliation, and falls back to reconciliation every 30 seconds when recursive watching is unavailable. A catalog fingerprint change refreshes Settings and retires the current agent runtime generation. An active turn finishes against its existing generation, while every later turn resumes through a freshly provisioned generation.
 - User-Skill compatibility hashing is incremental. A rebuildable index at `<configRoot>/runtime-support/user-skill-compatibility-v1.json` stores only relative package/file paths, file size and timestamps, and SHA-256 hashes; it never stores file contents or absolute paths. Unchanged files reuse their hashes, changed files are streamed through the hasher, deleted entries are pruned, and a missing or corrupt index is rebuilt from the Personal and Imported sources. The index lives outside `<configRoot>/skills`, so persisting it cannot trigger the catalog observer.
-- Before an agent runtime starts, the enabled central catalog is copied into that framework's isolated, rebuildable Skill projection. Claude keeps its private profile at `<configRoot>/claude` and publishes Agent-readable Skills at `<configRoot>/runtime-support/agent-skills/claude/v1/<revision>/.claude/skills/<skill-name>`. Shared, isolated, and custom Claude sessions mount that revision as an additional directory for supporting-file access while keeping the workspace `project` settings source disabled. A primary-session-only, allowlisted loader aliases Claude's native `Skill { skill, args? }` call to the selected immutable package; its short always-loaded tool description points Claude to scoped canonical names and descriptions encoded as described constants in the `skill` input schema, avoiding Claude Code's per-tool-description truncation while keeping Featured, Personal, Imported, Connector, and Compute Skills discoverable without enabling workspace project settings. Discovery metadata is bounded to 256 Skills and 64 KiB per session; overflow packages remain explicitly invocable by canonical name through the schema's string fallback. Its Agent-facing server name is the neutral `skills`, so discovery and invocation expose neither an application plugin namespace nor an `os-` catalog marker. Reviewer, Side chat, and restricted inference sessions do not receive this loader or catalog: Claude gets an isolated empty projection, while OpenCode and Codex skip application Skill and Connector materialization before their restricted profiles are applied. Specialists see only their exact Skill scope. The projection root permits only `.claude/skills`, preventing project settings, hooks, agents, commands, or `CLAUDE.md` from entering through this mount. OpenCode and Codex continue to project primary-session content into `<configRoot>/opencode/config/opencode/skills/os-<catalog-id>`, `<configRoot>/codex/skills/os-<catalog-id>`, or `<configRoot>/codex-subscription/skills/os-<catalog-id>`; for those backends the internal `os-<catalog-id>` directory remains a projection identity, not the user package name. Projections are normalized and made read-only while preserving executable bits; the Personal/Imported source package remains authoritative. Claude revisions are immutable snapshots so a running session never observes a half-updated Skill tree. The single-instance desktop runtime retains every revision published by its current process for active-session safety, then removes those rebuildable revisions on the next process's first provision.
+- Before an agent runtime starts, the enabled central catalog is copied into that framework's isolated, rebuildable Skill projection. Claude keeps its private profile at `<configRoot>/claude` and publishes Agent-readable Skills at `<configRoot>/runtime-support/agent-skills/claude/v1/<revision>/.claude/skills/<skill-name>`. Shared, isolated, and custom Claude sessions mount that revision as an additional directory for supporting-file access while keeping the workspace `project` settings source disabled. A primary-session-only, allowlisted loader aliases Claude's native `Skill { skill, args? }` call to the selected immutable package; its short always-loaded tool description points Claude to scoped canonical names and descriptions encoded as described constants in the `skill` input schema, avoiding Claude Code's per-tool-description truncation while keeping Featured, Personal, Imported, Connector, and Compute Skills discoverable without enabling workspace project settings. Discovery metadata is bounded to 256 Skills and 64 KiB per session; overflow packages remain explicitly invocable by canonical name through the schema's string fallback. Its Agent-facing server name is the neutral `skills`, so discovery and invocation expose neither an application plugin namespace nor an `os-` catalog marker. Reviewer, Side chat, and restricted inference sessions do not receive this loader or catalog: Claude gets an isolated empty projection, OpenCode and Codex skip application Skill and Connector materialization before their restricted profiles are applied, and Pi drops its Skill runtime server and runs in a per-runtime Pi home, agent directory, and session store instead of Main's. Specialists see only their exact Skill scope. The projection root permits only `.claude/skills`, preventing project settings, hooks, agents, commands, or `CLAUDE.md` from entering through this mount. OpenCode and Codex continue to project primary-session content into `<configRoot>/opencode/config/opencode/skills/os-<catalog-id>`, `<configRoot>/codex/skills/os-<catalog-id>`, or `<configRoot>/codex-subscription/skills/os-<catalog-id>`; for those backends the internal `os-<catalog-id>` directory remains a projection identity, not the user package name. Projections are normalized and made read-only while preserving executable bits; the Personal/Imported source package remains authoritative. Claude revisions are immutable snapshots so a running session never observes a half-updated Skill tree. The single-instance desktop runtime retains every revision published by its current process for active-session safety, then removes those rebuildable revisions on the next process's first provision.
+- Notebook processes receive built-in read-only access to existing application-managed Skill projections: `<configRoot>/codex/skills`, `codex-subscription/skills`, `opencode/config/opencode/skills`, `runtime-support/agent-skills/claude`, and `codebuddy/skill-runtime/.claude/skills`. This directory policy makes supporting references, scripts, and assets readable without a folder grant; it does not filter files by the current Agent's Skill discovery scope. Provider credentials and private profile directories are outside the built-in grant. Missing projections are skipped, and symlinked/junction projection paths are not promoted into grants. Protected execution retains explicit write denials even under a broader writable folder grant; Windows standard mode retains its existing OS-permission behavior. Existing processes receive the policy when restarted; no permission records, migration, or new persisted state are introduced.
 - Specialist switching follows the provider's identity boundary. Claude replaces its provider Session because Specialist identity and Skill metadata are Session-level, then the renderer replays the bounded visible conversation history on the next turn. Codex and OpenCode retain their provider Session and do not replay history; every Specialist turn declares the current identity and exact scope as superseding all earlier Specialist identities and scopes, while every Main turn carries a compact declaration that revokes any earlier Specialist identity and Specialist-only Skill or Connector scope. If a switch wins while compatible resume is in flight, these turn-prefix routes re-resolve the latest binding locally and publish the already-resumed provider Session without a second resume, disposal, or replay.
 - Names beginning with `os-` or `mcp-`, names matching a bundled Featured/Internal Skill, Specialist sidecar IDs colliding with a bundled ID, and duplicate user sidecar IDs are logged and excluded so app-owned packages and user identities stay authoritative. Unsafe sidecar IDs are ignored. Existing newest-wins behavior remains for out-of-band Personal/Imported name duplicates; normal create/import flows prevent those collisions.
 - The Skills header shows Installed count, Browse Marketplace and Add skill. Source, Agent, Tag and search filters share the next wrapping row. Each category owns Select multiple / Done; selection happens in the current catalog, not a separate Manage page.
@@ -1077,6 +1149,32 @@ The upper-right pin toggles the current Session through the shared Session contr
 - Trailing controls retain Connector-specific retry, configure, and sign-in actions, followed by Tag assignment, the custom Connector action menu and shared Manage access popover. The custom menu orders Export, Edit, separator, Remove; removal continues to use the Specialist impact check and confirmation dialog.
 - Creating a custom OAuth Connector saves its configuration first, then immediately starts browser authorization in a cancellable dialog. Cancelling or failing authorization keeps the saved Connector disabled so the user can retry from the same dialog or finish later. Existing Connector rows reuse this dialog for sign-in rather than presenting a separate inline waiting state.
 - When a runtime refresh shows that a previously authenticated OAuth Connector has lost its tokens, the app raises one transient global notice with a shortcut back to Settings. The Connector row remains the persistent source of truth and continues to show that sign-in is required. This notice is session-local UI state: it adds no persisted status field, migration, or shared enum value.
+
+## Recoverable operations
+
+- Connector, Compute, Skill, Provider, Network, Memory category, Tag, service credential, and device
+  credential drafts participate in the shared Settings leave guard, including section changes,
+  history navigation and closing Settings. Successful saves clear dirty/busy state before navigation;
+  failed submissions retain editable input. Asynchronous completions from a closed or replaced editor
+  cannot navigate the current editor. Invalid SSH ports remain visible when advanced settings are
+  collapsed. Loading SSH aliases, failing to load them and finding no aliases have distinct
+  presentations with retry on failure.
+- Notification bulk-read and storage migration cancellation display pending and failure feedback.
+  Cancellation requests do not claim completion before the owning operation acknowledges it.
+- Desktop artifact downloads show processed-file progress and allow cancellation. Keep selections
+  stable while saving, wait for the actual terminal result and offer retry after cancellation errors.
+  A cancelled session batch retains successfully published files and selects only unfinished files
+  for retry; a cancelled project archive leaves the previous destination intact.
+- Notebook action errors remain visible regardless of the selected sidebar tab. Restarting R
+  requires confirmation that variables and loaded packages will be lost while saved files and
+  conversation history remain.
+- Literature import lets users exclude individual records. Selection changes recompute identity
+  matches against the selected set; pending or failed previews disable import and failures offer
+  retry. Excluded rows retain their diagnostics. Commit revalidates the selected records through
+  the existing transactional identity owner.
+- Empty global search results link to Archived settings, where archived projects and conversations
+  can be filtered by title or project. Onboarding explains why a tested model connection is needed
+  before setup can finish.
 
 ## Error notices
 
@@ -1270,3 +1368,10 @@ This protection does not add cross-restart autosave, a persisted draft format or
 - Group the heading, research starters and composer in one bounded start surface without a separate logo. Keep it visible while editing or staging files; place package import below as a secondary action.
 - Research starters use a native horizontal rail with circular arrows over faded edges, without reserving side columns. Hide each arrow at its boundary; a keyboard-focused arrow remains visible and aria-disabled until focus leaves. Use scroll padding to reveal focused items clear of the overlays. They prepare or append an editable prompt, never submit it. Preserve references, attachments and Reading context.
 - The first user message creates the active conversation and docks the same mounted editor at the bottom. Animate its position with a 200ms transform only; reduced motion docks immediately. Existing conversations remain docked. File staging and failed validation do not change the layout.
+
+### File intake areas
+
+- Use `FileDropZone` for inline file selection and file drops. It composes `useFileDropZone`, `FileDropOverlay`, and the shared Button; callers own file validation, destinations, and persistence.
+- Keep a compact picker/drop strip visible above existing attachments. Highlight the owning region during file drags without shifting layout. Use explicit action copy to distinguish importing references from attaching PDFs to one reference.
+- File drops must not bubble into another intake region or navigate the browser. Portaled content, covered surfaces, and busy operations must not start an underlying import.
+- Selecting files and dropping files use the same admission rules. Reject folders and unsupported combinations explicitly; never silently take only the first file. Keep successful attachments when another file fails, name the failure, and stop remaining files when a batch is cancelled.

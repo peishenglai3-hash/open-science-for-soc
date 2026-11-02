@@ -1,20 +1,24 @@
 import type { McpOAuthConfig, McpOAuthState } from '@aipoch/connector-mcp-client'
-import type { ClassificationAdapter, ClassificationBinding } from '../../shared/classification'
+import type { ClassificationAdapter } from '@aipoch/providers'
+import type { ClassificationBinding } from '../../shared/classification'
 import type { GrantedLocalRoot } from '../../shared/local-fs'
 import type { LanguagePreference } from '../../shared/locale'
 import type { PackageMirror } from '../../shared/mirror'
-import type { ChatApiEndpoint, ReasoningEffort } from '../../shared/model-preference-contract'
+import type {
+  ModelProtocol,
+  OfficialVendorId,
+  CustomReasoningEffortTransport
+} from '@aipoch/providers'
+import type { ReasoningEffort } from '../../shared/model-preference-contract'
+import type { ReasoningEffortPresetSetting } from '../../shared/reasoning-effort'
 import type { NetworkProxySettings } from '../../shared/network-proxy'
 import type { NotebookLanguage } from '../../shared/notebook-language-contract'
 import type { NotebookNetworkSettings } from '../../shared/notebook-network-settings'
 import type { RuntimeEnablement } from '../../shared/notebook-runtime'
 import type { PermissionProfileId } from '../../shared/permission-profiles'
-import type { OfficialVendorId } from '../../shared/provider-registry'
+
 import type {
-  CustomReasoningEffortTransport,
-  ReasoningEffortPresetSetting
-} from '../../shared/reasoning-effort'
-import type {
+  AgentFrameworkId,
   AppIconVariant,
   ClaudeInfo,
   ClaudeSubscriptionProviderId,
@@ -33,7 +37,6 @@ import type {
 import { SETTINGS_FILE_VERSION } from '../../shared/settings'
 import type { CloseActionPreference } from '../../shared/window-controls'
 import type { LocalShellRuntimePreference, WslSelection } from '../../shared/wsl-setup'
-import type { AgentFrameworkId } from '../agent-framework'
 type StoredClassificationService = {
   id: string
   adapter: ClassificationAdapter
@@ -77,9 +80,9 @@ export type StoredProvider = {
   codexAutoUseHttps?: boolean
   name: string
   // Which chat APIs a custom gateway speaks. Official providers derive it from the registry; absent
-  // means ['anthropic'] (all pre-existing providers). Legacy records may carry the removed scalar
+  // means ['messages'] (all pre-existing providers). Legacy records may carry the removed scalar
   // `apiType` on disk; the repository migrates it to this field on read.
-  apiEndpoints?: ChatApiEndpoint[]
+  apiEndpoints?: ModelProtocol[]
   baseUrl?: string
   model?: string
   // Optional custom-model token limits. Context is the shared request/response budget; input/output
@@ -200,14 +203,15 @@ export type StoredConnectors = {
   // OpenAlex is consumed by a subset of the bundled Literature Connector tools. Keep its secret
   // beside the other Connector-owned credentials so dispatch can resolve it immediately before use.
   openAlexApiKeyRef?: string
+  semanticScholarApiKeyRef?: string
   // Fully-qualified "<connector>/<method>" ids denied by policy; allow by default otherwise.
   blockedToolIds?: string[]
   // Fully-qualified "<connector>/<method>" ids that require per-call approval (opt-in). Tools default
   // to allow (no prompt); this is the set the user switched to "Require approval".
   askToolIds?: string[]
-  // Ids of bundled connectors the user turned OFF. Absent/empty means every bundled connector is
-  // enabled (default-on), mirroring disabledSkillIds. This is the authoritative bundled gate.
+  // Explicit bundled choices override catalog defaults; disabled wins conflicting input.
   disabledConnectorIds?: string[]
+  enabledConnectorIds?: string[]
   customMcpServers?: StoredCustomMcpServer[]
   // Durable tombstones for Connector deletions that still need their permission grants pruned.
   pendingCustomServerDeletionIds?: string[]
@@ -285,6 +289,7 @@ export type StoredSettings = {
   // Application-wide proxy preference. Absent in historical documents means follow the system.
   networkProxy?: NetworkProxySettings
   // Application-wide egress policy for Notebook REPL and Notebook Bash processes.
+  notebookFolderRestrictionEnabled?: boolean
   notebookNetwork?: NotebookNetworkSettings
   // A candidate profile only. Selection is not an execution enablement signal.
   wslSelection?: WslSelection

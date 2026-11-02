@@ -90,7 +90,7 @@ for (const variant of [
           model: 'e2e-model',
           key: 'e2e-key',
           baseUrl: 'http://127.0.0.1:9/v1',
-          apiEndpoints: ['openai']
+          apiEndpoints: ['chat-completions']
         })
         return snapshot.providers.find((entry) => entry.name === 'Translation Agent test')!.id
       })
@@ -174,7 +174,7 @@ for (const variant of [
           type: 'custom',
           name: 'Local direct translation test',
           model: 'translation-test',
-          apiEndpoints: ['openai'],
+          apiEndpoints: ['chat-completions'],
           baseUrl: `http://127.0.0.1:${port}`
         })
         const provider = snapshot.providers.find(
@@ -418,7 +418,7 @@ for (const variant of [
               ...provider,
               type: 'custom',
               name: 'Local direct translation test',
-              apiEndpoints: ['openai'],
+              apiEndpoints: ['chat-completions'],
               model
             }),
           { provider: directProvider!, model }
@@ -451,7 +451,9 @@ for (const variant of [
     await panel.getByLabel('Target language', { exact: true }).fill('Chinese')
     await panel.getByRole('button', { name: 'Translation glossary', exact: true }).click()
     await panel.getByRole('button', { name: 'Add term', exact: true }).click()
-    await panel.getByLabel('Source term 1', { exact: true }).fill('PAIR_PDF_ACCEPTANCE')
+    await panel
+      .getByLabel('Source term 1', { exact: true })
+      .fill(variant === 'recovery' ? 'PAIR_PDF_ACCEPTANCE_SLOW_CANCEL' : 'PAIR_PDF_ACCEPTANCE')
     await panel
       .getByLabel('Preferred translation 1', { exact: true })
       .fill('controlled test fixture')
@@ -769,6 +771,15 @@ for (const variant of [
     }
     if (variant === 'recovery') {
       await expect(panel).toContainText('1 / 4', { timeout: 60000 })
+      // Restart while the next real inference is still draining, rather than between requests.
+      await expect
+        .poll(
+          async () =>
+            (await app.readFakeAgentPrompts()).filter((entry) =>
+              entry.prompt.includes('PAIR_PDF_ACCEPTANCE_SLOW_CANCEL')
+            ).length
+        )
+        .toBeGreaterThanOrEqual(3)
       await panel.getByRole('button', { name: 'Cancel', exact: true }).click()
       await expect(panel).toContainText('1 / 4')
       const restoredPage = await app.restart()
@@ -1070,7 +1081,7 @@ for (const variant of [
         'This passage is translated, but its original layout was retained in the PDF.'
       )
       await expect(warningTip).toContainText(
-        'This PDF contains links or annotations that cannot yet be preserved safely.'
+        'These source pages were kept in their original form because their links could not be remapped safely.'
       )
       await page.screenshot({ path: testInfo.outputPath('retained-paragraph-tip.png') })
       await marker.focus()

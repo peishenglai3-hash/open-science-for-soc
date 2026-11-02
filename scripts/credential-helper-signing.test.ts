@@ -21,7 +21,11 @@ function loadHook(file: string): (context: unknown) => Promise<void> {
     __dirname: dirname(file),
     console,
     require: (id: string) =>
-      id === './verify-native-components.cjs' ? async () => new Set() : require(id)
+      id === './verify-native-components.cjs'
+        ? async () => new Set()
+        : id === './stage-windows-extractor.cjs'
+          ? async () => undefined
+          : require(id)
   })
   return exports.default!
 }
@@ -55,7 +59,7 @@ it('edits the Windows launcher before signing and signs each bundled PE only onc
   const helper = addPe('resources/app.asar.unpacked/node_modules/helper/helper.exe')
   const dll = addPe('dxcompiler.dll')
   const addon = addPe('resources/app.asar.unpacked/node_modules/addon/addon.node')
-  const extra = addPe('resources/micromamba.exe')
+  const extra = addPe('resources/backend/resources/micromamba.exe')
   const vendor = addPe('vendor.dll')
   markSigned(vendor)
   const vendorBytes = readFileSync(vendor)
@@ -103,6 +107,7 @@ it('preserves pinned credential signatures while signing other resources and the
     console: { log: vi.fn() },
     require: (id: string) => {
       if (id === './verify-native-components.cjs') return async () => new Set()
+      if (id === './stage-windows-extractor.cjs') return async () => undefined
       if (id === 'builder-util') return { Arch: { 1: 'x64' } }
       if (id === 'node:path') return posix
       if (id === 'node:fs')
@@ -112,8 +117,13 @@ it('preserves pinned credential signatures while signing other resources and the
             directory.endsWith('/node-runtime')
               ? [{ name: 'node', isDirectory: () => false, isFile: () => true }]
               : directory.endsWith('/backend')
-                ? [{ name: 'native.node', isDirectory: () => false, isFile: () => true }]
-                : [],
+                ? [
+                    { name: 'native.node', isDirectory: () => false, isFile: () => true },
+                    { name: 'resources', isDirectory: () => true, isFile: () => false }
+                  ]
+                : directory.endsWith('/backend/resources')
+                  ? [{ name: 'micromamba', isDirectory: () => false, isFile: () => true }]
+                  : [],
           openSync: (file: string) => file,
           readSync: (_fd: string, buffer: Buffer) => Buffer.from('cffaedfe', 'hex').copy(buffer),
           closeSync: vi.fn()
@@ -143,13 +153,18 @@ it('preserves pinned credential signatures while signing other resources and the
     )
     expect(position, executable).toBe(-1)
   }
-  for (const relative of ['node-runtime/node', 'backend/native.node']) {
+  for (const relative of [
+    'node-runtime/node',
+    'backend/native.node',
+    'backend/resources/micromamba'
+  ]) {
     const position = calls.findIndex(
       (args) => args.at(-1) === posix.join(app, 'Contents/Resources', relative)
     )
     expect(position, relative).toBeGreaterThanOrEqual(0)
     expect(position).toBeLessThan(calls.findIndex((args) => args.at(-1) === app))
   }
+  expect(calls.filter((args) => args.at(-1)?.endsWith('/micromamba'))).toHaveLength(1)
 })
 
 it('signs every unsigned bundled Windows PE while preserving vendor signatures', async () => {
@@ -172,7 +187,7 @@ it('signs every unsigned bundled Windows PE while preserving vendor signatures',
   }
   const unsignedDll = addPe('dxcompiler.dll', false)
   const unsignedNode = addPe('resources/node_modules/native-addon.node', false)
-  const unsignedExe = addPe('resources/micromamba.exe', false)
+  const unsignedExe = addPe('resources/backend/resources/micromamba.exe', false)
   addPe('d3dcompiler_47.dll', true)
   addPe('open-science.exe', true)
   writeFileSync(join(directory, 'not-a-pe.dll'), 'not a PE')
@@ -183,6 +198,7 @@ it('signs every unsigned bundled Windows PE while preserving vendor signatures',
     console: { log: vi.fn() },
     require: (id: string) => {
       if (id === './verify-native-components.cjs') return async () => new Set()
+      if (id === './stage-windows-extractor.cjs') return async () => undefined
       if (id === 'builder-util') return { Arch: { 1: 'x64' } }
       if (id === 'node:path') return nodePath
       if (id === 'node:fs') return fs

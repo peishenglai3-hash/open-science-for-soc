@@ -9,8 +9,7 @@ import {
   MessageScrollerContent,
   MessageScrollerProvider,
   MessageScrollerViewport,
-  useMessageScroller,
-  useMessageScrollerScrollable
+  useMessageScroller
 } from '@/components/ui/message-scroller'
 import { useNavigationStore } from '@/stores/navigation-store'
 import { sessionExportLocked, usePackageOperationStore } from '@/stores/package-operation-store'
@@ -29,9 +28,10 @@ import {
   useSearchMessageFocusStore,
   type SearchMessageFocus
 } from '@/stores/search-message-focus-store'
-import { useSessionStore, type ChatMessage, type ChatSession } from '@/stores/session-store'
+import { useSessionStore } from '@/stores/session-store'
+import type { ChatMessage, ChatSession } from '@/stores/session-store-contract'
 import { useSettingsStore } from '@/stores/settings-store'
-import { ArrowDownIcon } from 'lucide-react'
+import { ArrowDownIcon, ChevronRight } from 'lucide-react'
 import {
   Fragment,
   memo,
@@ -121,6 +121,7 @@ import {
 } from './workspace-conversation-items'
 import {
   createWorkspaceConversationTimeline,
+  resolveCollapsibleTurnProcesses,
   resolveForkBoundaryItemId
 } from './workspace-conversation-timeline'
 import type { SendEditedMessage } from './workspace-edited-message'
@@ -129,49 +130,7 @@ import { setWorkspacePresentationRevealing } from './workspace-presentation-reve
 import { getNotebookRunIdFromActivity } from './workspace-tool-activity-details'
 import type { ActivityExpansionOverrides } from './workspace-tool-activity-groups'
 
-// Replacing a bounded tail can keep the same row count. Tell the existing scroller to follow
-// after that replacement commits; its normal resize/streaming behavior remains authoritative.
-const TranscriptEndSync = ({
-  scopeId,
-  itemCount,
-  mountedItemCount,
-  following
-}: {
-  scopeId: string | undefined
-  itemCount: number
-  mountedItemCount: number
-  following: boolean
-}): null => {
-  const { scrollToEnd } = useMessageScroller()
-  const { end: readerAwayFromEnd } = useMessageScrollerScrollable()
-  const previousRef = useRef<
-    { scopeId: string | undefined; itemCount: number; mountedItemCount: number } | undefined
-  >(undefined)
-  useLayoutEffect(() => {
-    const previous = previousRef.current
-    previousRef.current = { scopeId, itemCount, mountedItemCount }
-    if (
-      following &&
-      !readerAwayFromEnd &&
-      previous &&
-      previous.scopeId === scopeId &&
-      itemCount > previous.itemCount &&
-      mountedItemCount === previous.mountedItemCount
-    ) {
-      // Content processes the replaced rows in a MutationObserver, which can select a new
-      // prompt anchor. Restore follow intent after that observer, before the next paint.
-      let cancelled = false
-      queueMicrotask(() => {
-        if (!cancelled) scrollToEnd({ behavior: 'auto' })
-      })
-      return () => {
-        cancelled = true
-      }
-    }
-    return undefined
-  }, [following, itemCount, mountedItemCount, readerAwayFromEnd, scopeId, scrollToEnd])
-  return null
-}
+import { TranscriptEndSync, MessageScrollerFollowIntent } from './use-transcript-window'
 
 type WorkspaceMessageScrollerProps = {
   activeSession: ChatSession | undefined
@@ -181,6 +140,7 @@ type WorkspaceMessageScrollerProps = {
   credentialPending?: boolean
   visiblePermissionPending?: boolean
   isResumingSession?: boolean
+  sendPreparing?: boolean
   notebookReference?: NotebookSessionReference
   onSendEditedMessage: SendEditedMessage
   onStartResearch?: (prompt: string) => void
@@ -206,20 +166,6 @@ type WorkspaceMessageScrollerProps = {
   // message queue can hold queued sends until the transcript finishes presenting.
   reportPresentationRevealing?: boolean
   turnOutcomeActions?: TurnOutcomeActions
-}
-
-const MessageScrollerFollowIntent = ({
-  active,
-  onChange
-}: {
-  active: boolean
-  onChange: (following: boolean) => void
-}): null => {
-  const { end } = useMessageScrollerScrollable()
-  useLayoutEffect(() => {
-    if (active) onChange(!end)
-  }, [active, end, onChange])
-  return null
 }
 
 type TerminalAnnouncement = {
@@ -589,6 +535,7 @@ const WorkspaceMessageScrollerImpl = ({
   credentialPending = false,
   visiblePermissionPending = false,
   isResumingSession = false,
+  sendPreparing = false,
   notebookReference,
   onSendEditedMessage,
   onOpenLibraryMention,
@@ -685,9 +632,22 @@ const WorkspaceMessageScrollerImpl = ({
   )
   const messageScrollerContentRef = useRef<HTMLDivElement | null>(null)
   const scrollToFirstMessageButtonRef = useRef<HTMLButtonElement | null>(null)
+  const scrollToFirstMessageHoveredRef = useRef(false)
+  const scrollToFirstMessageFocusedRef = useRef(false)
+  const [scrollToFirstMessageFocused, setScrollToFirstMessageFocused] = useState(false)
   const previousMessageScrollerScrollTopRef = useRef(0)
   const scrollToFirstMessageHideTimeoutRef = useRef<number | undefined>(undefined)
   const [scrollThresholdAllowsFirstMessage, setScrollThresholdAllowsFirstMessage] = useState(false)
+  const handleScrollToFirstMessageButtonRef = useCallback(
+    (node: HTMLButtonElement | null): void => {
+      scrollToFirstMessageButtonRef.current = node
+      if (node) return
+      scrollToFirstMessageHoveredRef.current = false
+      scrollToFirstMessageFocusedRef.current = false
+      setScrollToFirstMessageFocused(false)
+    },
+    [setScrollToFirstMessageFocused]
+  )
   const handleMessageScrollerViewportRef = useCallback((node: HTMLDivElement | null): void => {
     messageScrollerViewportRef.current = node
     setMessageScrollerViewport(node)
@@ -755,7 +715,7 @@ const WorkspaceMessageScrollerImpl = ({
   }, [currentProjectId, currentSessionId, loadReviewsForSession])
 
   // Group expansion is keyed by session so switching conversations never reuses stale UI state.
-  const [collapsedActivityGroupState, setCollapsedActivityGroupState] =
+  const [expandedActivityGroupState, setExpandedActivityGroupState] =
     useState<SessionScopedActivityGroupState>(() => ({
       sessionId: undefined,
       groupIds: new Set()
@@ -774,9 +734,9 @@ const WorkspaceMessageScrollerImpl = ({
       scopeId: undefined,
       messageIds: new Set()
     }))
-  const collapsedActivityGroups =
-    collapsedActivityGroupState.sessionId === currentSessionId
-      ? collapsedActivityGroupState.groupIds
+  const expandedActivityGroups =
+    expandedActivityGroupState.sessionId === currentSessionId
+      ? expandedActivityGroupState.groupIds
       : new Set<string>()
   const activityExpansionOverrides =
     activityExpansionOverrideState.sessionId === currentSessionId
@@ -796,9 +756,66 @@ const WorkspaceMessageScrollerImpl = ({
     [activeSession, handoffEvents]
   )
   const showTurnOutcomes = turnOutcomeActions !== undefined
-  const conversationItems = useMemo(
+  const fullConversationItems = useMemo(
     () => createWorkspaceConversationTimeline(activeSession, handoffEvents, showTurnOutcomes),
     [activeSession, handoffEvents, showTurnOutcomes]
+  )
+  const [expandedTurnState, setExpandedTurnState] = useState<{
+    scopeId: string | undefined
+    ids: Set<string>
+  }>({ scopeId: undefined, ids: new Set() })
+  const [windowFindOpen, setWindowFindOpen] = useState(false)
+  const presentingMessageIds = useMemo(
+    () =>
+      messagePresentationState.scopeId === currentPresentationScopeId
+        ? messagePresentationState.messageIds
+        : new Set<string>(),
+    [messagePresentationState, currentPresentationScopeId]
+  )
+  const turnProcesses = useMemo(
+    () =>
+      resolveCollapsibleTurnProcesses(
+        showTurnOutcomes ? activeSession : undefined,
+        fullConversationItems,
+        presentingMessageIds
+      ),
+    [showTurnOutcomes, activeSession, fullConversationItems, presentingMessageIds]
+  )
+  const isTurnExpanded = (promptId: string): boolean =>
+    windowFindOpen ||
+    (expandedTurnState.scopeId === currentPresentationScopeId &&
+      expandedTurnState.ids.has(promptId))
+  const setTurnExpanded = useCallback(
+    (promptId: string, expanded: boolean): void => {
+      setExpandedTurnState((current) => {
+        const ids = new Set(current.scopeId === currentPresentationScopeId ? current.ids : [])
+        if (expanded === ids.has(promptId)) return current
+        if (expanded) ids.add(promptId)
+        else ids.delete(promptId)
+        return { scopeId: currentPresentationScopeId, ids }
+      })
+    },
+    [currentPresentationScopeId]
+  )
+  const conversationItems = useMemo(
+    () =>
+      fullConversationItems.filter((item) => {
+        const group = turnProcesses.get(item.id)
+        return (
+          !group ||
+          windowFindOpen ||
+          (expandedTurnState.scopeId === currentPresentationScopeId &&
+            expandedTurnState.ids.has(group.promptMessageId)) ||
+          group.itemIds[0] === item.id
+        )
+      }),
+    [
+      fullConversationItems,
+      turnProcesses,
+      windowFindOpen,
+      expandedTurnState,
+      currentPresentationScopeId
+    ]
   )
   const notebookRunIdByActivityId = useMemo(
     () =>
@@ -853,10 +870,6 @@ const WorkspaceMessageScrollerImpl = ({
   )
   const presentationScopeRemainedVisible =
     visibleMessageSnapshot.scopeId === currentPresentationScopeId
-  const presentingMessageIds =
-    messagePresentationState.scopeId === currentPresentationScopeId
-      ? messagePresentationState.messageIds
-      : new Set<string>()
   const presentationRevealing = presentingMessageIds.size > 0
   // Let the workspace message queue hold queued sends until this transcript's reveal finishes,
   // plus a short settle delay so the dispatched message's scroll anchor lands after the final
@@ -884,13 +897,61 @@ const WorkspaceMessageScrollerImpl = ({
     presentationBarrierIndex >= 0
       ? conversationItems.slice(0, presentationBarrierIndex + 1)
       : conversationItems
+  const [pauseState, setPauseState] = useState<{ scopeId: string | undefined; paused: boolean }>({
+    scopeId: undefined,
+    paused: false
+  })
+  const followingPaused = pauseState.scopeId === currentPresentationScopeId && pauseState.paused
+  const handlePauseChange = useCallback(
+    (paused: boolean): void => {
+      setPauseState((current) =>
+        current.scopeId === currentPresentationScopeId && current.paused === paused
+          ? current
+          : { scopeId: currentPresentationScopeId, paused }
+      )
+    },
+    [currentPresentationScopeId]
+  )
   const transcriptWindow = useTranscriptWindow(
     currentPresentationScopeId,
     conversationItems,
     presentationBarrierIndex,
-    messageScrollerViewportRef
+    messageScrollerViewportRef,
+    followingPaused
   )
-  const revealTranscriptItem = transcriptWindow.revealMessage
+  const pendingProcessReveal = useRef<{ scopeId: string | undefined; id: string }>(undefined)
+  const revealWindowMessage = transcriptWindow.revealMessage
+  const revealTranscriptItem = useCallback(
+    (id: string): void => {
+      const group = turnProcesses.get(id)
+      if (
+        group &&
+        !(
+          expandedTurnState.scopeId === currentPresentationScopeId &&
+          expandedTurnState.ids.has(group.promptMessageId)
+        )
+      ) {
+        pendingProcessReveal.current = { scopeId: currentPresentationScopeId, id }
+        setTurnExpanded(group.promptMessageId, true)
+      } else revealWindowMessage(id)
+    },
+    [
+      turnProcesses,
+      expandedTurnState,
+      currentPresentationScopeId,
+      setTurnExpanded,
+      revealWindowMessage
+    ]
+  )
+  useLayoutEffect(() => {
+    const pending = pendingProcessReveal.current
+    if (!pending) return
+    pendingProcessReveal.current = undefined
+    if (pending.scopeId === currentPresentationScopeId) revealWindowMessage(pending.id)
+  }, [currentPresentationScopeId, conversationItems, revealWindowMessage])
+  const fullPresentationBarrierIndex = fullConversationItems.findIndex(
+    (item) => item.type === 'message' && presentingMessageIds.has(item.message.id)
+  )
   const searchFocus = useSearchMessageFocusStore((state) => state.pending)
   const navigationRevision = useNavigationStore((state) => state.userNavigationRevision)
   useEffect(() => {
@@ -901,18 +962,20 @@ const WorkspaceMessageScrollerImpl = ({
     }
     if (searchFocus.projectId !== currentProjectId || searchFocus.sessionId !== currentSessionId)
       return
-    const index = conversationItems.findIndex(
+    const index = fullConversationItems.findIndex(
       (item) => item.type === 'message' && item.message.id === searchFocus.messageId
     )
-    if (index < 0 || (presentationBarrierIndex >= 0 && index > presentationBarrierIndex)) return
-    revealTranscriptItem(searchFocus.messageId)
+    if (index < 0 || (fullPresentationBarrierIndex >= 0 && index > fullPresentationBarrierIndex))
+      return
+    const frame = requestAnimationFrame(() => revealTranscriptItem(searchFocus.messageId))
+    return () => cancelAnimationFrame(frame)
   }, [
     searchFocus,
     navigationRevision,
     currentProjectId,
     currentSessionId,
-    conversationItems,
-    presentationBarrierIndex,
+    fullConversationItems,
+    fullPresentationBarrierIndex,
     revealTranscriptItem
   ])
   const [annotationScrollTarget, setAnnotationScrollTarget] = useState<{
@@ -933,7 +996,7 @@ const WorkspaceMessageScrollerImpl = ({
         return
       }
 
-      const targetIndex = conversationItems.findIndex((item) => {
+      const targetIndex = fullConversationItems.findIndex((item) => {
         if (source.kind === 'agent-message') {
           return item.type === 'message' && item.message.id === source.messageId
         }
@@ -956,12 +1019,12 @@ const WorkspaceMessageScrollerImpl = ({
       })
       if (
         targetIndex < 0 ||
-        (presentationBarrierIndex >= 0 && targetIndex > presentationBarrierIndex)
+        (fullPresentationBarrierIndex >= 0 && targetIndex > fullPresentationBarrierIndex)
       ) {
         return
       }
 
-      const target = conversationItems[targetIndex]!
+      const target = fullConversationItems[targetIndex]!
       revealTranscriptItem(target.id)
       setAnnotationScrollTarget({ sessionId: source.sessionId, messageId: target.id })
       if (source.kind !== 'session-item') return
@@ -975,10 +1038,10 @@ const WorkspaceMessageScrollerImpl = ({
       setSessionItemRevealRequest(request)
       if (source.itemType !== 'tool-activity' || target.type !== 'activity-group') return
 
-      setCollapsedActivityGroupState((current) => {
+      setExpandedActivityGroupState((current) => {
         const groupIds =
           current.sessionId === currentSessionId ? new Set(current.groupIds) : new Set<string>()
-        groupIds.delete(target.id)
+        groupIds.add(target.id)
         return { sessionId: currentSessionId, groupIds }
       })
       setActivityExpansionOverrideState((current) => ({
@@ -1001,9 +1064,8 @@ const WorkspaceMessageScrollerImpl = ({
       stopAnnotation()
       stopBookmark()
     }
-  }, [conversationItems, currentSessionId, presentationBarrierIndex, revealTranscriptItem])
+  }, [fullConversationItems, currentSessionId, fullPresentationBarrierIndex, revealTranscriptItem])
   const revealFullTranscript = transcriptWindow.revealAll
-  const [windowFindOpen, setWindowFindOpen] = useState(false)
   const windowFindAcknowledgedScopeRef = useRef<{ scopeId: string | undefined } | undefined>(
     undefined
   )
@@ -1128,16 +1190,22 @@ const WorkspaceMessageScrollerImpl = ({
   }, [])
   const hideScrollToFirstMessage = useCallback((): void => {
     clearScrollToFirstMessageHideTimeout()
+    if (scrollToFirstMessageFocusedRef.current) return
     setScrollToFirstMessageRevealed(false)
   }, [clearScrollToFirstMessageHideTimeout, setScrollToFirstMessageRevealed])
-  const revealScrollToFirstMessage = useCallback((): void => {
+  const scheduleScrollToFirstMessageHide = useCallback((): void => {
     clearScrollToFirstMessageHideTimeout()
-    setScrollToFirstMessageRevealed(true)
+    if (scrollToFirstMessageHoveredRef.current || scrollToFirstMessageFocusedRef.current) return
     scrollToFirstMessageHideTimeoutRef.current = window.setTimeout(() => {
       scrollToFirstMessageHideTimeoutRef.current = undefined
+      if (scrollToFirstMessageHoveredRef.current || scrollToFirstMessageFocusedRef.current) return
       setScrollToFirstMessageRevealed(false)
     }, SCROLL_TO_FIRST_MESSAGE_IDLE_TIMEOUT_MS)
   }, [clearScrollToFirstMessageHideTimeout, setScrollToFirstMessageRevealed])
+  const revealScrollToFirstMessage = useCallback((): void => {
+    setScrollToFirstMessageRevealed(true)
+    scheduleScrollToFirstMessageHide()
+  }, [scheduleScrollToFirstMessageHide, setScrollToFirstMessageRevealed])
   const handleMessageScrollerScroll = (): void => {
     const viewport = messageScrollerViewportRef.current
     if (!viewport) return
@@ -1146,7 +1214,11 @@ const WorkspaceMessageScrollerImpl = ({
     previousMessageScrollerScrollTopRef.current = viewport.scrollTop
     const eligible = updateScrollToFirstMessageEligibility()
     transcriptWindow.expandAtScrollEdge(previousScrollTop)
-    if (viewport.scrollTop < previousScrollTop && eligible) revealScrollToFirstMessage()
+    if (
+      viewport.scrollTop < previousScrollTop &&
+      (eligible || scrollToFirstMessageFocusedRef.current)
+    )
+      revealScrollToFirstMessage()
     else if (viewport.scrollTop > previousScrollTop) hideScrollToFirstMessage()
   }
   useLayoutEffect(() => {
@@ -1174,7 +1246,8 @@ const WorkspaceMessageScrollerImpl = ({
     }
   }, [currentSessionId, updateScrollToFirstMessageEligibility])
   const showScrollToFirstMessage =
-    statusAllowsScrollToFirstMessage && scrollThresholdAllowsFirstMessage
+    statusAllowsScrollToFirstMessage &&
+    (scrollThresholdAllowsFirstMessage || scrollToFirstMessageFocused)
   const handleVisibleMessageSnapshotCommit = useCallback(
     (scopeId: string | undefined, messageIds: Set<string>): void => {
       setVisibleMessageSnapshot({ scopeId, messageIds })
@@ -1210,7 +1283,10 @@ const WorkspaceMessageScrollerImpl = ({
       )
     )
   }, [conversationItems])
-  const agentLoadingPhase = getAgentLoadingPhase(activeSession, { credentialPending })
+  const agentLoadingPhase = getAgentLoadingPhase(activeSession, {
+    credentialPending,
+    sendPreparing
+  })
   const [terminalAnnouncement, setTerminalAnnouncement] = useState<
     TerminalAnnouncement | undefined
   >()
@@ -1500,7 +1576,9 @@ const WorkspaceMessageScrollerImpl = ({
 
   // Toggles a whole adjacent tool-activity group without affecting other sessions.
   const toggleActivityGroup = (groupId: string): void => {
-    setCollapsedActivityGroupState((currentState) => {
+    // Find temporarily reveals groups without changing the reader’s saved expansion choices.
+    if (windowFindOpen) return
+    setExpandedActivityGroupState((currentState) => {
       const currentGroupIds =
         currentState.sessionId === currentSessionId ? currentState.groupIds : new Set<string>()
       const nextGroupIds = new Set(currentGroupIds)
@@ -1573,6 +1651,16 @@ const WorkspaceMessageScrollerImpl = ({
       </MessageScrollerItem>
     ) : null
 
+  const transcriptEntries = transcriptWindow.entries.flatMap((entry) => {
+    const process = turnProcesses.get(entry.item.id)
+    return process?.itemIds[0] === entry.item.id
+      ? [
+          { ...entry, processHeader: true },
+          ...(isTurnExpanded(process.promptMessageId) ? [{ ...entry, processHeader: false }] : [])
+        ]
+      : [{ ...entry, processHeader: false }]
+  })
+
   return (
     <TooltipProvider
       key={activeSession?.id ?? 'empty-conversation'}
@@ -1585,12 +1673,11 @@ const WorkspaceMessageScrollerImpl = ({
         defaultScrollPosition="last-anchor"
         scrollPreviousItemPeek={64}
       >
-        {onScrollFollowingChange ? (
-          <MessageScrollerFollowIntent
-            active={scrollIntentActive}
-            onChange={onScrollFollowingChange}
-          />
-        ) : null}
+        <MessageScrollerFollowIntent
+          active={scrollIntentActive}
+          onChange={onScrollFollowingChange}
+          onPauseChange={handlePauseChange}
+        />
         <MessageScroller className="relative min-h-0 flex-1 bg-bg-10">
           <AnnotationMessageReveal
             target={
@@ -1604,6 +1691,8 @@ const WorkspaceMessageScrollerImpl = ({
               searchFocus?.navigationRevision === navigationRevision &&
               searchFocus.projectId === currentProjectId &&
               searchFocus.sessionId === currentSessionId &&
+              (!turnProcesses.has(searchFocus.messageId) ||
+                isTurnExpanded(turnProcesses.get(searchFocus.messageId)!.promptMessageId)) &&
               transcriptWindow.entries.some(
                 ({ item }) => item.type === 'message' && item.message.id === searchFocus.messageId
               )
@@ -1617,9 +1706,7 @@ const WorkspaceMessageScrollerImpl = ({
             key={currentPresentationScopeId}
             items={presentedConversationItems}
             viewport={messageScrollerViewport}
-            onRevealMessage={
-              presentationBarrierIndex >= 0 ? undefined : transcriptWindow.revealMessage
-            }
+            onRevealMessage={presentationBarrierIndex >= 0 ? undefined : revealTranscriptItem}
           />
           <div
             aria-hidden="true"
@@ -1717,7 +1804,42 @@ const WorkspaceMessageScrollerImpl = ({
                 onCommit={handleVisibleMessageSnapshotCommit}
               />
               {/* Messages and tool activities share one sorted transcript timeline. */}
-              {transcriptWindow.entries.map(({ item, itemIndex }) => {
+              {transcriptEntries.map(({ item, itemIndex, processHeader }, entryIndex) => {
+                const process = turnProcesses.get(item.id)
+                const expanded = process ? isTurnExpanded(process.promptMessageId) : false
+                const disclosure =
+                  processHeader && process ? (
+                    <MessageScrollerItem
+                      key={`process-${process.promptMessageId}`}
+                      messageId={expanded ? `process-${process.promptMessageId}` : item.id}
+                      className="min-w-0"
+                    >
+                      <div className="mx-4 border-b border-border-200 py-2 md:mx-6">
+                        <button
+                          type="button"
+                          aria-expanded={expanded}
+                          onClick={() => setTurnExpanded(process.promptMessageId, !expanded)}
+                          className="inline-flex items-center gap-2 rounded-sm py-1 text-sm text-text-300 hover:text-text-100 focus-visible:keyboard-focus"
+                        >
+                          <ChevronRight
+                            aria-hidden="true"
+                            className={cn(
+                              'size-4 transition-transform motion-reduce:transition-none',
+                              expanded && 'rotate-90'
+                            )}
+                          />
+                          {t('{{count}} previous messages', {
+                            count: process.messageCount,
+                            defaultValue_one: '{{count}} previous message'
+                          })}
+                          {process.outcome === 'failed' ? (
+                            <span className="text-status-failure-foreground">{t('Failed')}</span>
+                          ) : null}
+                        </button>
+                      </div>
+                    </MessageScrollerItem>
+                  ) : null
+                if (processHeader) return disclosure
                 // Later text messages and their config-change dividers stay behind the
                 // presentation barrier. Tool, activity, and other non-message rows render
                 // in real time so their running state stays visible while the reply paces
@@ -1768,6 +1890,9 @@ const WorkspaceMessageScrollerImpl = ({
                   }
                   const messageItemProps: EditableWorkspaceMessageItemProps = {
                     message: item.message,
+                    contentPaddingClassName: transcriptEntries[entryIndex - 1]?.processHeader
+                      ? 'pt-2'
+                      : undefined,
                     projectId: currentProjectId,
                     isPackageSession: Boolean(activeSession?.packageOrigin),
                     onPreviewArtifact,
@@ -2105,7 +2230,7 @@ const WorkspaceMessageScrollerImpl = ({
                     )}
                     key={item.id}
                     group={item}
-                    isExpanded={!collapsedActivityGroups.has(item.id)}
+                    isExpanded={windowFindOpen || expandedActivityGroups.has(item.id)}
                     onToggleGroup={toggleActivityGroup}
                     expansionOverrides={activityExpansionOverrides}
                     onToggleRow={toggleActivityRow}
@@ -2191,13 +2316,32 @@ const WorkspaceMessageScrollerImpl = ({
 
           {showScrollToFirstMessage ? (
             <MessageScrollerButton
-              ref={scrollToFirstMessageButtonRef}
+              ref={handleScrollToFirstMessageButtonRef}
               direction="start"
               onClick={() => {
                 const firstMessage = conversationItems.find((item) => item.type === 'message')
                 if (firstMessage?.type === 'message') {
                   transcriptWindow.revealMessage(firstMessage.message.id)
                 }
+              }}
+              onPointerEnter={() => {
+                scrollToFirstMessageHoveredRef.current = true
+                clearScrollToFirstMessageHideTimeout()
+              }}
+              onPointerLeave={() => {
+                scrollToFirstMessageHoveredRef.current = false
+                scheduleScrollToFirstMessageHide()
+              }}
+              onFocusCapture={() => {
+                scrollToFirstMessageFocusedRef.current = true
+                setScrollToFirstMessageFocused(true)
+                clearScrollToFirstMessageHideTimeout()
+              }}
+              onBlurCapture={(event) => {
+                if (event.currentTarget.contains(event.relatedTarget)) return
+                scrollToFirstMessageFocusedRef.current = false
+                setScrollToFirstMessageFocused(false)
+                scheduleScrollToFirstMessageHide()
               }}
               aria-label={t('Scroll to first message')}
               aria-hidden="true"
@@ -2330,6 +2474,7 @@ const areWorkspaceMessageScrollerPropsEqual = (
   previous.forkSourceContent === next.forkSourceContent &&
   previous.trailingContent === next.trailingContent &&
   previous.isResumingSession === next.isResumingSession &&
+  previous.sendPreparing === next.sendPreparing &&
   previous.onAddAnnotation === next.onAddAnnotation &&
   previous.onRemoveAnnotation === next.onRemoveAnnotation &&
   previous.onUpdateAnnotationNote === next.onUpdateAnnotationNote &&

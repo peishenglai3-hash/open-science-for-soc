@@ -1,0 +1,753 @@
+/* eslint-disable @typescript-eslint/explicit-function-return-type */
+import {
+  nativeTableLayoutConflicts,
+  nativeTableUnreliableMathSourceItems
+} from './literature-pdf-table-layout-conflicts.mjs'
+import { proveNativeFlattenedFraction } from './literature-pdf-native-table-boundary-ink.mjs'
+import { nativeFractionRowConflict } from './literature-pdf-native-fraction-row-conflict.mjs'
+import { tableTextToken } from './literature-pdf-orientation.mjs'
+// These checks establish contradictions, not a replacement grid. Preserve the
+// printed image and native owners when the available layout has two readings.
+const compact = (s) => s.replace(/\s/gu, '')
+const rect = (r) => Array.isArray(r) && r.length === 4 && r.every(Number.isFinite)
+const key = (o) => `${o.pageNumber}:${o.index}`
+const box = (fonts) => [
+  Math.min(...fonts.map((f) => f.rect[0])),
+  Math.min(...fonts.map((f) => f.rect[1])),
+  Math.max(...fonts.map((f) => f.rect[2])),
+  Math.max(...fonts.map((f) => f.rect[3]))
+]
+
+// A scientific value contributes a numeric record only with a complete normal
+// mantissa/base and one uniquely attached superscript exponent. This extends
+// the existing repeated-row contradiction without lowering its leaf count.
+function scientificRecordLines(fonts, inventory, h) {
+  const normal = fonts.filter((f) => f.height >= h * 0.8),
+    scripts = fonts.filter((f) => f.height < h * 0.8),
+    domain = box(fonts),
+    lines = []
+  if (
+    !scripts.length ||
+    fonts.some(
+      (f) =>
+        !Number.isFinite(f.height) ||
+        !Number.isFinite(f.baseline) ||
+        !rect(f.rect) ||
+        f.rect[2] <= f.rect[0] ||
+        f.rect[3] <= f.rect[1]
+    ) ||
+    normal.some((f) => Math.abs(f.height - h) > h * 0.02) ||
+    scripts.some((f) => f.height < h * 0.5) ||
+    inventory.some(
+      (f) =>
+        !fonts.includes(f) &&
+        f.text?.trim() &&
+        (!rect(f.rect) ||
+          f.rect[2] <= f.rect[0] ||
+          f.rect[3] <= f.rect[1] ||
+          (f.rect[0] < domain[2] &&
+            f.rect[2] > domain[0] &&
+            f.rect[1] < domain[3] &&
+            f.rect[3] > domain[1]))
+    )
+  )
+    return
+  for (const f of [...normal].sort((a, b) => a.baseline - b.baseline || a.rect[0] - b.rect[0])) {
+    const last = lines.at(-1)
+    if (last && Math.abs(last.baseline - f.baseline) < h * 0.02) last.fonts.push(f)
+    else lines.push({ baseline: f.baseline, fonts: [f], scripts: [], scientific: true })
+  }
+  if (lines.length < 2) return
+  for (const script of scripts) {
+    const owners = lines.filter(
+      (line) =>
+        line.baseline - script.baseline > h * 0.15 && line.baseline - script.baseline < h * 0.6
+    )
+    if (owners.length !== 1) return
+    owners[0].scripts.push(script)
+  }
+  for (const line of lines) {
+    const ordered = line.fonts.sort((a, b) => a.rect[0] - b.rect[0]),
+      exponent = line.scripts.sort((a, b) => a.rect[0] - b.rect[0])
+    if (
+      !/^[+−-]?\d+(?:[.,]\d+)?×10$/u.test(
+        ordered.map((f) => f.text.replace(/\s/gu, '')).join('')
+      ) ||
+      ordered.slice(1).some((f, i) => f.rect[0] - ordered[i].rect[2] > h * 0.5) ||
+      !exponent.length ||
+      !/^[+−-]?\d+$/u.test(exponent.map((f) => f.text.trim()).join('')) ||
+      Math.abs(exponent[0].rect[0] - ordered.at(-1).rect[2]) > h * 0.03 ||
+      exponent.some(
+        (f) =>
+          Math.abs(f.height - exponent[0].height) > h * 0.02 ||
+          Math.abs(f.baseline - exponent[0].baseline) > h * 0.02
+      ) ||
+      exponent.slice(1).some((f, i) => Math.abs(f.rect[0] - exponent[i].rect[2]) > h * 0.03)
+    )
+      return
+  }
+  return lines
+}
+
+export function nativeTableSourceConflicts(table, inventory, checkFinalCrop = false) {
+  if (!table?.cells?.length || !table.grid?.length || !rect(table.cropRect)) return []
+  const native = new Map(),
+    counts = new Map()
+  for (const font of inventory) {
+    if (!font.sourceItem || !rect(font.rect) || !font.horizontal || !(font.height > 0)) continue
+    const k = key(font.sourceItem)
+    counts.set(k, (counts.get(k) ?? 0) + 1)
+    native.set(k, font)
+  }
+  const owners = new Map(),
+    sourceClaims = new Map(),
+    wholeClaims = new Set()
+  for (const cell of table.cells) {
+    for (const o of cell.sourceItems ?? []) {
+      const k = key(o)
+      owners.set(k, (owners.get(k) ?? 0) + 1)
+    }
+    // A whole source is exclusive even when a cell rectangle shows only part
+    // of it. Only explicit source segments describe a character partition.
+    for (const o of [...(cell.sourceItems ?? []), ...(cell.sourceSegments ?? [])]) {
+      const k = key(o),
+        f = native.get(k)
+      if (
+        !f ||
+        counts.get(k) !== 1 ||
+        !Number.isSafeInteger(o.pageNumber) ||
+        o.pageNumber < 1 ||
+        !Number.isSafeInteger(o.index) ||
+        o.index < 0 ||
+        !Number.isFinite(f.height) ||
+        !Number.isFinite(f.baseline) ||
+        f.rect[0] >= f.rect[2] ||
+        f.rect[1] >= f.rect[3] ||
+        f.text !== o.text ||
+        f.sourceItem.text !== o.text
+      )
+        continue
+      const claims = sourceClaims.get(k) ?? new Set()
+      claims.add(cell)
+      sourceClaims.set(k, claims)
+      if (cell.sourceItems?.includes(o)) wholeClaims.add(k)
+    }
+  }
+  const proved = []
+  for (const cell of table.cells) {
+    if (!cell.text?.trim() || cell.sourceSegments?.length || !cell.sourceItems?.length) continue
+    const fonts = cell.sourceItems.map((o) => native.get(key(o)))
+    if (
+      fonts.some(
+        (f, i) =>
+          !f ||
+          counts.get(key(f.sourceItem)) !== 1 ||
+          owners.get(key(f.sourceItem)) !== 1 ||
+          f.text !== cell.sourceItems[i].text ||
+          f.sourceItem.text !== cell.sourceItems[i].text
+      )
+    )
+      continue
+    if (
+      JSON.stringify(fonts.map((f) => JSON.stringify(f.rect)).sort()) !==
+      JSON.stringify((cell.sourceRects ?? []).map((r) => JSON.stringify(r)).sort())
+    )
+      continue
+    proved.push({ cell, fonts, box: box(fonts) })
+  }
+  const conflicts = new Set()
+  if ([...wholeClaims].some((k) => sourceClaims.get(k).size > 1))
+    conflicts.add('native-whole-source-claimed-by-multiple-cells')
+  // Earlier recovery may still enlarge the crop. At final publication, a whole
+  // uniquely bound source extending more than an em past a side contradicts the
+  // image presented for reviewing that cell. Small glyph overhangs and measured
+  // source splits do not prove this conflict; preserve their existing handling.
+  if (
+    checkFinalCrop &&
+    proved.some(
+      ({ cell, fonts }) =>
+        compact(cell.text) === compact(fonts.map((f) => f.text).join('')) &&
+        fonts.some(
+          (f) =>
+            f.text === f.text.trim() &&
+            f.rect[0] < f.rect[2] &&
+            f.rect[1] < f.rect[3] &&
+            (f.rect[0] < table.cropRect[0] - f.height || f.rect[2] > table.cropRect[2] + f.height)
+        )
+    )
+  )
+    conflicts.add('assigned-source-outside-final-crop')
+  // Three independent numeric leaf columns repeating the same native baselines
+  // contradict a single logical row. Wrapped prose, scripts and isolated
+  // multiline values do not establish this evidence.
+  const numericRows = new Map()
+  for (const { cell, fonts } of proved) {
+    if (cell.row < 1 || cell.rowSpan !== 1 || cell.colSpan !== 1 || fonts.length < 2) continue
+    const h = Math.max(...fonts.map((f) => f.height)),
+      lines = []
+    for (const f of [...fonts].sort((a, b) => a.baseline - b.baseline || a.rect[0] - b.rect[0])) {
+      const last = lines.at(-1)
+      if (last && Math.abs(last.baseline - f.baseline) < h * 0.15) last.fonts.push(f)
+      else lines.push({ baseline: f.baseline, fonts: [f] })
+    }
+    const scientific = scientificRecordLines(fonts, inventory, h),
+      records = scientific ?? lines
+    if (
+      records.length < 2 ||
+      (!scientific && fonts.some((f) => f.height < h * 0.8)) ||
+      records.slice(1).some((line, i) => line.baseline - records[i].baseline < h * 0.9) ||
+      (!scientific &&
+        records.some((line) => {
+          const ordered = line.fonts.sort((a, b) => a.rect[0] - b.rect[0])
+          return (
+            !/^[+−-]?\d+(?:[.,]\d+)?%?[*∗]*$/u.test(ordered.map((f) => f.text.trim()).join('')) ||
+            ordered.slice(1).some((f, i) => f.rect[0] - ordered[i].rect[2] > h * 0.5)
+          )
+        }))
+    )
+      continue
+    const row = numericRows.get(cell.row) ?? []
+    row.push({ column: cell.column, baselines: records.map((line) => line.baseline), h })
+    numericRows.set(cell.row, row)
+  }
+  for (const row of numericRows.values())
+    if (
+      row.some(
+        (a) =>
+          new Set(
+            row
+              .filter(
+                (b) =>
+                  b.baselines.length === a.baselines.length &&
+                  b.baselines.every(
+                    (y, i) => Math.abs(y - a.baselines[i]) < Math.min(a.h, b.h) * 0.15
+                  )
+              )
+              .map((b) => b.column)
+          ).size >= 3
+      )
+    )
+      conflicts.add('collapsed-numeric-records')
+  for (const { cell, fonts } of proved) {
+    // A full-size numerator and denominator share x, while the surrounding
+    // inequality has an intermediate baseline. This is not a superscript.
+    if (!cell.text.includes('/') && fonts.some((f) => /[<>=≤≥]/u.test(f.text))) {
+      for (const a of fonts)
+        for (const b of fonts) {
+          if (
+            a === b ||
+            !/^[\p{L}\p{N}]+$/u.test(a.text.trim()) ||
+            !/^[\p{L}\p{N}]+$/u.test(b.text.trim())
+          )
+            continue
+          const h = Math.max(a.height, b.height),
+            overlap = Math.min(a.rect[2], b.rect[2]) - Math.max(a.rect[0], b.rect[0])
+          if (
+            Math.min(a.height, b.height) < h * 0.8 ||
+            overlap < Math.min(a.rect[2] - a.rect[0], b.rect[2] - b.rect[0]) * 0.7 ||
+            b.baseline - a.baseline < h ||
+            b.baseline - a.baseline > h * 2.5
+          )
+            continue
+          if (
+            fonts.some(
+              (f) =>
+                /[<>=≤≥]/u.test(f.text) &&
+                f.baseline > a.baseline + h * 0.25 &&
+                f.baseline < b.baseline - h * 0.25
+            )
+          )
+            conflicts.add('two-dimensional-math-cell')
+        }
+    }
+    // A detached accent overlapping a larger native run cannot be faithfully
+    // serialized by appending it after that run (possibly after an operator).
+    if (
+      fonts.some(
+        (f) =>
+          /^[˜ˆˉ¯]$/u.test(f.text.trim()) &&
+          fonts.some(
+            (g) =>
+              g !== f &&
+              /[\p{L}].*[<>=≤≥]/u.test(g.text) &&
+              f.rect[0] < g.rect[2] &&
+              g.rect[0] < f.rect[2]
+          )
+      )
+    )
+      conflicts.add('two-dimensional-math-cell')
+  }
+  // Complete header fonts extending over a proved neighbouring body column
+  // contradict a single-column header whose neighbour contains only a marker.
+  const header = proved.filter(
+    (p) => p.cell.row === 0 && p.cell.rowSpan === 1 && p.cell.colSpan === 1
+  )
+  for (const a of header)
+    for (const b of header) {
+      if (a === b || b.cell.column !== a.cell.column + 1 || !/^[†‡*]+$/u.test(b.cell.text.trim()))
+        continue
+      const peer = proved.filter(
+        (p) =>
+          p.cell.row > 0 &&
+          p.cell.column === b.cell.column &&
+          p.cell.colSpan === 1 &&
+          /^[+−-]?\d+(?:\.\d+)?$/u.test(p.cell.text.trim())
+      )
+      if (peer.length >= 2 && peer.every((p) => a.box[0] < p.box[0] && a.box[2] >= p.box[2]))
+        conflicts.add('header-crosses-independent-column')
+    }
+  // One word/subscript split between adjacent leaf columns is still one
+  // printed heading when both pieces sit above the actual leaf headings.
+  for (const a of header)
+    for (const b of header) {
+      if (b.cell.column !== a.cell.column + 1) continue
+      for (const f of a.fonts)
+        for (const g of b.fonts) {
+          if (!/^\p{L}+$/u.test(f.text.trim()) || !/^\p{L}+$/u.test(g.text.trim())) continue
+          const h = Math.max(f.height, g.height)
+          if (
+            Math.abs(g.rect[0] - f.rect[2]) > h * 0.15 ||
+            Math.abs(f.baseline - g.baseline) > h * 0.6
+          )
+            continue
+          if (
+            a.fonts.some((i) => i.rect[1] > Math.max(f.rect[3], g.rect[3]) + h * 0.3) &&
+            b.fonts.some((i) => i.rect[1] > Math.max(f.rect[3], g.rect[3]) + h * 0.3)
+          )
+            conflicts.add('header-split-between-columns')
+        }
+    }
+  // A wholly omitted native heading above the first body row is a structural
+  // omission. Unassigned notes below the body do not satisfy this condition.
+  const body = proved.filter((p) => p.cell.row > 0),
+    unassigned = new Set((table.unassigned ?? []).map(compact))
+  if (body.length && unassigned.size) {
+    const top = Math.min(...body.map((p) => p.box[1]))
+    for (const f of inventory)
+      if (
+        f.text?.trim() &&
+        rect(f.rect) &&
+        /\p{L}/u.test(f.text) &&
+        unassigned.has(compact(f.text)) &&
+        f.rect[0] >= table.cropRect[0] &&
+        f.rect[2] <= table.cropRect[2] &&
+        f.rect[1] >= table.cropRect[1] &&
+        f.rect[3] < top &&
+        counts.get(key(f.sourceItem ?? {})) === 1 &&
+        !owners.has(key(f.sourceItem ?? {})) &&
+        // A section title above complete headers is not a missing leaf heading.
+        // Require an empty header slot and independently owned body in its lane.
+        table.cells.some(
+          (head) =>
+            head.row === 0 &&
+            head.rowSpan === 1 &&
+            head.colSpan === 1 &&
+            !head.text?.trim() &&
+            !head.sourceItems?.length &&
+            body.some(
+              (p) =>
+                p.cell.column === head.column &&
+                p.cell.colSpan === 1 &&
+                p.box[0] >= f.rect[0] &&
+                p.box[2] <= f.rect[2]
+            )
+        )
+      )
+        conflicts.add('unassigned-printed-header')
+  }
+  const omittedHeaders = inventory.filter(
+    (f) =>
+      f.sourceItem &&
+      f.horizontal &&
+      f.height > 0 &&
+      Number.isFinite(f.baseline) &&
+      rect(f.rect) &&
+      /\p{L}/u.test(f.text) &&
+      unassigned.has(compact(f.text)) &&
+      counts.get(key(f.sourceItem)) === 1 &&
+      !owners.has(key(f.sourceItem)) &&
+      f.rect[0] >= table.cropRect[0] &&
+      f.rect[2] <= table.cropRect[2] &&
+      f.rect[1] >= table.cropRect[1] &&
+      f.rect[3] <= table.cropRect[3]
+  )
+  const laneRows = (f, column, afterRow) =>
+    new Set(
+      proved
+        .filter(
+          (p) =>
+            p.cell.column === column &&
+            p.cell.row > afterRow &&
+            p.cell.colSpan === 1 &&
+            p.box[1] > f.rect[3] &&
+            p.box[0] >= f.rect[0] &&
+            p.box[2] <= f.rect[2]
+        )
+        .map((p) => p.cell.row)
+    ).size
+  // A grouped header can occupy row zero while the missing leaf labels belong
+  // to row one. Require two owned peers on the same baseline and repeated body
+  // records in the omitted label's lane; mere nearby prose is insufficient.
+  for (const f of omittedHeaders)
+    for (const empty of table.cells.filter(
+      (c) =>
+        c.row <= 1 &&
+        c.colSpan === 1 &&
+        c.rowSpan === 1 &&
+        !c.text?.trim() &&
+        !c.sourceItems?.length &&
+        !c.sourceSegments?.length
+    )) {
+      const peers = proved.filter(
+        (p) =>
+          p.cell.row === empty.row &&
+          p.cell.colSpan === 1 &&
+          p.fonts.length === 1 &&
+          Math.abs(p.fonts[0].baseline - f.baseline) < f.height * 0.15
+      )
+      if (
+        new Set(peers.map((p) => p.cell.column)).size >= 2 &&
+        laneRows(f, empty.column, empty.row) >= 2
+      )
+        conflicts.add('unassigned-printed-header')
+    }
+  // Entire omitted headers need two separate native labels and repeated body
+  // columns. A single title spanning the table must not trigger this proof.
+  const firstRow = proved.filter((p) => p.cell.row === 0 && p.cell.colSpan === 1)
+  if (firstRow.length >= 2) {
+    const top = Math.min(...firstRow.map((p) => p.box[1]))
+    const candidates = omittedHeaders.flatMap((f) => {
+      if (f.rect[3] >= top || top - f.rect[3] > f.height * 3) return []
+      const center = (f.rect[0] + f.rect[2]) / 2
+      const lanes = firstRow.filter(
+        (p) =>
+          p.box[0] - f.height * 0.5 <= center &&
+          p.box[2] + f.height * 0.5 >= center &&
+          new Set(
+            proved
+              .filter(
+                (q) =>
+                  q.cell.column === p.cell.column &&
+                  q.cell.colSpan === 1 &&
+                  q.box[1] > f.rect[3] &&
+                  q.box[0] - f.height * 0.5 <= center &&
+                  q.box[2] + f.height * 0.5 >= center
+              )
+              .map((q) => q.cell.row)
+          ).size >= 2
+      )
+      return lanes.length === 1 ? [{ f, column: lanes[0].cell.column }] : []
+    })
+    if (
+      candidates.some((a) =>
+        candidates.some(
+          (b) =>
+            a !== b &&
+            a.column !== b.column &&
+            (a.f.rect[2] < b.f.rect[0] || b.f.rect[2] < a.f.rect[0]) &&
+            Math.abs(a.f.baseline - b.f.baseline) < Math.min(a.f.height, b.f.height) * 0.15
+        )
+      )
+    )
+      conflicts.add('unassigned-printed-header')
+  }
+  // Top-aligned record labels plus an aligned body line establish the next
+  // record's start. A preceding full-size line in that same cell crosses it.
+  const stubs = proved.filter(
+    (p) => p.cell.column === 0 && p.cell.row > 0 && p.cell.rowSpan === 1 && p.cell.colSpan === 1
+  )
+  const displaced = []
+  for (const stub of stubs) {
+    const first = stub.fonts.reduce((a, b) => (a.baseline < b.baseline ? a : b)),
+      h = first.height
+    for (const p of proved.filter(
+      (p) =>
+        p.cell.row === stub.cell.row &&
+        p.cell.column > 0 &&
+        p.cell.rowSpan === 1 &&
+        p.cell.colSpan === 1
+    )) {
+      const before = p.fonts.filter(
+        (f) => f.rect[3] < first.rect[1] - h * 0.1 && Math.abs(f.height - h) < h * 0.1
+      )
+      if (
+        before.length &&
+        p.fonts.some((f) => Math.abs(f.baseline - first.baseline) < h * 0.1) &&
+        stubs.some(
+          (prev) =>
+            prev.cell.row === stub.cell.row - 1 &&
+            prev.box[3] < Math.min(...before.map((f) => f.rect[1]))
+        )
+      )
+        displaced.push(stub.cell.row)
+    }
+  }
+  if (new Set(displaced).size >= 2) conflicts.add('body-line-crosses-record-start')
+  // A repeated detached numeric right edge, including its own header, is an
+  // independent leaf lane, not prose embedded in a wide last column.
+  const last = table.grid[0].length - 1,
+    terminal = proved.filter(
+      (p) => p.cell.column === last && p.cell.colSpan === 1 && p.cell.rowSpan === 1
+    )
+  const lanes = []
+  for (const p of terminal) {
+    const ordered = [...p.fonts].sort((a, b) => a.rect[0] - b.rect[0]),
+      tail = ordered.at(-1),
+      others = ordered.slice(0, -1)
+    if (
+      !tail ||
+      !others.length ||
+      !(p.cell.row === 0 ? /^[\p{L}\p{S}§]{1,3}$/u : /^\d{1,3}$/u).test(tail.text.trim())
+    )
+      continue
+    const h = tail.height,
+      right = Math.max(...others.map((f) => f.rect[2]))
+    if (
+      tail.rect[0] - right > h &&
+      Math.abs(tail.baseline - Math.min(...others.map((f) => f.baseline))) < h * 0.15
+    )
+      lanes.push({ row: p.cell.row, x: tail.rect[0], h })
+  }
+  if (
+    lanes.some((p) => p.row === 0) &&
+    lanes.filter((p) => p.row > 0).length >= 3 &&
+    Math.max(...lanes.map((p) => p.x)) - Math.min(...lanes.map((p) => p.x)) <
+      Math.min(...lanes.map((p) => p.h))
+  )
+    conflicts.add('independent-terminal-column')
+  return [...conflicts]
+}
+
+// An encoded control is not faithful Unicode cell text. This proves only that
+// mapping must pause; it neither decodes the glyph nor proves a whole body crop.
+function nativeEncodedSourceConflict(table, inventory, context) {
+  // eslint-disable-next-line no-control-regex -- Deliberately excludes whitespace controls and C1.
+  const control = /[\u0000-\u0008\u000e-\u001f]/u
+  // eslint-disable-next-line no-control-regex -- A complete encoded source, never a borrowed text substring.
+  const controlOnly = /^[\u0000-\u0008\u000e-\u001f]+$/u
+  const content = context?.sourceContent,
+    viewport = context?.viewport,
+    transform = viewport?.transform
+  if (
+    !Number.isSafeInteger(table?.page) ||
+    table.page < 1 ||
+    !rect(table.cropRect) ||
+    !table.cells?.length ||
+    !Array.isArray(inventory) ||
+    !Array.isArray(content?.items) ||
+    !Array.isArray(transform) ||
+    transform.length !== 6 ||
+    !transform.every(Number.isFinite) ||
+    viewport.rotation !== 0 ||
+    !Number.isFinite(viewport.width) ||
+    !Number.isFinite(viewport.height) ||
+    !(viewport.width > 0 && viewport.height > 0) ||
+    !(transform[0] > 0) ||
+    transform[1] !== 0 ||
+    transform[2] !== 0 ||
+    transform[3] !== -transform[0]
+  )
+    return false
+  const same = (a, b) => rect(a) && rect(b) && a.every((v, i) => v === b[i]),
+    nativeViewport = {
+      ...viewport,
+      convertToViewportPoint: (x, y) => [
+        x * transform[0] + y * transform[2] + transform[4],
+        x * transform[1] + y * transform[3] + transform[5]
+      ]
+    }
+  for (const cell of table.cells) {
+    if (typeof cell.text !== 'string' || !control.test(cell.text)) continue
+    for (const origin of [...(cell.sourceItems ?? []), ...(cell.sourceSegments ?? [])]) {
+      if (
+        origin.pageNumber !== table.page ||
+        !Number.isSafeInteger(origin.index) ||
+        origin.index < 0 ||
+        typeof origin.text !== 'string' ||
+        !controlOnly.test(origin.text) ||
+        !cell.text.includes(origin.text) ||
+        (cell.sourceSegments?.includes(origin) &&
+          (origin.start !== 0 || origin.end !== origin.text.length))
+      )
+        continue
+      const fonts = inventory.filter((f) => f.sourceItem && key(f.sourceItem) === key(origin)),
+        raw = content.items.filter((r) => r.sourceItem && key(r.sourceItem) === key(origin))
+      if (fonts.length !== 1 || raw.length !== 1) continue
+      const f = fonts[0],
+        item = raw[0],
+        style = content.styles?.[item.fontName]
+      if (
+        f.text !== origin.text ||
+        f.sourceItem.pageNumber !== origin.pageNumber ||
+        f.sourceItem.index !== origin.index ||
+        f.sourceItem.text !== origin.text ||
+        item.str !== origin.text ||
+        item.sourceItem.pageNumber !== origin.pageNumber ||
+        item.sourceItem.index !== origin.index ||
+        item.sourceItem.text !== origin.text ||
+        !Number.isFinite(item.width) ||
+        !Number.isFinite(item.height) ||
+        !(item.width > 0 && item.height > 0) ||
+        !Array.isArray(item.transform) ||
+        item.transform.length !== 6 ||
+        !item.transform.every(Number.isFinite) ||
+        !Number.isFinite(style?.ascent) ||
+        !(style.ascent > 0) ||
+        !Number.isFinite(style.descent) ||
+        style.descent > 0 ||
+        style.vertical !== false ||
+        f.fontAscent !== style.ascent ||
+        f.fontDescent !== style.descent
+      )
+        continue
+      const token = tableTextToken(item, nativeViewport, 0)
+      if (
+        !f.horizontal ||
+        !token.horizontal ||
+        !Number.isFinite(f.baseline) ||
+        !Number.isFinite(f.height) ||
+        !(f.height > 0) ||
+        f.baseline !== token.baseline ||
+        f.height !== token.height ||
+        !same(f.rect, token.rect) ||
+        f.rect[2] <= f.rect[0] ||
+        f.rect[3] <= f.rect[1] ||
+        !cell.sourceRects?.some((r) => same(r, f.rect)) ||
+        (cell.sourceSegments?.includes(origin) && !same(origin.rect, f.rect))
+      )
+        continue
+      return true
+    }
+  }
+  return false
+}
+
+export function reviewNativeTableSources(table, inventory) {
+  // Let later native record recovery use its complete paint/source proof first.
+  // Final assembly also attaches measured ranges before deciding whether a
+  // candidate whole-source overlap remains. Do not persist a provisional warning.
+  const conflicts = nativeTableSourceConflicts(table, inventory).filter(
+    (conflict) =>
+      conflict !== 'collapsed-numeric-records' &&
+      conflict !== 'native-whole-source-claimed-by-multiple-cells'
+  )
+  return conflicts.length
+    ? {
+        ...table,
+        issues: [...new Set([...(table.issues ?? []), 'native-table-structure-ambiguous'])],
+        reviewCandidate: false
+      }
+    : table
+}
+
+// Run after measured source segments have been attached: a legitimate measured
+// split must not be mistaken for an unsupported partial native owner.
+export function reviewFinalNativeTableSources(table, inventory, rules, measuredRuns, context) {
+  if (table.parts)
+    return {
+      ...table,
+      parts: table.parts.map((part) => {
+        const checked = reviewFinalNativeTableSources(
+          { ...part, cropRect: part.cropRect ?? table.cropRect },
+          inventory,
+          rules,
+          measuredRuns,
+          context
+        )
+        if (
+          checked.issues === part.issues &&
+          checked.unreliableMathSourceItems === part.unreliableMathSourceItems
+        )
+          return part
+        const next = { ...part, issues: checked.issues }
+        if (checked.unreliableMathSourceItems)
+          next.unreliableMathSourceItems = checked.unreliableMathSourceItems
+        else delete next.unreliableMathSourceItems
+        return next
+      })
+    }
+  const ambiguous =
+    nativeTableSourceConflicts(table, inventory, true).length ||
+    nativeTableLayoutConflicts(table, inventory, rules, measuredRuns, context).length ||
+    proveNativeFlattenedFraction(table, inventory, rules, context).length ||
+    nativeFractionRowConflict(table, inventory, rules, context) ||
+    nativeEncodedSourceConflict(table, inventory, context)
+  // Preserve the original conflict short-circuit. Collect this additional,
+  // read-only evidence afterwards even if an earlier conflict already won.
+  const mathSources = ambiguous
+    ? nativeTableUnreliableMathSourceItems(table, inventory, rules, context)
+    : []
+  const result = ambiguous
+    ? {
+        ...table,
+        issues: [...new Set([...(table.issues ?? []), 'native-table-structure-ambiguous'])],
+        reviewCandidate: false
+      }
+    : table
+  if (mathSources.length) return { ...result, unreliableMathSourceItems: mathSources }
+  if (!table.unreliableMathSourceItems) return result
+  const withoutStaleMath = { ...result }
+  delete withoutStaleMath.unreliableMathSourceItems
+  return withoutStaleMath
+}
+
+export function trimNativeTablePageCounterCrop(table, inventory, rules, context) {
+  if (
+    !rect(table.cropRect) ||
+    table.parts ||
+    table.cropRects ||
+    !Number.isInteger(context?.pageNumber) ||
+    !Number.isInteger(context?.pageCount) ||
+    !(context.height > 0)
+  )
+    return table
+  const crop = table.cropRect,
+    text = `${context.pageNumber}/${context.pageCount}`,
+    folios = inventory.filter(
+      (f) =>
+        f.text?.trim() === text &&
+        f.sourceItem?.text.trim() === text &&
+        rect(f.rect) &&
+        f.horizontal &&
+        f.baseline > context.height * 0.85 &&
+        f.rect[0] >= crop[0] &&
+        f.rect[2] <= crop[2] &&
+        f.rect[1] < crop[3]
+    )
+  if (folios.length !== 1) return table
+  const folio = folios[0],
+    owned = table.cells?.flatMap((c) => c.sourceItems ?? []) ?? []
+  if (owned.some((o) => key(o) === key(folio.sourceItem))) return table
+  const body = inventory.filter(
+    (f) =>
+      f !== folio &&
+      f.text?.trim() &&
+      rect(f.rect) &&
+      f.rect[0] < crop[2] &&
+      f.rect[2] > crop[0] &&
+      f.rect[1] < crop[3] &&
+      f.rect[3] > crop[1]
+  )
+  if (!body.length || body.some((f) => !f.horizontal || f.rect[0] < crop[0] || f.rect[2] > crop[2]))
+    return table
+  const bounds = box(body),
+    closing = rules
+      .filter(
+        (r) =>
+          rect(r) &&
+          r[1] === r[3] &&
+          r[0] <= bounds[0] &&
+          r[2] >= bounds[2] &&
+          r[1] > bounds[3] &&
+          r[1] - bounds[3] < folio.height &&
+          folio.baseline - r[1] > folio.height * 0.5 &&
+          r[1] < crop[3]
+      )
+      .sort((a, b) => b[1] - a[1])[0]
+  if (!closing) return table
+  return {
+    ...table,
+    cropRect: [crop[0], crop[1], crop[2], closing[1] + 0.5],
+    repairs: [...(table.repairs ?? []), 'native-page-counter-crop-trimmed']
+  }
+}

@@ -1,3 +1,5 @@
+import type { PdfAnnotationAgentTools } from '../pdf-annotations/agent-tools'
+import type { SandboxNetworkApprovalOwner } from '../acp/sandbox-network-approval-owner'
 import { runtimeMetadata } from '../runtime-metadata'
 import { ImageInputCompatibilityOwner } from '../acp/image-input-compatibility-owner'
 import { createAcpRuntime } from '../acp/runtime-composition'
@@ -59,6 +61,8 @@ export async function composeAgentRuntime({
   permissionGrantRegistry,
   artifactReproducibilityAttemptOwnerRef,
   sessionPersistenceCoordinator,
+  sandboxNetworkApprovalOwner,
+  pdfAnnotationAgent,
   pdfElementReader,
   literatureDocumentReader,
   mainPromptSideChatRelay,
@@ -102,10 +106,12 @@ export async function composeAgentRuntime({
   artifactReproducibilityAttemptOwnerRef: {
     current?: ArtifactReproducibilityAttemptOwner
   }
+  sandboxNetworkApprovalOwner: SandboxNetworkApprovalOwner
   sessionPersistenceCoordinator: SessionCatalog &
     SessionMutation &
     SessionRuntimeContextCommands &
     Pick<SessionPersistenceCommands, 'sessionProjectId'>
+  pdfAnnotationAgent: PdfAnnotationAgentTools
   pdfElementReader: PdfElementAgentReader
   literatureDocumentReader: LiteratureDocumentReader
   mainPromptSideChatRelay: ReturnType<typeof createMainPromptSideChatRelay>
@@ -194,6 +200,7 @@ export async function composeAgentRuntime({
       initializationBarrier: initialConnectorSkillsReady,
       specialistService,
       sessionPersistenceCoordinator,
+      sandboxNetworkApprovalOwner,
       finalizeRuntimeArtifacts: async (request) => {
         const handlers = artifactHandlersRef.current
         if (!handlers) throw new Error('Artifact finalization is not initialized.')
@@ -201,6 +208,7 @@ export async function composeAgentRuntime({
       },
       literatureReader: literatureDocumentReader,
       pdfElementReader,
+      pdfAnnotationAgent,
       literatureAttachments: literatureAttachmentAuthority,
       literatureCatalog,
       literaturePdfAcquisition,

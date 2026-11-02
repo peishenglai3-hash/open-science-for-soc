@@ -6,16 +6,19 @@
 
 <p align="center">
   <a href="https://aipoch.com/open-science/download">
-    <img alt="다운로드" src="https://img.shields.io/badge/Download-Latest%20Release-2f9e44?style=flat">
+    <img alt="AIPOCH Open-Science 다운로드" src="https://img.shields.io/badge/Download-Latest%20Release-2f9e44?style=flat">
   </a>
   <a href="https://github.com/aipoch/open-science/releases/latest">
-    <img alt="버전" src="https://img.shields.io/github/v/release/aipoch/open-science?label=Version&style=flat&color=4dabf7">
+    <img alt="AIPOCH Open-Science 최신 버전" src="https://img.shields.io/github/v/release/aipoch/open-science?label=Version&style=flat&color=4dabf7">
   </a>
   <a href="https://doi.org/10.5281/zenodo.22252246">
-    <img alt="DOI" src="https://img.shields.io/badge/DOI-10.5281%2Fzenodo.22252246-0b7285?style=flat">
+    <img alt="AIPOCH Open-Science Zenodo DOI" src="https://img.shields.io/badge/DOI-10.5281%2Fzenodo.22252246-0b7285?style=flat">
   </a>
-  <a href="https://huggingface.co/datasets/phylobio/BiomniBench-DA">
-    <img alt="BiomniBench-DA Public 50 1위" src="https://img.shields.io/badge/%F0%9F%8F%86%20%231-BiomniBench--DA%20Public%2050-f59f00?style=flat">
+  <a href="https://arxiv.org/abs/2610.17110">
+    <img alt="AIPOCH Open-Science arXiv 프리프린트: 2610.17110" src="../images/readme/arxiv-preprint.svg">
+  </a>
+  <a href="#벤치마크-성능">
+    <img alt="AIPOCH Open-Science — 보고된 벤치마크 비교에서 최고 점수" src="../../docs/images/readme/benchmark-comparisons.svg">
   </a>
   <a href="https://github.com/aipoch/open-science/releases/latest">
     <img alt="지원 플랫폼 macOS Windows Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-4263eb?style=flat">
@@ -25,9 +28,6 @@
   </a>
   <a href="https://aipoch.com/open-science">
     <img alt="웹사이트 aipoch.com" src="https://img.shields.io/badge/website-aipoch.com-e8590c?style=flat">
-  </a>
-  <a href="https://discord.gg/zxQAYjReRv">
-    <img alt="Discord" src="https://img.shields.io/badge/Discord-Join%20the%20Community-5865F2?style=flat&logo=discord&logoColor=white">
   </a>
 </p>
 
@@ -51,7 +51,7 @@ AIPOCH Open-Science는 머신러닝, 통계학, 생명과학, 화학, 재료과�
 
 완료된 연구 세션은 선택한 대화 분기, 파일 버전, Notebook 기록 및 검증 증거를 포함하는 이동 가능한 `.science` 패키지로 내보내 검토, 인계 및 보관에 사용할 수도 있습니다.
 
-> 💡 **AIPOCH Open-Science v1.0.0** _(2026년 10월 업데이트)_. 이번 이정표는 로컬 우선 연구 작업 공간, 과학 에이전트, Python/R Notebook 실행, 문헌 도구, 이동 가능한 `.science` 연구 패키지를 아우릅니다. v0.37.2 이후의 개선 사항과 CLI 업그레이드 변경 사항은 [1.0.0 릴리스 노트](../../release-notes/1.0.0/ko.md)를 참조하세요. 다운로드는 계속 [최신 공개 릴리스](https://github.com/aipoch/open-science/releases/latest)를 기준으로 합니다.
+> 💡 **[AIPOCH Open-Science v1.0.6 출시](https://github.com/aipoch/open-science/releases/latest)** _(2026년 10월 최종 업데이트)_. 이번 업데이트는 로컬 Zotero 라이브러리에서 참조 문헌을 가져오고 PDF의 읽기 순서를 자동으로 결정하며, 애플리케이션과 공존하는 연구 데이터를 보존하는 더 빠른 Windows 설치를 제공합니다. 또한 OpenCode 세션 안정성을 개선하고 긴 턴에서도 아티팩트를 계속 게시할 수 있게 합니다. 자세한 내용은 [v1.0.6 릴리스 노트](../../release-notes/1.0.6/ko.md)를 참조하세요.
 
 <p align="center">
  <img width="1920" height="1140" alt="AIPOCH Open-Science 히어로 배너: Science, Open to All — 오픈 소스, 모델 독립적, 자체 호스팅 가능한 과학 AI 연구 워크벤치" src="../images/readme/open-science-banner.png" />
@@ -62,12 +62,14 @@ AIPOCH Open-Science는 머신러닝, 통계학, 생명과학, 화학, 재료과�
 - [빠른 시작](#-빠른-시작)
 - [제품 둘러보기](#제품-둘러보기)
 - [AIPOCH Open-Science `.science` 연구 패키지](#aipoch-open-science-science-연구-패키지)
+- [AIPOCH Open-Science 논문 및 인용](#aipoch-open-science-논문-및-인용)
 - [벤치마크 성능](#벤치마크-성능)
 - [핵심 기능](#핵심-기능)
 - [모델 제공업체](#모델-제공업체)
 - [데이터, 권한 및 신뢰](#데이터-권한-및-신뢰)
 - [개발 및 패키징](#개발-및-패키징)
 - [자주 묻는 질문](#자주-묻는-질문)
+- [기여자](#기여자)
 - [참여하기](#참여하기)
 - [라이선스](#라이선스)
 
@@ -92,6 +94,24 @@ macOS에서는 [Homebrew](https://brew.sh)로도 설치할 수 있습니다:
 ```bash
 brew install --cask open-science
 ```
+
+macOS 또는 Linux용 독립 CLI는 별도의 [AIPOCH tap](https://github.com/aipoch/homebrew-tap)을 사용합니다.
+
+```bash
+brew install aipoch/tap/open-science
+```
+
+이 Formula는 Node를 포함하고 데스크톱 앱 없이 실행됩니다. 버전은 데스크톱 Cask와 다를 수 있습니다. 전제 조건과 업그레이드는 [독립 실행 환경 가이드](../standalone-runtime.md)를 참고하세요.
+
+독립 CLI와 웹 UI는 **Node.js 22.13.0 이상**에서 배포된 [npm 패키지](https://www.npmjs.com/package/@aipoch/open-science)로 설치할 수 있습니다:
+
+```bash
+npm install --global @aipoch/open-science
+open-science start --no-open
+open-science url
+```
+
+출력된 URL을 열어 설정을 완료하거나 [터미널 설정 가이드](../../packages/open-science/CLI.md#first-run-setup-codex)를 따르세요. npm은 macOS ARM64/x64, glibc 기반 Linux ARM64/x64 및 Windows x64를 지원하며 데스크톱 앱은 필요하지 않습니다. npm 선택적 의존성을 활성화하고 [Linux 사전 요구 사항 및 업그레이드 안내](../standalone-runtime.md#install-from-npm)를 확인하세요. URL에는 인증 토큰이 포함되므로 공유하지 마세요.
 
 Windows 재설치 시 연구 데이터는 유지됩니다. 완전히 초기화하려면 확인 후 로컬 데이터를 영구 삭제하는 [데이터 초기화 도구](../../scripts/windows-reset/README.md)를 참고하세요.
 
@@ -162,23 +182,78 @@ Windows 재설치 시 연구 데이터는 유지됩니다. 완전히 초기화�
 
 완료된 연구 세션을 검토, 인계 및 보관에 사용할 수 있는 이동 가능한 `.science` 패키지로 내보낼 수 있습니다. 연구 기록과 함께 포함할 대화 분기, 파일 버전, Notebook 기록 및 검증 증거를 선택한 다음 다른 프로젝트나 컴퓨터로 가져오세요.
 
+내보내기와 가져오기는 데스크톱 앱, 로컬 Web 세션 및 헤드리스 CLI에서 사용할 수 있습니다. 원격 Web 세션은 임의의 로컬 패키지 경로를 읽거나 쓸 수 없습니다.
+
 **내보내기 → 전송 → 검토**
 
 1. 완료된 세션을 내보내고 포함할 내용을 선택합니다.
 2. `.science` 파일을 협업자나 다른 컴퓨터로 전송합니다.
-3. 프로젝트로 가져온 뒤 읽기 전용 기록, 포함된 파일, Notebook 기록 및 검증 증거를 확인합니다.
+3. 프로젝트로 가져옵니다. 오른쪽 **Research replay**에서 기록된 과정을 확인하고 왼쪽 대화에서 질문하며 고정 단계를 참조할 수 있습니다.
 
-가져온 패키지는 읽기 전용입니다. 코드를 실행하거나 자격 증명을 복원하지 않습니다. 후속 작업은 새 세션에서 진행하세요. 결과를 다시 실행하려면 완전한 레시피, 필요한 입력 및 사용 가능한 런타임이 필요합니다.
+가져온 기록은 읽기 전용입니다. 재생은 코드 실행, 모델 호출 또는 자격 증명 복원을 수행하지 않습니다. 첫 질문은 연결된 쓰기 가능한 대화를 만듭니다. **Create a copy to continue research**로 작업 사본을 만들어 연구를 계속할 수 있습니다. 재실행에는 완전한 레시피, 필요한 입력과 사용 가능한 실행 환경이 필요합니다.
+
+Side Chat 대화, 비공개 읽기 북마크와 자격 증명은 제외되며, 포함 파일은 내보내기 선택에 따라 달라집니다. 받은 검증 기록은 발신자의 검사 결과이며 이 컴퓨터에서 다시 실행했음을 증명하지 않습니다. [`.science` 패키지 가이드](https://aipoch.com/docs/guides/research-packages/)를 참고하세요.
+
+## AIPOCH Open-Science 논문 및 인용
+
+**[AIPOCH Open-Science: An Open-Source AI Research Workbench with Reproducible .science Packages](https://arxiv.org/abs/2610.17110)**
+
+arXiv 프리프린트 · [v1](https://arxiv.org/abs/2610.17110v1) · 2026년 10월 12일 제출.
+
+이 프리프린트는 연구 맥락, 산출물 버전 및 검증 기록을 이동 가능한 `.science` 패키지로 공유하는 오픈소스 AI 연구 워크벤치 AIPOCH Open-Science를 소개합니다. 패키지 교환 설계와 통제된 평가에 관한 자세한 내용은 논문을 참고하세요.
+
+연구에 AIPOCH Open-Science를 사용한다면 이 프리프린트를 인용할 수 있습니다.
+
+<details>
+<summary>BibTeX 인용</summary>
+
+```bibtex
+@misc{ouyang2026aipochopenscienceopensourceai,
+      title={AIPOCH Open-Science: An Open-Source AI Research Workbench with Reproducible .science Packages},
+      author={Wen Ouyang and Bocheng Huang and Qianyu Yao and Fei Sun and Minying Deng and Haoyue Cheng and Wenwen Zhou and Lei Mou and Yusi Wei and Jiang Li and Kun Zhu and Lei Wang and Yi Feng and Jiaheng Dai and Ke Qian and Dan Wang and Yahui Wang and Chenyi Wang and Mingsheng Lyu and Yaqiang Zhang and Ping Zheng and Chunhua Tang and Xinge Ma and Xu Zhang and Youjia Fan and Can Lu and Zhijun Dai and Man Hu and Qiqi Xie and Beinan Liu and Yuanning Guo and Yunze Liu and Jinhong Jiang and Xianjun Fu and Mingwei Zhang and Yuanji Xu and Shilin Xia and Bowen Yang and Mingjun Yu and Jingdun Xie and Xuwei Chen and Xia Zou and Yuzhou Xue and Jianguo Zhou and Chunhao Cao and Donghao Tian and Lei Huang and Jinxiao Li and Shengrong Long and Zefeng Song and Honglin Li and Jiang Luo and Wenying Jiang and Shanshan Li and Lei Dai and Ning Jiang and Ying Cai and Chaohui Li and Chunyan Peng and Hetong Zhao and Angqing Li and Chunyan Yang and Chongyang Sun and Yong Li and Xinyu Shi and Wei Dai and Ming Peng and Chen Sang and Yuanyuan Han and Desong Qiu and Haixin Miao and Jian Xu and Yi Chen and Xiaoliang Shi and Tian Shen and Teng Hu and Shuhao Wang and Yingyong Hou and Huimei Wang},
+      year={2026},
+      eprint={2610.17110},
+      archivePrefix={arXiv},
+      primaryClass={cs.SE},
+      url={https://arxiv.org/abs/2610.17110},
+}
+```
+
+</details>
 
 ## 벤치마크 성능
 
-### 🏆 AstaBench LitQA2-FullText-Search — 대상 논문 10/10 검색 성공
+AstaBench, ASI-Bench, BiomniBench-DA는 과제, 데이터셋, 채점 방식이 서로 다른 별개의 벤치마크이며, 각 결과는 별도로 보고되고 서로 직접 비교할 수 없습니다.
 
-AIPOCH Open-Science는 **DeepSeek v4-flash(max)**, 문헌 검색 스페셜리스트와 스킬을 활용해 공식 검증 세트 10문항에서 **100% recall@30**을 기록했습니다. 모든 대상 논문이 검색 결과 상위 30개에 포함되었습니다. 보고서에 실린 공개 검증 결과 3개보다 높으며, 그중 최고인 **80%보다 20%포인트 높습니다**. 로컬 반복 테스트 3회를 보고했으며, 이 과학 질문 세트에서 대상 논문을 찾는 능력을 보여줍니다.
+### 🏆 AstaBench — LitQA2 Test: 보고서에 제시된 최고 점수와 동점, 90.67% Recall@30
 
-![AIPOCH Open-Science의 AstaBench LitQA2 검증 결과: 100% recall@30, 10/10 대상 논문 검색 성공. 테스트와 검증 문항은 다름](../images/readme/astabench-litqa2.png)
+AIPOCH Open-Science는 **gpt-6-astra**를 사용하여 공식 75문항 LitQA2-FullText-Search Test 세트의 로컬 평가에서 **90.67% Recall@30 (68/75)**을 기록했습니다. 10월 26일 보고서 스냅샷에 포함된 27개 결과 가운데 이 로컬 Test 점수는 각각 90.67%를 기록한 Asta Paper Finder 및 Asta v0와 함께 **제시된 최고 Recall@30과 동점**입니다. 공식 Test 세트에 대한 로컬 평가이며, 공식 순위표에 제출하거나 순위를 획득한 결과는 아닙니다.
 
-그림에는 테스트 및 검증 기록이 함께 있으며 순서는 수치 비교입니다. Recall@30은 대상 논문 검색을 측정하며 과학 질문의 정답률을 의미하지 않습니다.
+**ScholarQA-CS2:** AIPOCH Open-Science는 **deepseek-v4-flash**를 사용하여 **Validation 100문항**에 걸쳐 **0.9289/1 종합 점수**를 기록했습니다. 보고서에 제시된 공식 Test 최고 참조 점수인 **0.9192**는 다른 문항 세트의 결과이므로, 두 결과로 직접 비교 순위를 매길 수 없습니다.
+
+![AIPOCH Open-Science AstaBench 요약: LitQA2 Test에서 90.67% Recall@30, ScholarQA-CS2 Validation에서 종합 점수 0.9289. 로컬 결과와 공식 참조를 구분](../images/readme/astabench-literature-research-overview.jpg)
+
+<details>
+<summary><strong>LitQA2-FullText-Search 결과 비교</strong></summary>
+
+![AIPOCH Open-Science는 75문항 LitQA2 Test에서 90.67% Recall@30을 기록하여 보고서 스냅샷에 제시된 최고 점수와 동점임. 공식 순위표에 제출한 결과는 아님](../images/readme/astabench-litqa2-test.jpg)
+
+로컬 평가는 2026년 10월 23일에 수행되었습니다. 차트에는 AIPOCH Open-Science의 로컬 Test 결과 1개와 공식 참조 기록 26개가 포함되어 있습니다. 같은 점수는 같은 길이의 막대로 표시하며, 행 순서가 동점의 순위를 나누지는 않습니다. AIPOCH의 로컬 평가 비용은 통일된 기준으로 산정되지 않았으므로 이 차트로 비용 효율성을 비교할 수 없습니다.
+
+앞서 **DeepSeek v4-flash (max)**를 사용한 로컬 평가에서는 별도의 10문항 Validation 세트에서 **100% Recall@30 (10/10)**을 기록했으며, 이 결과에 대해 로컬 반복 실행 3회가 보고되었습니다. Test와 Validation은 서로 다른 문항을 사용하므로 결과를 구분해 제시합니다.
+
+</details>
+
+<details>
+<summary><strong>ScholarQA-CS2 Validation 및 Test 참조</strong></summary>
+
+![AIPOCH Open-Science는 100문항 ScholarQA-CS2 Validation 세트에서 종합 점수 0.9289를 기록함. 공식 Test 참조는 다른 문항을 사용하므로 직접 비교한 순위를 구성하지 않음](../images/readme/astabench-scholarqa-cs2.jpg)
+
+차트는 로컬 Validation 결과 1개와 공식 Test 참조 기록 41개를 구분합니다. 보고서 본문에는 `gpt-5.6-sol`의 추가 Validation 점수 0.7905가 언급되었으나 원본 표에는 해당 행이 없었으며, 문항 수도 명시되지 않았습니다.
+
+</details>
+
+Recall@30은 제출한 첫 30개 결과에 대상 논문이 포함되는지를 측정하며, 과학 질문의 정답률을 의미하지 않습니다. ScholarQA-CS2 점수는 응답 품질의 종합 지표이며, 모든 내용을 완전히 정확하게 답한 문항의 비율이 아닙니다.
 
 ### 🏆 ASI-Bench B1–B4 — 보고서의 네 비교 모두에서 최고 표시 점수
 
@@ -190,7 +265,7 @@ AIPOCH Open-Science는 **GPT-6(gpt-6-astra / xhigh)**, 분야별 스페셜리스
 
 로컬 실행은 seed31415를 사용했습니다. AIPOCH B1은 보고서에 설명된 채점기 문제로 1개를 제외한 59개 과제를 채점했습니다. B3/B4는 v0.32.0 및 대체 평가 모델을 사용했습니다. 공개 참조와 과제 인스턴스, 구성, 채점 조건이 다르며 B2의 0.02점은 수치 차이일 뿐입니다.
 
-### 🏆 수집된 BiomniBench-DA Public 50 비교에서 최고 값 — 79.05점
+### 🏆 BiomniBench-DA Public 50 — 취합된 비교의 최고 표시 점수: 79.05
 
 AIPOCH Open-Science는 **gpt-5.6-sol(xhigh)**을 사용해 BiomniBench-DA Public 50으로 표시된 50개 과제의 내부 평가에서 **79.05점**을 얻어 수집된 비교의 최고 표시 점수를 기록했습니다. Gemini 3.1 Pro 평가의 **81.04점**과 DeepSeek v4-pro 평가의 **77.06점**을 동일 가중치로 평균한 결과로, 해당 구성의 생물의학 데이터 분석 성능을 보여줍니다. [평가 보고서](https://aipoch.com/blog/open-science-biomnibench-da)를 참고하세요.
 
@@ -198,28 +273,38 @@ AIPOCH Open-Science는 **gpt-5.6-sol(xhigh)**을 사용해 BiomniBench-DA Public
 
 서로 다른 평가 모델 적용 범위가 혼합된 비교이며, 동일한 평가 조건의 공식 순위가 아닙니다.
 
-**평가 범위:** 자체 보고한 로컬·내부 결과입니다. 제시된 비교에서 최고 점수라는 사실이 공식 1위나 통계적으로 유의한 개선을 입증하지는 않습니다.
+**평가 범위:** 명시된 데이터셋과 분할을 사용해 2026년 8~10월에 자체 보고한 로컬·내부 평가 결과이며, 현재 릴리스를 위해 다시 실행한 평가가 아닙니다. 공식 Test 세트를 로컬에서 실행했다는 사실이 공식 순위표 제출이나 순위를 의미하지는 않습니다. 참조 값은 과거 보고서 시점의 기록이며 실시간 순위가 아닙니다. Validation과 Test 결과는 직접 비교할 수 없습니다. 문항, 모델 구성, 평가 모델 적용 범위, 비용 산정 방식의 차이로 시스템 간 비교에는 제약이 있습니다. 수치상 동점이나 격차가 통계적으로 유의한 개선을 입증하지는 않습니다.
 
 ## 핵심 기능
 
 AIPOCH Open-Science는 프로젝트 관리, 다중 모델 에이전트 실행, Python 및 R Notebook, 과학 데이터 커넥터, 출처가 포함된 불변 아티팩트 버전, 권한이 적용된 사람 참여 제어를 하나의 로컬 워크스페이스에 통합합니다. 변경되는 카탈로그, 패키징 세부 정보, 새 옵션은 설치된 앱과 [최신 릴리스 노트](https://github.com/aipoch/open-science/releases/latest)를 기준으로 확인하세요.
 
-| 영역                              | 핵심 기능                                                                                                                                                                                                                                                                                                                                                                         |
-| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **과학 스킬**                     | **23개의 기본 제공 스킬**과 [Skills Marketplace](https://github.com/aipoch/openscience-skill-marketplace)에서 원클릭 설치 및 업데이트할 수 있는 **525개의 스킬**로 연구를 확장하세요. 대화나 완료된 작업에서 스킬을 만들고 패키지 또는 GitHub 소스를 가져올 수 있습니다. 기여는 검토 후 게시되며 로컬 가져오기로 자동 게시되지 않습니다.                                          |
-| **커넥터**                        | **36개의 기본 제공 커넥터**로 과학 리소스에 접근하거나 사용자 지정 로컬 및 원격 MCP 커넥터를 추가하세요. 도구별 권한 관리와 커넥터 구성 가져오기/내보내기를 지원합니다.                                                                                                                                                                                                           |
-| **스페셜리스트 및 위임**          | [Specialist Marketplace](https://github.com/aipoch/openscience-specialist-marketplace)에서 **10개의 스페셜리스트**를 설치하거나 개인 전문가를 만들고 조정해 메인 에이전트의 작업을 위임하세요. 전문가 패키지는 가져오기/내보내기를 지원하며 기여는 검토 후 게시되고 로컬 가져오기는 자동 게시되지 않습니다.                                                                       |
-| **모델 및 에이전트 백엔드**       | 클라우드 모델, 호환 사용자 지정 게이트웨이 또는 Claude·Codex 구독 로그인을 사용하세요. Claude Code, OpenCode, Codex, CodeBuddy 백엔드와 모델 연결 확인, 이미지 입력, 추론 강도 설정을 지원합니다.                                                                                                                                                                                 |
-| **프로젝트, 세션 및 연구 패키지** | 프로젝트를 관리하고 세션 고정, 메시지 분기, 사이드 채팅과 기록 복구를 사용하세요. 대화 분기, 선택한 파일 버전, Notebook 기록과 검증 증거를 담은 **이동 가능한 `.science` 연구 패키지**를 다른 프로젝트나 컴퓨터로 옮길 수 있습니다. 가져온 기록은 읽기 전용으로 코드 실행이나 자격 증명 복원을 하지 않으며, 사이드 채팅과 북마크는 제외되고 파일 범위는 내보내기 선택에 따릅니다. |
-| **검토 에이전트**                 | 필요에 따라 자동 검토를 켜고, 완료된 에이전트 턴의 응답, 실행 기록 및 관련 파일 근거를 별도 컨텍스트에서 확인합니다. 근거가 있는 통과·경고·실패 검사 결과를 제시하며, 문제가 발견되면 정해진 횟수 내에서 주 에이전트의 수정과 재검토를 진행할 수 있습니다. 검토 로그와 문제 처리 상태를 보관하며, 검토 범위는 해당 턴에서 이용할 수 있는 기록으로 제한됩니다.                     |
-| **Python, R, Notebook 및 HPC**    | 관리 환경이나 자체 인터프리터로 Python, R, Notebook, Shell 작업을 로컬에서 실행하며 백그라운드 처리와 실행 기록을 지원합니다. SSH 연결이나 Slurm 작업 제출에는 아래 원격 컴퓨팅 FAQ의 호스트, 소프트웨어, 리소스 및 권한이 필요합니다.                                                                                                                                            |
-| **문헌 라이브러리**               | 문헌과 PDF를 가져와 컬렉션, 태그, 프로젝트 연결, 메모 및 중복 항목 병합으로 관리합니다. 오픈 액세스 원문을 찾고, PDF를 읽으며 그림과 표를 추출하고, 대화에서 라이브러리 문헌을 활용해 AI의 도움으로 분석할 수 있습니다. 선택한 인용 스타일로 참고문헌 목록을 생성하고 BibTeX 또는 RIS로 내보낼 수 있습니다.                                                                       |
-| **과학 파일 및 미리보기**         | 파일당 최대 **10 GiB**를 업로드하고 프로젝트 파일과 과학 데이터, PDF, Office 문서, 이미지, 코드, 분자 구조 미리보기를 관리하세요. 업로드 한도는 모델이 전체 내용을 읽을 수 있다는 뜻이 아니며 컨텍스트, 첨부 분석, 미리보기에는 별도 제한이 있습니다. 큰 파일은 보통 코드로 나누어 읽거나 분석해야 합니다.                                                                        |
-| **아티팩트 및 출처**              | 변경 불가능한 산출물 버전과 사용 가능한 생성 코드, 입력, 실행 기록, 환경 정보 및 검토 증거를 보관합니다. 데스크톱에서 완전한 실행 레시피, 필수 입력, 사용 가능한 런타임을 갖춘 버전을 재실행하고 출력을 비교해 검증 기록을 내보낼 수 있습니다. 증거 부족으로 검증이 불가능할 수 있으며 재실행 검사는 과학적 타당성을 증명하지 않습니다.                                           |
+| 영역                              | 핵심 기능                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **과학 스킬**                     | **24개의 기본 제공 스킬**과 [Skills Marketplace](https://github.com/aipoch/openscience-skill-marketplace)에서 원클릭 설치 및 업데이트할 수 있는 **525개의 스킬**로 연구를 확장하세요. 대화나 완료된 작업에서 스킬을 만들고 패키지 또는 GitHub 소스를 가져오며 GitHub 리포지토리를 저장해 가져오기 워크플로에서 다시 사용할 수 있습니다. 리포지토리를 저장하는 것만으로 스킬이 설치되지는 않습니다. 기여는 검토 후 게시되며 로컬 가져오기로 자동 게시되지 않습니다.                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **커넥터**                        | **48개의 기본 제공 커넥터**로 과학 리소스에 접근하거나 사용자 지정 로컬 및 원격 MCP 커넥터를 추가하세요. 일부 기본 제공 소스는 기본적으로 비활성화되어 있으며 소스별 동의가 필요합니다. 도구별 권한 관리와 커넥터 구성 가져오기/내보내기를 지원합니다.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| **스페셜리스트 및 위임**          | [Specialist Marketplace](https://github.com/aipoch/openscience-specialist-marketplace)에서 **10개의 스페셜리스트**를 설치하거나 개인 전문가를 만들고 조정해 메인 에이전트의 작업을 위임하세요. 전문가 패키지는 가져오기/내보내기를 지원하며 기여는 검토 후 게시되고 로컬 가져오기는 자동 게시되지 않습니다.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| **모델 및 에이전트 백엔드**       | 클라우드 모델, 호환 사용자 지정 게이트웨이 또는 Claude·Codex 구독 로그인을 사용하세요. Claude Code, OpenCode, Codex, CodeBuddy 백엔드와 모델 연결 확인, 이미지 입력, 추론 강도 설정을 지원합니다.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **프로젝트, 세션 및 연구 패키지** | 프로젝트를 관리하고 세션 고정, 메시지 분기, 사이드 채팅과 기록 복구를 사용하세요. 대화 분기, 선택한 파일 버전, Notebook 기록과 검증 증거를 담은 **이동 가능한 `.science` 연구 패키지**를 다른 프로젝트나 컴퓨터로 옮길 수 있습니다. 가져온 기록은 읽기 전용으로 코드 실행이나 자격 증명 복원을 하지 않으며, 사이드 채팅과 북마크는 제외되고 파일 범위는 내보내기 선택에 따릅니다.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **검토 에이전트**                 | 필요에 따라 자동 검토를 켜고, 완료된 에이전트 턴의 응답, 실행 기록 및 관련 파일 근거를 별도 컨텍스트에서 확인합니다. 근거가 있는 통과·경고·실패 검사 결과를 제시하며, 문제가 발견되면 정해진 횟수 내에서 주 에이전트의 수정과 재검토를 진행할 수 있습니다. 검토 로그와 문제 처리 상태를 보관하며, 검토 범위는 해당 턴에서 이용할 수 있는 기록으로 제한됩니다.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| **Python, R, Notebook 및 HPC**    | 관리 환경이나 자체 인터프리터로 Python, R, Notebook, Shell 작업을 로컬에서 실행하며 백그라운드 처리와 실행 기록을 지원합니다. SSH 연결이나 Slurm 작업 제출에는 아래 원격 컴퓨팅 FAQ의 호스트, 소프트웨어, 리소스 및 권한이 필요합니다.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| **문헌 라이브러리**               | 문헌과 PDF를 가져와 컬렉션, 태그, 프로젝트 연결, 메모 및 중복 항목 병합으로 관리합니다. Semantic Scholar에서 논문의 참고문헌과 인용 문헌을 탐색하고, 보충 자료 첨부 파일을 다운로드·미리보기하며, PDF 또는 서지 파일을 드래그 앤 드롭할 수 있습니다. 오픈 액세스 원문 검색, PDF 읽기, 그림·표 추출과 대화 기반 AI 분석을 지원합니다. 유효한 DOI가 있는 문헌은 알려진 철회나 정정 여부를 Crossref에서 수동으로 확인할 수 있습니다. 이 확인은 DOI를 Crossref로 전송하며, 적용 범위가 완전하지 않으므로 알림이 없다고 해서 해당 연구가 영향을 받지 않았다는 뜻은 아닙니다. 참고문헌 목록을 생성하고 문헌을 BibTeX 또는 RIS로, Smart Screening 판정을 CSV로 내보낼 수 있습니다. 읽기 상태를 읽지 않음, 읽는 중 또는 읽기 완료로 직접 설정하고, 선택한 문헌의 상태를 일괄 변경하거나 상태별로 필터링할 수 있습니다. 기존 문헌 검색창에서 개인 메모 내용을 검색할 수 있습니다. |
+| **과학 파일 및 미리보기**         | 파일당 최대 **10 GiB**를 업로드하고 프로젝트 파일과 과학 데이터, PDF, Office 문서, 이미지, 코드, 분자 구조 미리보기를 관리하세요. 업로드 한도는 모델이 전체 내용을 읽을 수 있다는 뜻이 아니며 컨텍스트, 첨부 분석, 미리보기에는 별도 제한이 있습니다. 큰 파일은 보통 코드로 나누어 읽거나 분석해야 합니다.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| **아티팩트 및 출처**              | 변경 불가능한 산출물 버전과 사용 가능한 생성 코드, 입력, 실행 기록, 환경 정보 및 검토 증거를 보관합니다. 승인된 폴더에서 아티팩트를 가져오면 AIPOCH Open-Science가 각 파일을 관리형 아티팩트 저장소에 복사합니다. 데스크톱에서 완전한 실행 레시피, 필수 입력, 사용 가능한 런타임을 갖춘 버전을 재실행하고 출력을 비교해 검증 기록을 내보낼 수 있습니다. 증거 부족으로 검증이 불가능할 수 있으며 재실행 검사는 과학적 타당성을 증명하지 않습니다.                                                                                                                                                                                                                                                                                                                                                                                                                         |
+
+같은 컴퓨터에서 실행 중인 Zotero 10 이상에서 문헌 레코드, 태그, 컬렉션, 출처 링크를 가져올 수 있습니다. 로컬 PDF 첨부 파일은 선택적으로 복사할 수 있으며, 이 가져오기는 단방향으로 진행되어 Zotero를 수정하지 않습니다.
+
+DOI, DOI 링크 또는 arXiv 초록 페이지나 PDF 링크로 문헌을 한 건씩 추가하고, 가져온 메타데이터를 확인·편집한 뒤 저장할 수 있습니다. 원문 PDF는 별도로 추가할 수 있습니다.
+
+영구 PDF 주석과 문서 노트를 지원합니다. 심사 모델을 설정하면 스마트 컬렉션이 포함·제외 기준에 따라 문헌을 평가합니다. AI 판단과 수동 판단을 별도로 기록하여 사람의 검토를 지원합니다.
+
+번역 PDF는 본문과 캡션을 선택적으로 단일 열의 콘텐츠 우선 레이아웃으로 재배치하면서 이미지, 표, 수식 및 참고문헌은 원래 형식으로 유지하고 비교를 위한 원본-출력 페이지 매핑을 제공합니다. 새 설치에서는 Notebook 및 Shell 폴더 제한이 기본적으로 활성화되어 해당 런타임을 작업 공간, 승인된 폴더 및 도구에 필요한 파일로 제한합니다. 이 설정은 에이전트 기본 도구나 원격 컴퓨터를 제어하지 않습니다.
+
+데스크톱 앱에서는 산출물 출처를 RO-Crate 1.1로 내보낼 수 있습니다. 버전에 연결된 환경 번들은 캡처가 완전하고 대상 플랫폼과 호환될 때만 관리 환경을 만들 수 있으며, 전체 컴퓨터 백업은 아닙니다.
 
 ## 모델 제공업체
 
-AIPOCH Open-Science는 제품 수준에서 특정 모델에 종속되지 않습니다. 주요 클라우드 LLM 제공업체 또는 사용자 지정 게이트웨이에 연결하거나 기존 Claude 또는 Codex 구독을 재사용할 수 있습니다. 현재 제공업체 사용 가능 여부는 선택한 에이전트 백엔드와 지원 API 프로토콜에 따라 달라집니다. 모델에 연결하는 방법은 네 가지입니다.
+AIPOCH Open-Science는 제품 수준에서 특정 모델에 종속되지 않습니다. 주요 클라우드 LLM 제공업체 또는 사용자 지정 게이트웨이에 연결하거나 기존 Claude 또는 Codex 구독을 재사용할 수 있습니다. 현재 제공업체 사용 가능 여부는 선택한 에이전트 백엔드와 지원 API 프로토콜에 따라 달라집니다. 다음 연결 옵션을 사용할 수 있습니다.
 
 | 제공업체 모드              | 작동 방식                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -227,6 +312,7 @@ AIPOCH Open-Science는 제품 수준에서 특정 모델에 종속되지 않습�
 | **사용자 지정 게이트웨이** | Base URL과 정확한 모델 ID를 입력하고 선택한 에이전트 백엔드가 지원하는 API 프로토콜(Messages, Chat Completions 또는 Responses)을 지정한 뒤 연결을 테스트하세요. 원격 게이트웨이는 HTTPS와 API Key가 필요합니다. `localhost`, `127.0.0.1`, `[::1]` 같은 루프백 엔드포인트는 HTTP를 사용하고 키를 생략할 수 있습니다. Ollama, LM Studio, llama.cpp, vLLM 프리셋을 제공합니다. 기본 API 형식만으로 서버나 모델 호환성이 보장되지는 않습니다. |
 | **Codex 구독**             | Codex 에이전트 프레임워크를 선택한 다음 제공업체 유형에서 Codex 구독을 선택합니다.                                                                                                                                                                                                                                                                                                                                                        |
 | **Claude 구독**            | 두 가지 모드로 로그인합니다. **공유** 모드는 브라우저 로그인 자격 증명을 기본 `~/.claude` 프로필에 저장합니다. **격리** 모드는 앱 소유 `CLAUDE_CONFIG_DIR`에서 `claude setup-token`을 실행하여 `~/.claude/`와 완전히 분리하고 브라우저 흐름과 토큰 붙여넣기 폴백을 제공합니다.                                                                                                                                                            |
+| **xAI (Grok) OAuth**       | 내장 xAI (Grok) OAuth 기기 로그인을 사용합니다. 이용 가능 여부는 xAI 계정과 선택한 백엔드의 프로토콜 지원에 따라 달라지므로 앱에서 연결을 검증하세요.                                                                                                                                                                                                                                                                                     |
 
 사전 설정된 25개의 프로바이더 옵션이 있으며, OpenAI, Anthropic, DeepSeek, NVIDIA Build 등이 있습니다. 모델과 지역별 엔드포인트는 설치 버전 및 선택한 백엔드에 따라 달라지므로 앱의 제공업체 선택기와 연결 테스트로 확인하세요.
 
@@ -256,7 +342,7 @@ AIPOCH Open-Science는 프로젝트 데이터, 설정, 아티팩트 버전, 출�
 
 ## 개발 및 패키징
 
-웹 UI는 일반 Node 백엔드에서 실행되며 Electron이나 그래픽 화면이 필요하지 않습니다.
+AIPOCH Open-Science는 일반 Node 백엔드와 Electron 데스크톱 클라이언트로 구성되며 React, TypeScript, Prisma/SQLite 및 ACP 기반 에이전트 런타임을 사용합니다.
 
 소스 개발 요구 사항:
 
@@ -284,15 +370,17 @@ npm run pack:backend
 
 웹 UI는 일반 Node 백엔드에서 실행되며 Electron이나 그래픽 화면이 필요하지 않습니다. `npm run dev:web`와 `npm run dev:headless`는 백엔드와 웹 UI를 빌드하고 실행하며 데스크톱이나 트레이를 시작하지 않습니다. `OPEN_SCIENCE_WEB_PORT`로 포트를 선택합니다(기본값 `44100`). Ctrl+C는 전경 서비스를 정상 종료합니다.
 
-소스 개발에는 Node.js 24가 필요합니다. 독립 npm tarball에는 Node >=22.13.0, 경량 CLI/SDK에는 Node >=22.5가 필요합니다. Release 압축 파일, Homebrew Formula, 데스크톱 명령 실행기는 런타임을 포함합니다.
+소스 개발에는 Node.js 24가 필요합니다. 배포된 npm 패키지와 로컬에서 빌드한 독립 tarball에는 Node.js >=22.13.0이 필요합니다. Release 압축 파일, Homebrew Formula, 데스크톱 명령 실행기는 런타임을 포함합니다.
 
-데스크톱과 브라우저는 같은 서비스를 공유합니다. 데스크톱을 종료하면 직접 시작한 백엔드만 중지하며, CLI가 시작한 서비스에서는 연결만 해제합니다.
+데스크톱과 브라우저는 같은 서비스를 공유합니다. v1.0.4에서는 데스크톱을 종료하면 직접 시작한 백엔드만 중지하며, CLI가 시작한 서비스에서는 연결만 해제합니다. 현재 `main`(소스 빌드)에서는 연결된 앱과 `open-science start`의 명시적 실행 유지 요청이 서비스를 계속 실행하게 합니다. 마지막 앱을 종료해도 명시적 유지 요청이 남아 있으면 서비스는 중지되지 않습니다.
 
 [CLI](../../packages/open-science/CLI.md) · [Node](../standalone-runtime.md)
 
 ### 모바일 원격 액세스
 
 Remote.It 페어링을 통해 휴대전화나 태블릿에서 동일한 localhost 웹 UI에 연결할 수 있습니다. 6자리 AIPOCH Open-Science 코드로 브라우저를 페어링하고 데스크톱에서 한 번 승인하면 루프백 서버를 직접 공개하지 않고 워크스페이스에 연결할 수 있습니다. 브라우저 신뢰는 취소할 수 있으며 모드 변경이나 서비스 종료는 활성 원격 세션을 즉시 무효화합니다.
+
+호스트를 켜고 온라인 상태로 유지하며 AIPOCH Open-Science와 Remote.It 에이전트를 실행하고, 로그인된 Remote.It 계정에 호스트를 추가해야 합니다. 브라우저 승인은 만료되며 취소할 수 있습니다. [원격 제어 가이드](../remote-control.md)를 참고하세요.
 
 ### 헤드리스 CLI 및 SDK
 
@@ -301,12 +389,7 @@ Remote.It 페어링을 통해 휴대전화나 태블릿에서 동일한 localhos
 - [CLI 가이드](../../packages/open-science/CLI.md) — 설치, 서비스 수명 주기, 작업 자동화, 아티팩트, 출력 형식, 종료 코드
 - [SDK 패키지 개요](../../packages/open-science/README.md) — Node.js 빠른 시작 및 패키지 진입점
 
-```bash
-brew install --cask open-science
-brew install aipoch/tap/open-science
-```
-
-[Homebrew / Release](../standalone-runtime.md)
+독립 실행형 CLI는 `open-science mcp`를 통해 연구 도구를 외부 MCP 클라이언트에 제공할 수 있습니다. 먼저 선택한 프로필의 서비스를 시작하고 인증하세요. 어댑터는 해당 프로필의 기존 권한을 사용하며 별도의 샌드박스나 읽기 전용 보기가 아닙니다. 따라서 연결된 클라이언트가 변경 사항을 저장하고 모델 비용을 발생시킬 수 있습니다. 임의의 Shell 또는 RPC 접근, 자격 증명 관리, 파일 가져오기·내보내기, 경로 지정 다운로드, 원격 HTTP MCP 엔드포인트는 제공하지 않습니다.
 
 ## 자주 묻는 질문
 
@@ -353,6 +436,14 @@ open-science artifacts download <artifact-id> --output ./report.md
 ### 이후 대화를 잃지 않고 이전 요청을 수정할 수 있나요?
 
 답변: 가능합니다. 완료된 사용자 메시지를 편집해 다시 보내면 해당 지점에서 새 브랜치가 생성됩니다. 원래 후속 턴은 계속 사용할 수 있고, 메시지 옆의 수정 화살표로 대체 경로를 전환합니다.
+
+## 기여자
+
+코드, 문서, 번역, 버그 보고 및 커뮤니티 지원을 통해 AIPOCH Open-Science에 기여해 주시는 모든 분께 감사드립니다.
+
+[GitHub 기여자 보기](https://github.com/aipoch/open-science/graphs/contributors)
+
+[![AIPOCH Open-Science 기여자](https://contrib.rocks/image?repo=aipoch/open-science)](https://github.com/aipoch/open-science/graphs/contributors)
 
 ## 참여하기
 
